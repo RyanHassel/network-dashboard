@@ -4,18 +4,17 @@
 # Style: Proxmox VE Helper-Scripts (community-scripts.org)
 #
 # Run directly in the Proxmox VE Host Shell (CLI):
-#    Public repo:
-#     bash -c "$(curl -fsSL https://raw.githubusercontent.com/RyanHassel/network-dashboard/main/install-netdash.sh)"
 #    Private repo (with GitHub Personal Access Token):
 #     export GITHUB_TOKEN="ghp_xxx" && bash -c "$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" https://raw.githubusercontent.com/RyanHassel/network-dashboard/main/install-netdash.sh)"
+#    Public repo:
+#     bash -c "$(curl -fsSL https://raw.githubusercontent.com/RyanHassel/network-dashboard/main/install-netdash.sh)"
 #
-# Dual-Mode Support:
-#   1. Proxmox VE Host CLI -> Launches interactive whiptail wizard, downloads
-#      Debian 12/13 GenericCloud image, creates & tunes KVM VM, injects
-#      Cloud-Init config, and bootstraps the entire NetDash Docker stack.
-#   2. Debian 12/13 Guest VM -> Installs Docker CE, sysctl tuning, UFW, clones
-#      the GitHub repo into /opt/netdash, enables 5m GitOps auto-updater, and
-#      starts the NetDash containers.
+# Architecture:
+#   Uses `virt-customize` (libguestfs-tools) directly on the Debian GenericCloud
+#   disk image before boot — baking in root/netdash credentials, SSH keys/config,
+#   systemd-networkd (en* / eth* wildcard matching for DHCP or Static IP), and
+#   the NetDash first-boot provisioning service so the VM never hangs on
+#   Cloud-Init or DHCP wait-online and local console login works immediately.
 # ==============================================================================
 
 set -euo pipefail
@@ -45,7 +44,7 @@ INFO="${BL}ℹ${CL}"
 header_info() {
   clear || true
   cat <<"EOF"
-    _   __     __  ____ash
+    _   __     __  ____            __
    / | / /__  / /_/ __ \____ _____/ /_
   /  |/ / _ \/ __/ / / / __ `/ ___/ __ \
  / /|  /  __/ /_/ /_/ / /_/ (__  ) / / /
@@ -83,7 +82,7 @@ check_root() {
 }
 
 # ==============================================================================
-# MODE 1: PROXMOX VE HOST CLI — VM PROVISIONER (whiptail TUI + qm + Cloud-Init)
+# MODE 1: PROXMOX VE HOST CLI — VM PROVISIONER (whiptail + virt-customize + qm)
 # ==============================================================================
 
 check_proxmox_env() {
@@ -128,7 +127,6 @@ select_storage_pool() {
     die "No active Proxmox storage pool supports content type '${content_type}'."
   fi
 
-  # Default first pool to ON
   pools[2]="ON"
 
   if [[ "${#pools[@]}" -eq 3 ]]; then
@@ -147,27 +145,6 @@ select_storage_pool() {
   echo "${selected}"
 }
 
-ensure_snippets_storage() {
-  # Ensure 'local' storage supports 'snippets' so we can attach Cloud-Init vendor-data cleanly
-  local current_content
-  current_content="$(pvesm status | awk '$1=="local" {print $1}')"
-  if [[ -z "${current_content}" ]]; then
-    die "Proxmox 'local' storage pool not found."
-  fi
-  mkdir -p /var/lib/vz/snippets
-  local cfg_content
-  cfg_content="$(awk '/^dir: local$/,/^$/' /etc/pve/storage.cfg | awk '/content/ {print $2}')"
-  if [[ "${cfg_content}" != *"snippets"* ]]; then
-    msg_info "Enabling 'snippets' content type on Proxmox 'local' storage"
-    if [[ -n "${cfg_content}" ]]; then
-      pvesm set local --content "${cfg_content},snippets"
-    else
-      pvesm set local --content "iso,vztmpl,backup,snippets"
-    fi
-    msg_ok "Enabled 'snippets' on 'local' storage"
-  fi
-}
-
 proxmox_default_settings() {
   VMID="$(get_next_vmid)"
   HN="netdash"
@@ -182,11 +159,10 @@ proxmox_default_settings() {
   NET_MODE="dhcp"
   STATIC_IP=""
   GATEWAY_IP=""
-  DNS_SERVER=""
+  DNS_SERVER="1.1.1.1"
   CI_USER="netdash"
   CI_PASSWORD="netdash"
   SSH_KEY=""
-  START_VM="yes"
 }
 
 proxmox_wizard() {
@@ -194,16 +170,16 @@ proxmox_wizard() {
 
   if ! whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
     --title "${APP} KVM VM Installer" \
-    --yesno "This will create a new ${APP} Virtual Machine on Proxmox VE and configure the entire observability stack automatically.\n\nHost specs recommended: 4 vCPUs, 8 GB RAM, 120 GB SSD.\n\nProceed?" 14 68; then
+    --yesno "This will create a new ${APP} Virtual Machine on Proxmox VE and configure the entire observability stack automatically.\n\nDefault VM Specs: 4 vCPUs, 8 GB RAM, 120 GB SSD.\nDefault Console/SSH Login: root (or netdash) / password: netdash\n\nProceed?" 15 70; then
     die "Exited installer."
   fi
 
   local install_mode
   install_mode=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
     --title "Settings Mode" \
-    --radiolist "\nChoose VM provisioning settings mode:\n" 12 68 2 \
-    "default" "Default Settings (4 vCPU, 8GB RAM, 120GB SSD, DHCP)" ON \
-    "advanced" "Advanced Settings (Custom ID, VLAN, Static IP, SSH)" OFF \
+    --radiolist "\nChoose VM provisioning settings mode:\n" 12 70 2 \
+    "default" "Default Hardware (4 vCPU, 8GB RAM, 120GB SSD)" ON \
+    "advanced" "Advanced Hardware (Custom VMID, CPU, RAM, Disk, SSH Key)" OFF \
     3>&1 1>&2 2>&3) || die "Installation cancelled."
 
   STORAGE_POOL="$(select_storage_pool "images" "VM Virtual Disk")"
@@ -240,36 +216,6 @@ proxmox_wizard() {
       --inputbox "\nSet Proxmox Network Bridge:" 10 58 "${BRG}" \
       --title "NETWORK BRIDGE" 3>&1 1>&2 2>&3) || die "Cancelled."
 
-    VLAN=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-      --inputbox "\nSet Management VLAN Tag (leave blank for untagged):" 10 58 "" \
-      --title "VLAN TAG" 3>&1 1>&2 2>&3) || die "Cancelled."
-
-    NET_MODE=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-      --title "IPv4 ADDRESS CONFIGURATION" \
-      --radiolist "\nSelect IPv4 configuration for the VM:" 12 64 2 \
-      "dhcp" "Use DHCP" ON \
-      "static" "Set Static IPv4 Address" OFF \
-      3>&1 1>&2 2>&3) || die "Cancelled."
-
-    if [[ "${NET_MODE}" == "static" ]]; then
-      STATIC_IP=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-        --inputbox "\nEnter Static IPv4 & CIDR (e.g. 192.168.1.50/24):" 10 58 "192.168.1.50/24" \
-        --title "STATIC IPv4" 3>&1 1>&2 2>&3) || die "Cancelled."
-
-      GATEWAY_IP=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-        --inputbox "\nEnter Default Gateway IPv4 (e.g. 192.168.1.1):" 10 58 "192.168.1.1" \
-        --title "GATEWAY IPv4" 3>&1 1>&2 2>&3) || die "Cancelled."
-
-      DNS_SERVER=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-        --inputbox "\nEnter DNS Server IPv4 (e.g. 192.168.1.1):" 10 58 "${GATEWAY_IP}" \
-        --title "DNS SERVER" 3>&1 1>&2 2>&3) || die "Cancelled."
-    fi
-
-    CI_PASSWORD=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-      --passwordbox "\nSet SSH Password for user 'netdash' (leave default 'netdash' if blank):" 10 64 "${CI_PASSWORD}" \
-      --title "SSH PASSWORD" 3>&1 1>&2 2>&3) || die "Cancelled."
-    [[ -z "${CI_PASSWORD}" ]] && CI_PASSWORD="netdash"
-
     SSH_KEY=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
       --inputbox "\nOptional SSH Public Key (ssh-ed25519 / ssh-rsa, or leave blank):" 10 68 "" \
       --title "SSH AUTHORIZED KEY" 3>&1 1>&2 2>&3) || die "Cancelled."
@@ -281,7 +227,38 @@ proxmox_wizard() {
     REPO_URL="${DEFAULT_REPO_URL}"
   fi
 
-  # --- NetDash Application Telemetry Settings (Prompted in Both Default & Advanced) ---
+  # --- Network & Login Settings (Always Prompted so VLAN / Static IP / Password never trip up boot) ---
+  VLAN=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
+    --inputbox "\nSet VLAN Tag on ${BRG} (leave blank if untagged):" 10 64 "" \
+    --title "VLAN TAG (OPTIONAL)" 3>&1 1>&2 2>&3) || die "Cancelled."
+
+  NET_MODE=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
+    --title "IPv4 NETWORK CONFIGURATION" \
+    --radiolist "\nHow should the VM obtain its IPv4 address on ${BRG}${VLAN:+ (VLAN ${VLAN})}?\n" 12 68 2 \
+    "dhcp" "DHCP (Automatic IPv4 lease from router)" ON \
+    "static" "Static IPv4 (Manually specify IP/CIDR, Gateway & DNS)" OFF \
+    3>&1 1>&2 2>&3) || die "Cancelled."
+
+  if [[ "${NET_MODE}" == "static" ]]; then
+    STATIC_IP=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
+      --inputbox "\nEnter Static IPv4 & CIDR (e.g. 192.168.1.50/24):" 10 64 "192.168.1.50/24" \
+      --title "STATIC IPv4 ADDRESS" 3>&1 1>&2 2>&3) || die "Cancelled."
+
+    GATEWAY_IP=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
+      --inputbox "\nEnter Default Gateway IPv4 (e.g. 192.168.1.1):" 10 64 "192.168.1.1" \
+      --title "DEFAULT GATEWAY" 3>&1 1>&2 2>&3) || die "Cancelled."
+
+    DNS_SERVER=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
+      --inputbox "\nEnter DNS Server IPv4 (e.g. 192.168.1.1 or 1.1.1.1):" 10 64 "${GATEWAY_IP}" \
+      --title "DNS SERVER" 3>&1 1>&2 2>&3) || die "Cancelled."
+  fi
+
+  CI_PASSWORD=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
+    --inputbox "\nSet Console & SSH Password for 'root' and 'netdash' users:" 10 68 "${CI_PASSWORD}" \
+    --title "LOCAL CONSOLE & SSH PASSWORD" 3>&1 1>&2 2>&3) || die "Cancelled."
+  [[ -z "${CI_PASSWORD}" ]] && CI_PASSWORD="netdash"
+
+  # --- NetDash Application Telemetry Settings ---
   if [[ -z "${GITHUB_TOKEN}" ]]; then
     GITHUB_TOKEN=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
       --passwordbox "\nGitHub Personal Access Token (required for Private Repo; leave blank if Public):" 10 72 "" \
@@ -329,12 +306,20 @@ provision_proxmox_vm() {
   msg_ok "Base OS:        ${BL}Debian ${DEBIAN_VER} GenericCloud (amd64)${CL}"
   msg_ok "Resources:      ${BL}${CORE_COUNT} vCPUs (${CPU_TYPE}), ${RAM_SIZE} MiB RAM, ${DISK_SIZE} GB SSD (${STORAGE_POOL})${CL}"
   msg_ok "Network:        ${BL}${BRG}${VLAN:+ (VLAN ${VLAN})} — ${NET_MODE^^}${STATIC_IP:+ (${STATIC_IP})}${CL}"
+  msg_ok "Login Users:    ${BL}root & ${CI_USER} (password set)${CL}"
   msg_ok "GitHub Repo:    ${BL}${REPO_URL}${CL}"
   echo ""
 
-  ensure_snippets_storage
+  # 1. Ensure libguestfs-tools (virt-customize) is installed on Proxmox host
+  if ! command -v virt-customize >/dev/null 2>&1; then
+    msg_info "Installing libguestfs-tools on Proxmox host (one-time setup for image customization)"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -y -qq libguestfs-tools >/dev/null 2>&1
+    msg_ok "Installed libguestfs-tools"
+  fi
 
-  # 1. Download Debian GenericCloud Image
+  # 2. Download Debian GenericCloud Image
   local img_name img_url cache_dir="/var/lib/vz/template/cache"
   mkdir -p "${cache_dir}"
   if [[ "${DEBIAN_VER}" == "13" ]]; then
@@ -355,188 +340,267 @@ provision_proxmox_vm() {
     msg_ok "Using cached cloud image ${img_path}"
   fi
 
-  # 2. Generate Cloud-Init Vendor-Data Snippet (Self-Contained Guest Bootstrap)
-  local db_pass snippet_file="/var/lib/vz/snippets/netdash-${VMID}-vendor.yaml"
+  # 3. Stage files & customize a working copy of the disk image via virt-customize
+  local work_img="/tmp/netdash-${VMID}.qcow2"
+  local stage_dir="/tmp/netdash-stage-${VMID}"
+  rm -rf "${work_img}" "${stage_dir}"
+  mkdir -p "${stage_dir}"
+  cp "${img_path}" "${work_img}"
+
+  local db_pass
   db_pass="$(openssl rand -hex 20)"
 
-  msg_info "Generating Cloud-Init vendor bootstrap config (${snippet_file})"
-  cat << EOF > "${snippet_file}"
-#cloud-config
-package_update: true
-package_upgrade: true
-packages:
-  - qemu-guest-agent
-  - ca-certificates
-  - curl
-  - gnupg
-  - git
-  - ufw
-  - openssl
-  - lsb-release
+  # 3a. Network config for systemd-networkd (matches any VirtIO interface: ens18, enp0s18, eth0)
+  if [[ "${NET_MODE}" == "static" ]]; then
+    cat << EOF > "${stage_dir}/10-netdash.network"
+[Match]
+Name=en* eth*
 
-write_files:
-  - path: /etc/sysctl.d/99-netdash.conf
-    permissions: '0644'
-    content: |
-      net.core.rmem_max = 26214400
-      net.core.rmem_default = 4194304
-      net.core.wmem_max = 26214400
-      net.core.netdev_max_backlog = 10000
-      net.core.somaxconn = 4096
-      vm.overcommit_memory = 1
-
-  - path: /etc/netdash-seed.env
-    permissions: '0600'
-    content: |
-      REPO_URL=${REPO_URL}
-      GITHUB_TOKEN=${GITHUB_TOKEN}
-      POSTGRES_USER=netdash
-      POSTGRES_PASSWORD=${db_pass}
-      POSTGRES_DB=netdash
-      DATABASE_URL=postgresql://netdash:${db_pass}@timescaledb:5432/netdash
-      SYNC_DATABASE_URL=postgresql://netdash:${db_pass}@timescaledb:5432/netdash
-      REDIS_URL=redis://redis:6379/0
-      UNIFI_HOST=${UNIFI_HOST}
-      UNIFI_API_KEY=${UNIFI_API_KEY}
-      UNIFI_SITE=${UNIFI_SITE}
-      UNIFI_VERIFY_SSL=false
-      UNIFI_POLL_INTERVAL=30
-      SNMP_VERSION=${SNMP_VERSION}
-      SNMP_COMMUNITY=${SNMP_COMMUNITY}
-      SNMP_TARGETS=${SNMP_TARGETS}
-      SNMP_PORT=161
-      SNMP_POLL_INTERVAL=60
-      SNMP_RAW_RETENTION_DAYS=${SNMP_RAW_RETENTION_DAYS}
-      ALLOWED_SUBNETS=${ALLOWED_SUBNETS}
-      SUBNET_SCAN_MINUTES=15
-      SYSLOG_PORT=${SYSLOG_PORT}
-      LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS}
-      WEB_PORT=${WEB_PORT}
-
-  - path: /usr/local/bin/netdash-update
-    permissions: '0755'
-    content: |
-      #!/usr/bin/env bash
-      set -euo pipefail
-      INSTALL_DIR="/opt/netdash"
-      FORCE_BUILD="\${1:-}"
-      cd "\${INSTALL_DIR}"
-      [[ -d .git ]] || exit 0
-      git fetch origin main --quiet
-      LOCAL_SHA="\$(git rev-parse HEAD)"
-      REMOTE_SHA="\$(git rev-parse origin/main)"
-      if [[ "\${LOCAL_SHA}" != "\${REMOTE_SHA}" ]] || [[ "\${FORCE_BUILD}" == "--force" ]]; then
-        logger -t netdash-updater "Updating NetDash from \${LOCAL_SHA:0:7} to \${REMOTE_SHA:0:7}..."
-        git reset --hard origin/main
-        if [[ -f backend/Dockerfile && -f frontend/Dockerfile ]]; then
-          docker compose --env-file "\${INSTALL_DIR}/.env" up -d --build --remove-orphans
-        elif [[ -f docker-compose.yml ]]; then
-          docker compose --env-file "\${INSTALL_DIR}/.env" up -d timescaledb redis vector
-        fi
-        docker image prune -f >/dev/null 2>&1 || true
-      fi
-
-  - path: /etc/systemd/system/netdash-updater.service
-    permissions: '0644'
-    content: |
-      [Unit]
-      Description=NetDash GitHub Auto-Updater Service
-      After=network-online.target docker.service
-      Wants=network-online.target
-
-      [Service]
-      Type=oneshot
-      ExecStart=/usr/local/bin/netdash-update
-      WorkingDirectory=/opt/netdash
-
-  - path: /etc/systemd/system/netdash-updater.timer
-    permissions: '0644'
-    content: |
-      [Unit]
-      Description=Poll GitHub every 5 minutes for NetDash updates
-
-      [Timer]
-      OnBootSec=2min
-      OnUnitActiveSec=5min
-      Persistent=true
-
-      [Install]
-      WantedBy=timers.target
-
-  - path: /usr/local/bin/netdash-firstboot.sh
-    permissions: '0755'
-    content: |
-      #!/usr/bin/env bash
-      set -euo pipefail
-      exec > >(tee -a ${BOOTSTRAP_LOG}) 2>&1
-      echo "[NetDash Bootstrap] Starting automated VM provisioning at \$(date -u)"
-      systemctl enable --now qemu-guest-agent || true
-      sysctl --system || true
-
-      # Install Docker CE
-      if ! command -v docker >/dev/null 2>&1; then
-        echo "[NetDash Bootstrap] Installing Docker CE & Compose plugin..."
-        install -m 0755 -d /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
-        chmod a+r /etc/apt/keyrings/docker.gpg
-        DEBIAN_CODENAME="\$(. /etc/os-release && echo "\${VERSION_CODENAME:-bookworm}")"
-        echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \${DEBIAN_CODENAME} stable" > /etc/apt/sources.list.d/docker.list
-        apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-        systemctl enable --now docker
-      fi
-
-      source /etc/netdash-seed.env
-      if [[ -n "\${GITHUB_TOKEN:-}" ]]; then
-        git config --global credential.helper store
-        echo "https://x-access-token:\${GITHUB_TOKEN}@github.com" > /root/.git-credentials
-        chmod 600 /root/.git-credentials
-      fi
-
-      if [[ -d "${INSTALL_DIR}/.git" ]]; then
-        git -C "${INSTALL_DIR}" fetch origin main
-        git -C "${INSTALL_DIR}" reset --hard origin/main
-      else
-        mkdir -p "${INSTALL_DIR}"
-        git clone --branch main "\${REPO_URL}" "${INSTALL_DIR}" || {
-          echo "[NetDash Bootstrap] WARN: Could not clone \${REPO_URL} yet; initializing directory."
-        }
-      fi
-
-      mkdir -p "${INSTALL_DIR}"
-      grep -vE '^(REPO_URL|GITHUB_TOKEN)=' /etc/netdash-seed.env > "${ENV_FILE}"
-      chmod 600 "${ENV_FILE}"
-
-      # Configure UFW
-      ufw allow OpenSSH || true
-      ufw allow "\${WEB_PORT}/tcp" || true
-      ufw allow "\${SYSLOG_PORT}/udp" || true
-      ufw allow "\${SYSLOG_PORT}/tcp" || true
-      ufw --force enable || true
-
-      systemctl daemon-reload
-      systemctl enable --now netdash-updater.timer
-
-      # Start Docker Compose stack
-      if [[ -f "${INSTALL_DIR}/docker-compose.yml" ]]; then
-        cd "${INSTALL_DIR}"
-        if [[ -f backend/Dockerfile && -f frontend/Dockerfile ]]; then
-          echo "[NetDash Bootstrap] Building and starting full NetDash stack..."
-          docker compose --env-file "${ENV_FILE}" up -d --build --remove-orphans
-        else
-          echo "[NetDash Bootstrap] Starting Phase 1 core services (TimescaleDB, Redis, Vector)..."
-          docker compose --env-file "${ENV_FILE}" up -d timescaledb redis vector
-        fi
-      fi
-      echo "[NetDash Bootstrap] COMPLETE"
-
-runcmd:
-  - [ systemctl, enable, --now, qemu-guest-agent ]
-  - [ /usr/local/bin/netdash-firstboot.sh ]
+[Network]
+Address=${STATIC_IP}
+Gateway=${GATEWAY_IP}
+DNS=${DNS_SERVER:-1.1.1.1}
+DNS=1.1.1.1
 EOF
-  msg_ok "Cloud-Init vendor config generated"
+  else
+    cat << EOF > "${stage_dir}/10-netdash.network"
+[Match]
+Name=en* eth*
 
-  # 3. Create and Configure the Proxmox KVM Virtual Machine
+[Network]
+DHCP=ipv4
+
+[DHCPv4]
+UseDNS=true
+UseRoutes=true
+SendHostname=true
+EOF
+  fi
+
+  # 3b. Kernel sysctl tuning
+  cat << 'EOF' > "${stage_dir}/99-netdash.conf"
+net.core.rmem_max = 26214400
+net.core.rmem_default = 4194304
+net.core.wmem_max = 26214400
+net.core.netdev_max_backlog = 10000
+net.core.somaxconn = 4096
+vm.overcommit_memory = 1
+EOF
+
+  # 3c. Seed environment file
+  cat << EOF > "${stage_dir}/netdash-seed.env"
+REPO_URL=${REPO_URL}
+GITHUB_TOKEN=${GITHUB_TOKEN}
+POSTGRES_USER=netdash
+POSTGRES_PASSWORD=${db_pass}
+POSTGRES_DB=netdash
+DATABASE_URL=postgresql://netdash:${db_pass}@timescaledb:5432/netdash
+SYNC_DATABASE_URL=postgresql://netdash:${db_pass}@timescaledb:5432/netdash
+REDIS_URL=redis://redis:6379/0
+UNIFI_HOST=${UNIFI_HOST}
+UNIFI_API_KEY=${UNIFI_API_KEY}
+UNIFI_SITE=${UNIFI_SITE}
+UNIFI_VERIFY_SSL=false
+UNIFI_POLL_INTERVAL=30
+SNMP_VERSION=${SNMP_VERSION}
+SNMP_COMMUNITY=${SNMP_COMMUNITY}
+SNMP_TARGETS=${SNMP_TARGETS}
+SNMP_PORT=161
+SNMP_POLL_INTERVAL=60
+SNMP_RAW_RETENTION_DAYS=${SNMP_RAW_RETENTION_DAYS}
+ALLOWED_SUBNETS=${ALLOWED_SUBNETS}
+SUBNET_SCAN_MINUTES=15
+SYSLOG_PORT=${SYSLOG_PORT}
+LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS}
+WEB_PORT=${WEB_PORT}
+EOF
+
+  # 3d. GitOps auto-updater script & systemd units
+  cat << 'EOF' > "${stage_dir}/netdash-update"
+#!/usr/bin/env bash
+set -euo pipefail
+INSTALL_DIR="/opt/netdash"
+FORCE_BUILD="${1:-}"
+cd "${INSTALL_DIR}"
+[[ -d .git ]] || exit 0
+git fetch origin main --quiet
+LOCAL_SHA="$(git rev-parse HEAD)"
+REMOTE_SHA="$(git rev-parse origin/main)"
+if [[ "${LOCAL_SHA}" != "${REMOTE_SHA}" ]] || [[ "${FORCE_BUILD}" == "--force" ]]; then
+  logger -t netdash-updater "Updating NetDash from ${LOCAL_SHA:0:7} to ${REMOTE_SHA:0:7}..."
+  git reset --hard origin/main
+  if [[ -f backend/Dockerfile && -f frontend/Dockerfile ]]; then
+    docker compose --env-file "${INSTALL_DIR}/.env" up -d --build --remove-orphans
+  elif [[ -f docker-compose.yml ]]; then
+    docker compose --env-file "${INSTALL_DIR}/.env" up -d timescaledb redis vector
+  fi
+  docker image prune -f >/dev/null 2>&1 || true
+fi
+EOF
+
+  cat << 'EOF' > "${stage_dir}/netdash-updater.service"
+[Unit]
+Description=NetDash GitHub Auto-Updater Service
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/netdash-update
+WorkingDirectory=/opt/netdash
+EOF
+
+  cat << 'EOF' > "${stage_dir}/netdash-updater.timer"
+[Unit]
+Description=Poll GitHub every 5 minutes for NetDash updates
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  # 3e. First-boot provisioning script & systemd unit (non-blocking background service)
+  cat << 'EOF' > "${stage_dir}/netdash-firstboot.sh"
+#!/usr/bin/env bash
+set -euo pipefail
+BOOTSTRAP_LOG="/var/log/netdash-bootstrap.log"
+INSTALL_DIR="/opt/netdash"
+ENV_FILE="${INSTALL_DIR}/.env"
+
+exec > >(tee -a "${BOOTSTRAP_LOG}") 2>&1
+echo "[NetDash Bootstrap] Starting first-boot provisioning at $(date -u)"
+
+# Expand root partition & filesystem to full disk size (e.g., 120G)
+growpart /dev/sda 1 >/dev/null 2>&1 || growpart /dev/vda 1 >/dev/null 2>&1 || true
+resize2fs /dev/sda1 >/dev/null 2>&1 || resize2fs /dev/vda1 >/dev/null 2>&1 || true
+
+# Ensure networking, DNS, and SSH host keys are active
+systemctl enable --now systemd-networkd systemd-resolved >/dev/null 2>&1 || true
+ssh-keygen -A >/dev/null 2>&1 || true
+systemctl restart ssh || systemctl restart sshd || true
+sysctl --system >/dev/null 2>&1 || true
+
+# Wait up to 45s for network reachability
+for i in {1..15}; do
+  if ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || ping -c 1 -W 2 github.com >/dev/null 2>&1; then
+    break
+  fi
+  echo "[NetDash Bootstrap] Waiting for network connectivity ($i/15)..."
+  sleep 3
+done
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq qemu-guest-agent ca-certificates curl gnupg git ufw openssl lsb-release
+systemctl enable --now qemu-guest-agent || true
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "[NetDash Bootstrap] Installing Docker CE & Docker Compose plugin..."
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+  DEBIAN_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME:-bookworm}")"
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian ${DEBIAN_CODENAME} stable" > /etc/apt/sources.list.d/docker.list
+  apt-get update -qq
+  apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable --now docker
+fi
+
+source /etc/netdash-seed.env
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  git config --global credential.helper store
+  echo "https://x-access-token:${GITHUB_TOKEN}@github.com" > /root/.git-credentials
+  chmod 600 /root/.git-credentials
+fi
+
+if [[ -d "${INSTALL_DIR}/.git" ]]; then
+  git -C "${INSTALL_DIR}" fetch origin main
+  git -C "${INSTALL_DIR}" reset --hard origin/main
+else
+  rm -rf "${INSTALL_DIR}"
+  git clone --branch main "${REPO_URL}" "${INSTALL_DIR}"
+fi
+
+grep -vE '^(REPO_URL|GITHUB_TOKEN)=' /etc/netdash-seed.env > "${ENV_FILE}"
+chmod 600 "${ENV_FILE}"
+
+ufw allow OpenSSH || true
+ufw allow "${WEB_PORT}/tcp" || true
+ufw allow "${SYSLOG_PORT}/udp" || true
+ufw allow "${SYSLOG_PORT}/tcp" || true
+ufw --force enable || true
+
+systemctl daemon-reload
+systemctl enable --now netdash-updater.timer
+
+if [[ -f "${INSTALL_DIR}/docker-compose.yml" ]]; then
+  cd "${INSTALL_DIR}"
+  if [[ -f backend/Dockerfile && -f frontend/Dockerfile ]]; then
+    echo "[NetDash Bootstrap] Building and starting full NetDash stack..."
+    docker compose --env-file "${ENV_FILE}" up -d --build --remove-orphans
+  else
+    echo "[NetDash Bootstrap] Starting Phase 1 core services (TimescaleDB, Redis, Vector)..."
+    docker compose --env-file "${ENV_FILE}" up -d timescaledb redis vector
+  fi
+fi
+
+systemctl disable netdash-firstboot.service || true
+echo "[NetDash Bootstrap] COMPLETE"
+EOF
+
+  cat << 'EOF' > "${stage_dir}/netdash-firstboot.service"
+[Unit]
+Description=NetDash First-Boot Docker & Repository Provisioner
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/netdash-firstboot.sh
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  msg_info "Customizing Debian disk image (baking in root/${CI_USER} credentials, network & services)"
+  export LIBGUESTFS_BACKEND=direct
+  virt-customize -q -a "${work_img}" \
+    --hostname "${HN}" \
+    --root-password "password:${CI_PASSWORD}" \
+    --run-command "id -u ${CI_USER} >/dev/null 2>&1 || useradd -m -s /bin/bash -G sudo ${CI_USER}" \
+    --password "${CI_USER}:password:${CI_PASSWORD}" \
+    --run-command "echo '${CI_USER} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/${CI_USER} && chmod 0440 /etc/sudoers.d/${CI_USER}" \
+    --run-command "mkdir -p /etc/ssh/sshd_config.d && printf 'PermitRootLogin yes\nPasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/99-netdash-auth.conf" \
+    --run-command "rm -f /etc/systemd/network/* /etc/netplan/* 2>/dev/null || true" \
+    --upload "${stage_dir}/10-netdash.network:/etc/systemd/network/10-netdash.network" \
+    --run-command "chmod 0644 /etc/systemd/network/10-netdash.network && systemctl enable systemd-networkd" \
+    --run-command "systemctl mask systemd-networkd-wait-online.service cloud-init-local.service cloud-init.service cloud-config.service cloud-final.service >/dev/null 2>&1 || true" \
+    --upload "${stage_dir}/99-netdash.conf:/etc/sysctl.d/99-netdash.conf" \
+    --upload "${stage_dir}/netdash-seed.env:/etc/netdash-seed.env" \
+    --run-command "chmod 0600 /etc/netdash-seed.env" \
+    --upload "${stage_dir}/netdash-update:/usr/local/bin/netdash-update" \
+    --run-command "chmod 0755 /usr/local/bin/netdash-update" \
+    --upload "${stage_dir}/netdash-updater.service:/etc/systemd/system/netdash-updater.service" \
+    --upload "${stage_dir}/netdash-updater.timer:/etc/systemd/system/netdash-updater.timer" \
+    --upload "${stage_dir}/netdash-firstboot.sh:/usr/local/bin/netdash-firstboot.sh" \
+    --run-command "chmod 0755 /usr/local/bin/netdash-firstboot.sh" \
+    --upload "${stage_dir}/netdash-firstboot.service:/etc/systemd/system/netdash-firstboot.service" \
+    --run-command "systemctl enable netdash-firstboot.service"
+
+  if [[ -n "${SSH_KEY}" ]]; then
+    virt-customize -q -a "${work_img}" \
+      --ssh-inject "root:string:${SSH_KEY}" \
+      --ssh-inject "${CI_USER}:string:${SSH_KEY}"
+  fi
+  msg_ok "Customized disk image (local console & SSH login ready immediately on boot)"
+
+  # 4. Create and Configure the Proxmox KVM Virtual Machine (standard i440fx + VirtIO SCSI)
   msg_info "Creating Proxmox VM ${VMID} (${HN})"
   local net_arg="virtio,bridge=${BRG},firewall=1"
   [[ -n "${VLAN}" ]] && net_arg="${net_arg},tag=${VLAN}"
@@ -545,7 +609,6 @@ EOF
   qm create "${VMID}" \
     --name "${HN}" \
     --ostype l26 \
-    --machine q35 \
     --scsihw virtio-scsi-single \
     --agent "enabled=1,fstrim_cloned_disks=1" \
     --cpu "${CPU_TYPE}" \
@@ -559,9 +622,11 @@ EOF
     --tags "netdash;observability;docker" >/dev/null
   msg_ok "Created VM ${VMID} shell"
 
-  # 4. Import Cloud Image Disk & Resize
+  # 5. Import Customized Disk & Resize
   msg_info "Importing disk into storage pool '${STORAGE_POOL}' and resizing to ${DISK_SIZE}G"
-  qm importdisk "${VMID}" "${img_path}" "${STORAGE_POOL}" >/dev/null 2>&1
+  qm importdisk "${VMID}" "${work_img}" "${STORAGE_POOL}" >/dev/null 2>&1
+  rm -rf "${work_img}" "${stage_dir}"
+
   local disk_ref
   disk_ref="$(qm config "${VMID}" | awk -F': ' '/^unused0:/ {print $2}')"
   if [[ -z "${disk_ref}" ]]; then
@@ -570,34 +635,12 @@ EOF
 
   qm set "${VMID}" \
     --scsi0 "${disk_ref},discard=on,iothread=1,ssd=1" \
-    --boot "order=scsi0" \
-    --ide2 "${STORAGE_POOL}:cloudinit" >/dev/null
+    --boot "order=scsi0" >/dev/null
 
   qm resize "${VMID}" scsi0 "${DISK_SIZE}G" >/dev/null
   msg_ok "Configured ${DISK_SIZE}G VirtIO SCSI SSD disk (discard=on, iothread=1, ssd=1)"
 
-  # 5. Apply Cloud-Init Network, Credentials, and Vendor Snippet
-  msg_info "Applying Cloud-Init parameters to VM ${VMID}"
-  if [[ "${NET_MODE}" == "static" ]]; then
-    qm set "${VMID}" --ipconfig0 "ip=${STATIC_IP},gw=${GATEWAY_IP}" >/dev/null
-    [[ -n "${DNS_SERVER}" ]] && qm set "${VMID}" --nameserver "${DNS_SERVER}" >/dev/null
-  else
-    qm set "${VMID}" --ipconfig0 "ip=dhcp" >/dev/null
-  fi
-
-  qm set "${VMID}" \
-    --ciuser "${CI_USER}" \
-    --cipassword "${CI_PASSWORD}" \
-    --cicustom "vendor=local:snippets/netdash-${VMID}-vendor.yaml" >/dev/null
-
-  if [[ -n "${SSH_KEY}" ]]; then
-    local tmp_key="/tmp/netdash-${VMID}.pub"
-    echo "${SSH_KEY}" > "${tmp_key}"
-    qm set "${VMID}" --sshkeys "${tmp_key}" >/dev/null
-    rm -f "${tmp_key}"
-  fi
-
-  # Set community-scripts style HTML description in Proxmox UI Notes
+  # Resize root partition inside the image on boot via cloud-guest-utils (already in Debian cloud image)
   local vm_notes
   vm_notes="<div align='center'>
   <h2>NetDash — Network Observability Dashboard</h2>
@@ -605,14 +648,13 @@ EOF
   <p><b>Web UI Port:</b> <code>${WEB_PORT}/tcp</code> &nbsp;|&nbsp; <b>Syslog Port:</b> <code>${SYSLOG_PORT}/udp+tcp</code></p>
 </div>"
   qm set "${VMID}" --description "${vm_notes}" >/dev/null
-  msg_ok "Applied Cloud-Init configuration and Proxmox UI Notes"
 
   # 6. Start VM and Monitor Guest Bootstrap via QEMU Guest Agent
   msg_info "Starting VM ${VMID} (${HN})"
   qm start "${VMID}"
   msg_ok "Started VM ${VMID}"
 
-  msg_info "Waiting for QEMU Guest Agent & IPv4 lease inside VM ${VMID} (this takes ~45-90s)"
+  msg_info "Waiting for VM ${VMID} network & QEMU Guest Agent (~45-90s while packages install)"
   local vm_ip="" attempts=0
   while [[ "${attempts}" -lt 60 ]]; do
     sleep 3
@@ -633,13 +675,12 @@ EOF
     msg_ok "VM ${VMID} is online at IPv4: ${BGN}${vm_ip}${CL}"
   else
     vm_ip="${STATIC_IP%%/*}"
-    [[ -z "${vm_ip}" ]] && vm_ip="<VM-DHCP-IP>"
-    msg_warn "QEMU Guest Agent still initializing; continuing bootstrap in background."
+    [[ -z "${vm_ip}" ]] && vm_ip="<VM-IP>"
+    msg_warn "QEMU Guest Agent still initializing in background; check Proxmox Console for live progress."
   fi
 
-  # Wait for /usr/local/bin/netdash-firstboot.sh to complete if Guest Agent is responsive
   if qm guest cmd "${VMID}" ping >/dev/null 2>&1; then
-    msg_info "Provisioning Docker CE, TimescaleDB, Redis, Vector & NetDash inside VM ${VMID}"
+    msg_info "Waiting for Docker CE & NetDash container stack inside VM ${VMID}"
     local boot_tries=0
     while [[ "${boot_tries}" -lt 90 ]]; do
       sleep 4
@@ -654,11 +695,11 @@ EOF
   echo ""
   echo -e "${BL}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${CL}"
   msg_ok "${BOLD}${APP} Proxmox VM (${VMID}) has been provisioned!${CL}"
+  echo -e "   ${INFO} ${BOLD}Console/SSH Login:${CL} ${BL}root${CL} or ${BL}${CI_USER}${CL} (password: ${BL}${CI_PASSWORD}${CL})"
   echo -e "   ${INFO} ${BOLD}Dashboard URL:${CL}     ${BGN}http://${vm_ip}:${WEB_PORT}${CL}"
   echo -e "   ${INFO} ${BOLD}Syslog Receiver:${CL}   ${GN}${vm_ip}:${SYSLOG_PORT} (UDP/TCP)${CL}"
-  echo -e "   ${INFO} ${BOLD}SSH Access:${CL}        ${BL}ssh ${CI_USER}@${vm_ip}${CL} (sudo enabled)"
-  echo -e "   ${INFO} ${BOLD}Bootstrap Log:${CL}     ${BL}qm guest exec ${VMID} -- tail -n 50 ${BOOTSTRAP_LOG}${CL}"
-  echo -e "   ${INFO} ${BOLD}Manual Git Pull:${CL}   ${BL}sudo netdash-update --force${CL} (inside VM)"
+  echo -e "   ${INFO} ${BOLD}SSH Command:${CL}       ${BL}ssh root@${vm_ip}${CL}"
+  echo -e "   ${INFO} ${BOLD}Bootstrap Log:${CL}     ${BL}tail -f ${BOOTSTRAP_LOG}${CL} (inside VM)"
   echo -e "${BL}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${CL}"
 }
 
