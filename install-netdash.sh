@@ -145,6 +145,47 @@ select_storage_pool() {
   echo "${selected}"
 }
 
+select_network_bridge() {
+  local -a bridges=()
+  local br br_ip vlan_info desc
+
+  while read -r br; do
+    [[ -z "${br}" ]] && continue
+    br_ip="$(ip -4 -o addr show dev "${br}" 2>/dev/null | awk '{print $4}' | head -n1 || true)"
+    vlan_info=""
+    if awk "/^iface ${br} /,/^$/" /etc/network/interfaces 2>/dev/null | grep -q "bridge-vlan-aware yes"; then
+      local vids
+      vids="$(awk "/^iface ${br} /,/^$/" /etc/network/interfaces 2>/dev/null | awk '/bridge-vids/ {$1=""; print substr($0,2)}')"
+      vlan_info=" [VLAN-aware${vids:+: ${vids}}]"
+    fi
+    desc="${br_ip:-no-ip}${vlan_info}"
+    bridges+=("${br}" "${desc}" "OFF")
+  done < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1)
+
+  if [[ "${#bridges[@]}" -eq 0 ]]; then
+    echo "vmbr0"
+    return 0
+  fi
+
+  # Default first bridge to ON
+  bridges[2]="ON"
+
+  if [[ "${#bridges[@]}" -eq 3 ]]; then
+    echo "${bridges[0]}"
+    return 0
+  fi
+
+  local selected
+  selected=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
+    --title "Network Bridge Selection" \
+    --radiolist "\nSelect the Proxmox Network Bridge for the VM:\n" \
+    15 70 5 \
+    "${bridges[@]}" \
+    3>&1 1>&2 2>&3) || die "Installation cancelled by user."
+
+  echo "${selected}"
+}
+
 proxmox_default_settings() {
   VMID="$(get_next_vmid)"
   HN="netdash"
@@ -157,9 +198,13 @@ proxmox_default_settings() {
   VLAN=""
   MAC=""
   NET_MODE="dhcp"
+  HOST_GW="$(ip -4 route show default 2>/dev/null | awk '{print $3}' | head -n1 || true)"
+  [[ -z "${HOST_GW}" ]] && HOST_GW="192.168.1.1"
+  HOST_SUBNET="$(ip -4 route show proto kernel scope link 2>/dev/null | awk '{print $1}' | head -n1 || true)"
+  [[ -z "${HOST_SUBNET}" ]] && HOST_SUBNET="192.168.1.0/24"
   STATIC_IP=""
-  GATEWAY_IP=""
-  DNS_SERVER="1.1.1.1"
+  GATEWAY_IP="${HOST_GW}"
+  DNS_SERVER="${HOST_GW}"
   CI_USER="netdash"
   CI_PASSWORD="netdash"
   SSH_KEY=""
@@ -212,10 +257,6 @@ proxmox_wizard() {
       --inputbox "\nSet VirtIO SCSI Disk Size in GB (Recommended: 120):" 10 58 "${DISK_SIZE}" \
       --title "DISK SIZE (GB)" 3>&1 1>&2 2>&3) || die "Cancelled."
 
-    BRG=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-      --inputbox "\nSet Proxmox Network Bridge:" 10 58 "${BRG}" \
-      --title "NETWORK BRIDGE" 3>&1 1>&2 2>&3) || die "Cancelled."
-
     SSH_KEY=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
       --inputbox "\nOptional SSH Public Key (ssh-ed25519 / ssh-rsa, or leave blank):" 10 68 "" \
       --title "SSH AUTHORIZED KEY" 3>&1 1>&2 2>&3) || die "Cancelled."
@@ -227,9 +268,11 @@ proxmox_wizard() {
     REPO_URL="${DEFAULT_REPO_URL}"
   fi
 
-  # --- Network & Login Settings (Always Prompted so VLAN / Static IP / Password never trip up boot) ---
+  # --- Network & Login Settings (Always Prompted so Bridge / VLAN / Static IP / Password never trip up boot) ---
+  BRG="$(select_network_bridge)"
+
   VLAN=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-    --inputbox "\nSet VLAN Tag on ${BRG} (leave blank if untagged):" 10 64 "" \
+    --inputbox "\nSet VLAN Tag on ${BRG} (e.g. 3, 5, 8 — leave blank if untagged):" 10 68 "" \
     --title "VLAN TAG (OPTIONAL)" 3>&1 1>&2 2>&3) || die "Cancelled."
 
   NET_MODE=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
@@ -241,15 +284,15 @@ proxmox_wizard() {
 
   if [[ "${NET_MODE}" == "static" ]]; then
     STATIC_IP=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-      --inputbox "\nEnter Static IPv4 & CIDR (e.g. 192.168.1.50/24):" 10 64 "192.168.1.50/24" \
+      --inputbox "\nEnter Static IPv4 & CIDR (e.g. ${HOST_GW%.*}.50/24):" 10 64 "${HOST_GW%.*}.50/24" \
       --title "STATIC IPv4 ADDRESS" 3>&1 1>&2 2>&3) || die "Cancelled."
 
     GATEWAY_IP=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-      --inputbox "\nEnter Default Gateway IPv4 (e.g. 192.168.1.1):" 10 64 "192.168.1.1" \
+      --inputbox "\nEnter Default Gateway IPv4:" 10 64 "${HOST_GW}" \
       --title "DEFAULT GATEWAY" 3>&1 1>&2 2>&3) || die "Cancelled."
 
     DNS_SERVER=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-      --inputbox "\nEnter DNS Server IPv4 (e.g. 192.168.1.1 or 1.1.1.1):" 10 64 "${GATEWAY_IP}" \
+      --inputbox "\nEnter DNS Server IPv4:" 10 64 "${GATEWAY_IP}" \
       --title "DNS SERVER" 3>&1 1>&2 2>&3) || die "Cancelled."
   fi
 
@@ -266,7 +309,7 @@ proxmox_wizard() {
   fi
 
   UNIFI_HOST=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-    --inputbox "\nUDM Pro Gateway IP / Hostname:" 10 68 "${GATEWAY_IP:-192.168.1.1}" \
+    --inputbox "\nUDM Pro Gateway IP / Hostname:" 10 68 "${GATEWAY_IP}" \
     --title "UNIFI GATEWAY HOST" 3>&1 1>&2 2>&3) || die "Cancelled."
 
   UNIFI_API_KEY=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
@@ -286,7 +329,7 @@ proxmox_wizard() {
     --title "SNMP TARGETS" 3>&1 1>&2 2>&3) || die "Cancelled."
 
   ALLOWED_SUBNETS=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-    --inputbox "\nAllowed Subnets for Nmap + ARP Scanner (comma-separated CIDRs):" 10 68 "192.168.1.0/24" \
+    --inputbox "\nAllowed Subnets for Nmap + ARP Scanner (comma-separated CIDRs):" 10 68 "${HOST_SUBNET}" \
     --title "ALLOWED SUBNETS" 3>&1 1>&2 2>&3) || die "Cancelled."
 
   WEB_PORT="8080"
@@ -371,6 +414,7 @@ Name=en* eth*
 DHCP=ipv4
 
 [DHCPv4]
+ClientIdentifier=mac
 UseDNS=true
 UseRoutes=true
 SendHostname=true
@@ -591,7 +635,7 @@ EOF
     --upload "${stage_dir}/netdash-firstboot.sh:/usr/local/bin/netdash-firstboot.sh" \
     --run-command "chmod 0755 /usr/local/bin/netdash-firstboot.sh" \
     --upload "${stage_dir}/netdash-firstboot.service:/etc/systemd/system/netdash-firstboot.service" \
-    --run-command "systemctl enable netdash-firstboot.service"
+    --run-command "systemctl enable netdash-firstboot.service && systemd-machine-id-setup"
 
   if [[ -n "${SSH_KEY}" ]]; then
     virt-customize -q -a "${work_img}" \
@@ -602,9 +646,9 @@ EOF
 
   # 4. Create and Configure the Proxmox KVM Virtual Machine (standard i440fx + VirtIO SCSI)
   msg_info "Creating Proxmox VM ${VMID} (${HN})"
-  local net_arg="virtio,bridge=${BRG},firewall=1"
+  local net_arg="virtio,bridge=${BRG}"
   [[ -n "${VLAN}" ]] && net_arg="${net_arg},tag=${VLAN}"
-  [[ -n "${MAC}" ]] && net_arg="virtio=${MAC},bridge=${BRG},firewall=1${VLAN:+,tag=${VLAN}}"
+  [[ -n "${MAC}" ]] && net_arg="virtio=${MAC},bridge=${BRG}${VLAN:+,tag=${VLAN}}"
 
   qm create "${VMID}" \
     --name "${HN}" \
