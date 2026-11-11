@@ -273,13 +273,15 @@ proxmox_wizard() {
     SSH_KEY=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
       --inputbox "\nOptional SSH Public Key (ssh-ed25519 / ssh-rsa, or leave blank):" 10 68 "" \
       --title "SSH AUTHORIZED KEY" 3>&1 1>&2 2>&3) || die "Cancelled."
+
+    REPO_URL=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
+      --inputbox "\nGitHub Repository HTTPS URL to clone into /opt/netdash:" 10 68 "${DEFAULT_REPO_URL}" \
+      --title "GITHUB REPOSITORY" 3>&1 1>&2 2>&3) || die "Cancelled."
+  else
+    REPO_URL="${DEFAULT_REPO_URL}"
   fi
 
   # --- NetDash Application Telemetry Settings (Prompted in Both Default & Advanced) ---
-  REPO_URL=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-    --inputbox "\nGitHub Repository HTTPS URL to clone into /opt/netdash:" 10 68 "${DEFAULT_REPO_URL}" \
-    --title "GITHUB REPOSITORY" 3>&1 1>&2 2>&3) || die "Cancelled."
-
   if [[ -z "${GITHUB_TOKEN}" ]]; then
     GITHUB_TOKEN=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
       --passwordbox "\nGitHub Personal Access Token (required for Private Repo; leave blank if Public):" 10 72 "" \
