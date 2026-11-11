@@ -411,6 +411,56 @@ write_files:
       LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS}
       WEB_PORT=${WEB_PORT}
 
+  - path: /usr/local/bin/netdash-update
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      INSTALL_DIR="/opt/netdash"
+      FORCE_BUILD="\${1:-}"
+      cd "\${INSTALL_DIR}"
+      [[ -d .git ]] || exit 0
+      git fetch origin main --quiet
+      LOCAL_SHA="\$(git rev-parse HEAD)"
+      REMOTE_SHA="\$(git rev-parse origin/main)"
+      if [[ "\${LOCAL_SHA}" != "\${REMOTE_SHA}" ]] || [[ "\${FORCE_BUILD}" == "--force" ]]; then
+        logger -t netdash-updater "Updating NetDash from \${LOCAL_SHA:0:7} to \${REMOTE_SHA:0:7}..."
+        git reset --hard origin/main
+        if [[ -f backend/Dockerfile && -f frontend/Dockerfile ]]; then
+          docker compose --env-file "\${INSTALL_DIR}/.env" up -d --build --remove-orphans
+        elif [[ -f docker-compose.yml ]]; then
+          docker compose --env-file "\${INSTALL_DIR}/.env" up -d timescaledb redis vector
+        fi
+        docker image prune -f >/dev/null 2>&1 || true
+      fi
+
+  - path: /etc/systemd/system/netdash-updater.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=NetDash GitHub Auto-Updater Service
+      After=network-online.target docker.service
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/netdash-update
+      WorkingDirectory=/opt/netdash
+
+  - path: /etc/systemd/system/netdash-updater.timer
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Poll GitHub every 5 minutes for NetDash updates
+
+      [Timer]
+      OnBootSec=2min
+      OnUnitActiveSec=5min
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+
   - path: /usr/local/bin/netdash-firstboot.sh
     permissions: '0755'
     content: |
@@ -462,55 +512,6 @@ write_files:
       ufw allow "\${SYSLOG_PORT}/tcp" || true
       ufw --force enable || true
 
-      # Install GitOps 5m Auto-Updater
-      cat << 'EUPD' > "${UPDATER_BIN}"
-      #!/usr/bin/env bash
-      set -euo pipefail
-      INSTALL_DIR="/opt/netdash"
-      FORCE_BUILD="\${1:-}"
-      cd "\${INSTALL_DIR}"
-      [[ -d .git ]] || exit 0
-      git fetch origin main --quiet
-      LOCAL_SHA="\$(git rev-parse HEAD)"
-      REMOTE_SHA="\$(git rev-parse origin/main)"
-      if [[ "\${LOCAL_SHA}" != "\${REMOTE_SHA}" ]] || [[ "\${FORCE_BUILD}" == "--force" ]]; then
-        logger -t netdash-updater "Updating NetDash from \${LOCAL_SHA:0:7} to \${REMOTE_SHA:0:7}..."
-        git reset --hard origin/main
-        if [[ -f backend/Dockerfile && -f frontend/Dockerfile ]]; then
-          docker compose --env-file "\${INSTALL_DIR}/.env" up -d --build --remove-orphans
-        elif [[ -f docker-compose.yml ]]; then
-          docker compose --env-file "\${INSTALL_DIR}/.env" up -d timescaledb redis vector
-        fi
-        docker image prune -f >/dev/null 2>&1 || true
-      fi
-      EUPD
-      chmod +x "${UPDATER_BIN}"
-
-      cat << 'ESVC' > /etc/systemd/system/netdash-updater.service
-      [Unit]
-      Description=NetDash GitHub Auto-Updater Service
-      After=network-online.target docker.service
-      Wants=network-online.target
-
-      [Service]
-      Type=oneshot
-      ExecStart=/usr/local/bin/netdash-update
-      WorkingDirectory=/opt/netdash
-      ESVC
-
-      cat << 'ETMR' > /etc/systemd/system/netdash-updater.timer
-      [Unit]
-      Description=Poll GitHub every 5 minutes for NetDash updates
-
-      [Timer]
-      OnBootSec=2min
-      OnUnitActiveSec=5min
-      Persistent=true
-
-      [Install]
-      WantedBy=timers.target
-      ETMR
-
       systemctl daemon-reload
       systemctl enable --now netdash-updater.timer
 
@@ -553,18 +554,16 @@ EOF
     --net0 "${net_arg}" \
     --onboot 1 \
     --serial0 socket \
-    --vga serial0 \
     --tags "netdash;observability;docker" >/dev/null
   msg_ok "Created VM ${VMID} shell"
 
   # 4. Import Cloud Image Disk & Resize
   msg_info "Importing disk into storage pool '${STORAGE_POOL}' and resizing to ${DISK_SIZE}G"
-  local import_out disk_ref
-  import_out="$(qm importdisk "${VMID}" "${img_path}" "${STORAGE_POOL}" --format qcow2 2>&1 || qm importdisk "${VMID}" "${img_path}" "${STORAGE_POOL}" 2>&1)"
-  disk_ref="$(echo "${import_out}" | sed -n "s/.*successfully imported disk '\([^']*\)'.*/\1/p" | tail -n1)"
+  qm importdisk "${VMID}" "${img_path}" "${STORAGE_POOL}" >/dev/null 2>&1
+  local disk_ref
+  disk_ref="$(qm config "${VMID}" | awk -F': ' '/^unused0:/ {print $2}')"
   if [[ -z "${disk_ref}" ]]; then
-    # Fallback lookup from qm config unused0
-    disk_ref="$(qm config "${VMID}" | awk -F': ' '/^unused0:/ {print $2}')"
+    die "Failed to locate imported disk (unused0) on VM ${VMID}."
   fi
 
   qm set "${VMID}" \
