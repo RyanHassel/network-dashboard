@@ -12,7 +12,7 @@ To create a new **NetDash KVM Virtual Machine** and automatically configure Debi
 Replace `ghp_YOUR_TOKEN` with a GitHub Personal Access Token (`repo` / `Contents: Read-only` scope):
 
 ```bash
-GITHUB_TOKEN="ghp_YOUR_TOKEN" bash -c "$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" https://raw.githubusercontent.com/RyanHassel/network-dashboard/main/install-netdash.sh)"
+export GITHUB_TOKEN="ghp_YOUR_TOKEN" && bash -c "$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" https://raw.githubusercontent.com/RyanHassel/network-dashboard/main/install-netdash.sh)"
 ```
 
 *(Because `GITHUB_TOKEN` is exported in the command, the installer automatically passes it into the VM's `/root/.git-credentials` (`0600`) so both the initial `git clone` and the 5-minute `netdash-updater.timer` authenticate to your private repository seamlessly.)*
@@ -42,7 +42,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/RyanHassel/network-dashb
 If you already have a running Debian 12 or Debian 13 VM/server, running the exact same command inside the guest OS will automatically detect it is inside Debian and bootstrap NetDash directly:
 
 ```bash
-GITHUB_TOKEN="ghp_YOUR_TOKEN" bash -c "$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" https://raw.githubusercontent.com/RyanHassel/network-dashboard/main/install-netdash.sh)"
+export GITHUB_TOKEN="ghp_YOUR_TOKEN" && bash -c "$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" https://raw.githubusercontent.com/RyanHassel/network-dashboard/main/install-netdash.sh)"
 ```
 
 ## Useful Commands (Inside the NetDash VM)

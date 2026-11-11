@@ -7,7 +7,7 @@
 #    Public repo:
 #     bash -c "$(curl -fsSL https://raw.githubusercontent.com/RyanHassel/network-dashboard/main/install-netdash.sh)"
 #    Private repo (with GitHub Personal Access Token):
-#     GITHUB_TOKEN="ghp_xxx" bash -c "$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" https://raw.githubusercontent.com/RyanHassel/network-dashboard/main/install-netdash.sh)"
+#     export GITHUB_TOKEN="ghp_xxx" && bash -c "$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" https://raw.githubusercontent.com/RyanHassel/network-dashboard/main/install-netdash.sh)"
 #
 # Dual-Mode Support:
 #   1. Proxmox VE Host CLI -> Launches interactive whiptail wizard, downloads
