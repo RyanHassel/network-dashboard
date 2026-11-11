@@ -1,0 +1,142 @@
+name: netdash
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: netdash-timescaledb
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-netdash}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_strong_db_password}
+      POSTGRES_DB: ${POSTGRES_DB:-netdash}
+      SNMP_RAW_RETENTION_DAYS: ${SNMP_RAW_RETENTION_DAYS:-180}
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-30}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - effective_cache_size=3GB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - max_connections=150
+      - -c
+      - timescaledb.max_background_workers=8
+    ports:
+      # Bound solely to loopback so the host-networked worker service can connect
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./db-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-netdash} -d $${POSTGRES_DB:-netdash}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks:
+      - netdash_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: netdash-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      # Bound solely to loopback so the host-networked worker service can connect
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - netdash_net
+
+  vector:
+    image: timberio/vector:0.42.0-alpine
+    container_name: netdash-vector
+    restart: unless-stopped
+    command: ["--config", "/etc/vector/vector.yaml"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://netdash:changeme_strong_db_password@timescaledb:5432/netdash}
+    ports:
+      - "${SYSLOG_PORT:-514}:514/udp"
+      - "${SYSLOG_PORT:-514}:514/tcp"
+    volumes:
+      - ./vector/vector.yaml:/etc/vector/vector.yaml:ro
+      - vector_data:/var/lib/vector
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    networks:
+      - netdash_net
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: netdash-api
+    restart: unless-stopped
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--proxy-headers"]
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - netdash_net
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: netdash-worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    extra_hosts:
+      - "timescaledb:127.0.0.1"
+      - "redis:127.0.0.1"
+    env_file:
+      - .env
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: netdash-frontend
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      - api
+    networks:
+      - netdash_net
+
+volumes:
+  timescaledb_data:
+  redis_data:
+  vector_data:
+
+networks:
+  netdash_net:
+    driver: bridge
