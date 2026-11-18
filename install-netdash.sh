@@ -453,32 +453,99 @@ LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS}
 WEB_PORT=${WEB_PORT}
 EOF
 
-  # 3d. GitOps auto-updater script & systemd units
+  # 3d. Update Checker (fetch-only, NO auto-install) + Manual/Prompt Update Installer
+  cat << 'EOF' > "${stage_dir}/netdash-check-update"
+#!/usr/bin/env bash
+set -euo pipefail
+INSTALL_DIR="/opt/netdash"
+cd "${INSTALL_DIR}"
+[[ -d .git ]] || exit 0
+git fetch origin main --quiet || exit 0
+LOCAL_SHA="$(git rev-parse --short=7 HEAD)"
+REMOTE_SHA="$(git rev-parse --short=7 origin/main)"
+BEHIND="$(git rev-list HEAD..origin/main --count 2>/dev/null || echo 0)"
+if [[ "${BEHIND}" -gt 0 ]]; then
+  logger -t netdash-check "Update available on origin/main (${LOCAL_SHA} -> ${REMOTE_SHA}, ${BEHIND} commits behind)"
+fi
+EOF
+
   cat << 'EOF' > "${stage_dir}/netdash-update"
 #!/usr/bin/env bash
 set -euo pipefail
 INSTALL_DIR="/opt/netdash"
-FORCE_BUILD="${1:-}"
 cd "${INSTALL_DIR}"
+rm -f "${INSTALL_DIR}/.trigger-update"
 [[ -d .git ]] || exit 0
+echo "[NetDash Updater] Fetching latest commits from origin/main..."
 git fetch origin main --quiet
-LOCAL_SHA="$(git rev-parse HEAD)"
-REMOTE_SHA="$(git rev-parse origin/main)"
-if [[ "${LOCAL_SHA}" != "${REMOTE_SHA}" ]] || [[ "${FORCE_BUILD}" == "--force" ]]; then
-  logger -t netdash-updater "Updating NetDash from ${LOCAL_SHA:0:7} to ${REMOTE_SHA:0:7}..."
-  git reset --hard origin/main
-  if [[ -f backend/Dockerfile && -f frontend/Dockerfile ]]; then
-    docker compose --env-file "${INSTALL_DIR}/.env" up -d --build --remove-orphans
-  elif [[ -f docker-compose.yml ]]; then
-    docker compose --env-file "${INSTALL_DIR}/.env" up -d timescaledb redis vector
-  fi
-  docker image prune -f >/dev/null 2>&1 || true
+LOCAL_SHA="$(git rev-parse --short=7 HEAD)"
+REMOTE_SHA="$(git rev-parse --short=7 origin/main)"
+logger -t netdash-updater "Installing NetDash update (${LOCAL_SHA} -> ${REMOTE_SHA})..."
+echo "[NetDash Updater] Updating working tree from ${LOCAL_SHA} to ${REMOTE_SHA}..."
+git reset --hard origin/main
+if [[ -f backend/Dockerfile && -f frontend/Dockerfile ]]; then
+  docker compose --env-file "${INSTALL_DIR}/.env" up -d --build --remove-orphans
+elif [[ -f docker-compose.yml ]]; then
+  docker compose --env-file "${INSTALL_DIR}/.env" up -d timescaledb redis vector
 fi
+docker image prune -f >/dev/null 2>&1 || true
+rm -f "${INSTALL_DIR}/.update-status.json"
+echo "[NetDash Updater] Update to ${REMOTE_SHA} complete!"
+EOF
+
+  cat << 'EOF' > "${stage_dir}/netdash-update-prompt.sh"
+#!/usr/bin/env bash
+# Interactive login prompt when new commits exist on origin/main (never auto-installs)
+if [[ $- == *i* ]] && [[ -d /opt/netdash/.git ]]; then
+  LOCAL_SHA="$(git -C /opt/netdash rev-parse --short=7 HEAD 2>/dev/null || true)"
+  REMOTE_SHA="$(git -C /opt/netdash rev-parse --short=7 origin/main 2>/dev/null || true)"
+  BEHIND="$(git -C /opt/netdash rev-list HEAD..origin/main --count 2>/dev/null || echo 0)"
+  if [[ -n "${BEHIND}" && "${BEHIND}" -gt 0 ]]; then
+    echo ""
+    echo -e "\033[1;33m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
+    echo -e " \033[1;32m[NetDash] UPDATE AVAILABLE:\033[0m ${BEHIND} new commit(s) on GitHub (${LOCAL_SHA} -> ${REMOTE_SHA})"
+    git -C /opt/netdash log HEAD..origin/main -n 5 --pretty=format:"   • %h — %s (%ar)" 2>/dev/null || true
+    echo ""
+    echo -e "\033[1;33m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
+    read -r -p " Download and install this update now? [y/N]: " ans
+    if [[ "${ans}" =~ ^[Yy]$ ]]; then
+      sudo /usr/local/bin/netdash-update
+    else
+      echo " Skipped update. Run 'sudo netdash-update' or install from the Web UI anytime."
+    fi
+    echo ""
+  fi
+fi
+EOF
+
+  cat << 'EOF' > "${stage_dir}/netdash-check.service"
+[Unit]
+Description=NetDash GitHub Update Check (Fetch Only — No Auto-Install)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/netdash-check-update
+WorkingDirectory=/opt/netdash
+EOF
+
+  cat << 'EOF' > "${stage_dir}/netdash-check.timer"
+[Unit]
+Description=Check GitHub every 5 minutes for available NetDash updates (Fetch Only)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
 EOF
 
   cat << 'EOF' > "${stage_dir}/netdash-updater.service"
 [Unit]
-Description=NetDash GitHub Auto-Updater Service
+Description=NetDash Manual / Web-Triggered Update Installer
 After=network-online.target docker.service
 Wants=network-online.target
 
@@ -488,17 +555,16 @@ ExecStart=/usr/local/bin/netdash-update
 WorkingDirectory=/opt/netdash
 EOF
 
-  cat << 'EOF' > "${stage_dir}/netdash-updater.timer"
+  cat << 'EOF' > "${stage_dir}/netdash-updater.path"
 [Unit]
-Description=Poll GitHub every 5 minutes for NetDash updates
+Description=Watch for Web UI Update Install Trigger (/opt/netdash/.trigger-update)
 
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
-Persistent=true
+[Path]
+PathExists=/opt/netdash/.trigger-update
+Unit=netdash-updater.service
 
 [Install]
-WantedBy=timers.target
+WantedBy=multi-user.target
 EOF
 
   # 3e. First-boot provisioning script & systemd unit (non-blocking background service)
@@ -580,7 +646,7 @@ ufw allow "${SYSLOG_PORT}/tcp" || true
 ufw --force enable || true
 
 systemctl daemon-reload
-systemctl enable --now netdash-updater.timer
+systemctl enable --now netdash-check.timer netdash-updater.path
 
 if [[ -f "${INSTALL_DIR}/docker-compose.yml" ]]; then
   cd "${INSTALL_DIR}"
@@ -630,10 +696,16 @@ EOF
     --upload "${stage_dir}/99-netdash.conf:/etc/sysctl.d/99-netdash.conf" \
     --upload "${stage_dir}/netdash-seed.env:/etc/netdash-seed.env" \
     --run-command "chmod 0600 /etc/netdash-seed.env" \
+    --upload "${stage_dir}/netdash-check-update:/usr/local/bin/netdash-check-update" \
+    --run-command "chmod 0755 /usr/local/bin/netdash-check-update" \
     --upload "${stage_dir}/netdash-update:/usr/local/bin/netdash-update" \
     --run-command "chmod 0755 /usr/local/bin/netdash-update" \
+    --upload "${stage_dir}/netdash-update-prompt.sh:/etc/profile.d/netdash-update-prompt.sh" \
+    --run-command "chmod 0755 /etc/profile.d/netdash-update-prompt.sh" \
+    --upload "${stage_dir}/netdash-check.service:/etc/systemd/system/netdash-check.service" \
+    --upload "${stage_dir}/netdash-check.timer:/etc/systemd/system/netdash-check.timer" \
     --upload "${stage_dir}/netdash-updater.service:/etc/systemd/system/netdash-updater.service" \
-    --upload "${stage_dir}/netdash-updater.timer:/etc/systemd/system/netdash-updater.timer" \
+    --upload "${stage_dir}/netdash-updater.path:/etc/systemd/system/netdash-updater.path" \
     --upload "${stage_dir}/netdash-firstboot.sh:/usr/local/bin/netdash-firstboot.sh" \
     --run-command "chmod 0755 /usr/local/bin/netdash-firstboot.sh" \
     --upload "${stage_dir}/netdash-firstboot.service:/etc/systemd/system/netdash-firstboot.service" \
@@ -882,43 +954,78 @@ EOF
   ufw --force enable >/dev/null 2>&1 || true
   msg_ok "Configured UFW firewall"
 
+  cat << 'EOF' > /usr/local/bin/netdash-check-update
+#!/usr/bin/env bash
+set -euo pipefail
+INSTALL_DIR="/opt/netdash"
+cd "${INSTALL_DIR}"
+[[ -d .git ]] || exit 0
+git fetch origin main --quiet || exit 0
+EOF
+  chmod +x /usr/local/bin/netdash-check-update
+
   cat << 'EOF' > "${UPDATER_BIN}"
 #!/usr/bin/env bash
 set -euo pipefail
 INSTALL_DIR="/opt/netdash"
-FORCE_BUILD="${1:-}"
 cd "${INSTALL_DIR}"
+rm -f "${INSTALL_DIR}/.trigger-update"
+[[ -d .git ]] || exit 0
 git fetch origin main --quiet
-LOCAL_SHA="$(git rev-parse HEAD)"
-REMOTE_SHA="$(git rev-parse origin/main)"
-if [[ "${LOCAL_SHA}" != "${REMOTE_SHA}" ]] || [[ "${FORCE_BUILD}" == "--force" ]]; then
-  logger -t netdash-updater "Updating NetDash from ${LOCAL_SHA:0:7} to ${REMOTE_SHA:0:7}..."
-  git reset --hard origin/main
-  if [[ -f backend/Dockerfile && -f frontend/Dockerfile ]]; then
-    docker compose --env-file "${INSTALL_DIR}/.env" up -d --build --remove-orphans
-  else
-    docker compose --env-file "${INSTALL_DIR}/.env" up -d timescaledb redis vector
-  fi
-  docker image prune -f >/dev/null 2>&1 || true
+LOCAL_SHA="$(git rev-parse --short=7 HEAD)"
+REMOTE_SHA="$(git rev-parse --short=7 origin/main)"
+logger -t netdash-updater "Installing NetDash update (${LOCAL_SHA} -> ${REMOTE_SHA})..."
+git reset --hard origin/main
+if [[ -f backend/Dockerfile && -f frontend/Dockerfile ]]; then
+  docker compose --env-file "${INSTALL_DIR}/.env" up -d --build --remove-orphans
+else
+  docker compose --env-file "${INSTALL_DIR}/.env" up -d timescaledb redis vector
 fi
+docker image prune -f >/dev/null 2>&1 || true
+rm -f "${INSTALL_DIR}/.update-status.json"
 EOF
   chmod +x "${UPDATER_BIN}"
 
-  cat << 'EOF' > /etc/systemd/system/netdash-updater.service
+  cat << 'EOF' > /etc/profile.d/netdash-update-prompt.sh
+#!/usr/bin/env bash
+if [[ $- == *i* ]] && [[ -d /opt/netdash/.git ]]; then
+  LOCAL_SHA="$(git -C /opt/netdash rev-parse --short=7 HEAD 2>/dev/null || true)"
+  REMOTE_SHA="$(git -C /opt/netdash rev-parse --short=7 origin/main 2>/dev/null || true)"
+  BEHIND="$(git -C /opt/netdash rev-list HEAD..origin/main --count 2>/dev/null || echo 0)"
+  if [[ -n "${BEHIND}" && "${BEHIND}" -gt 0 ]]; then
+    echo ""
+    echo -e "\033[1;33m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
+    echo -e " \033[1;32m[NetDash] UPDATE AVAILABLE:\033[0m ${BEHIND} new commit(s) on GitHub (${LOCAL_SHA} -> ${REMOTE_SHA})"
+    git -C /opt/netdash log HEAD..origin/main -n 5 --pretty=format:"   • %h — %s (%ar)" 2>/dev/null || true
+    echo ""
+    echo -e "\033[1;33m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
+    read -r -p " Download and install this update now? [y/N]: " ans
+    if [[ "${ans}" =~ ^[Yy]$ ]]; then
+      sudo /usr/local/bin/netdash-update
+    else
+      echo " Skipped update. Run 'sudo netdash-update' or install from the Web UI anytime."
+    fi
+    echo ""
+  fi
+fi
+EOF
+  chmod +x /etc/profile.d/netdash-update-prompt.sh
+
+  cat << 'EOF' > /etc/systemd/system/netdash-check.service
 [Unit]
-Description=NetDash GitHub Auto-Updater Service
-After=network-online.target docker.service
+Description=NetDash GitHub Update Check (Fetch Only — No Auto-Install)
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/netdash-update
+ExecStart=/usr/local/bin/netdash-check-update
 WorkingDirectory=/opt/netdash
 EOF
 
-  cat << 'EOF' > /etc/systemd/system/netdash-updater.timer
+  cat << 'EOF' > /etc/systemd/system/netdash-check.timer
 [Unit]
-Description=Poll GitHub every 5 minutes for NetDash updates
+Description=Check GitHub every 5 minutes for available NetDash updates (Fetch Only)
 
 [Timer]
 OnBootSec=2min
@@ -929,9 +1036,33 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+  cat << 'EOF' > /etc/systemd/system/netdash-updater.service
+[Unit]
+Description=NetDash Manual / Web-Triggered Update Installer
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/netdash-update
+WorkingDirectory=/opt/netdash
+EOF
+
+  cat << 'EOF' > /etc/systemd/system/netdash-updater.path
+[Unit]
+Description=Watch for Web UI Update Install Trigger (/opt/netdash/.trigger-update)
+
+[Path]
+PathExists=/opt/netdash/.trigger-update
+Unit=netdash-updater.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
   systemctl daemon-reload
-  systemctl enable --now netdash-updater.timer
-  msg_ok "Enabled netdash-updater.timer (5-minute GitOps polling)"
+  systemctl enable --now netdash-check.timer netdash-updater.path
+  msg_ok "Enabled netdash-check.timer (fetch-only) & manual update prompt"
 
   cd "${INSTALL_DIR}"
   if [[ -f backend/Dockerfile && -f frontend/Dockerfile ]]; then

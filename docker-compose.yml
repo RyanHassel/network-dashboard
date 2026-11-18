@@ -87,6 +87,8 @@ services:
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--proxy-headers"]
     env_file:
       - .env
+    volumes:
+      - .:/opt/netdash-repo
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:

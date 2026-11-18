@@ -20,10 +20,11 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/RyanHassel/network-dashb
    - Downloads the official Debian GenericCloud `.qcow2` image into `/var/lib/vz/template/cache/`.
    - Creates the KVM VM (`qm create` / `qm importdisk` / `qm resize`) and attaches a Cloud-Init vendor snippet.
    - Adds formatted HTML status notes and tags (`netdash;observability;docker`) to the VM in the Proxmox Web UI.
-3. **Zero-Touch Guest Bootstrap & 5-Minute GitOps Auto-Update**:
-   - Inside the new VM, Cloud-Init automatically installs `qemu-guest-agent`, `docker-ce`, `docker-compose-plugin`, `git`, and `ufw`, applies high-rate UDP syslog kernel `sysctl` tuning, clones this repository into `/opt/netdash`, generates `/opt/netdash/.env` (`0600`), and starts the Docker Compose stack.
-   - Enables `netdash-updater.timer` (`systemd`), which polls `origin/main` every **5 minutes** and automatically runs `docker compose up -d --build --remove-orphans` whenever you push a commit to GitHub.
-   - Tracks provisioning via the QEMU Guest Agent and prints the live **Dashboard URL** (`http://<VM_IP>:8080`) and **Syslog endpoint** (`<VM_IP>:514`) right in your Proxmox shell.
+3. **Zero-Touch Guest Bootstrap & Prompt-Driven Update Workflow**:
+   - Inside the new VM, the first-boot service automatically installs `qemu-guest-agent`, `net-tools`, `docker-ce`, `docker-compose-plugin`, `git`, and `ufw`, applies high-rate UDP syslog kernel `sysctl` tuning, clones this repository into `/opt/netdash`, generates `/opt/netdash/.env` (`0600`), and builds/starts the full 6-container NetDash stack (`timescaledb`, `redis`, `vector`, `api`, `worker`, and `frontend` Nginx on port `8080`).
+   - **Never Auto-Installs Updates**: `netdash-check.timer` runs `git fetch origin main` in the background without modifying the running server. Whenever new commits exist on GitHub:
+     - **In the Web UI (`http://<VM_IP>:8080`)**: An **"Update Available"** modal prompt and header badge appear with the pending commit changelog and a **"Download & Install Now"** button.
+     - **In the VM Console / SSH**: An interactive `[y/N]` prompt appears on login asking if you want to download and install the pending commits now.
 
 ---
 
