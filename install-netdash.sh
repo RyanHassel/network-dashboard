@@ -761,9 +761,9 @@ EOF
   # Resize root partition inside the image on boot via cloud-guest-utils (already in Debian cloud image)
   local vm_notes
   vm_notes="<div align='center'>
-  <h2>NetDash — Network Observability Dashboard</h2>
-  <p><b>GitHub Auto-Update:</b> Polls <code>origin/main</code> every 5m via <code>netdash-updater.timer</code></p>
-  <p><b>Web UI Port:</b> <code>${WEB_PORT}/tcp</code> &nbsp;|&nbsp; <b>Syslog Port:</b> <code>${SYSLOG_PORT}/udp+tcp</code></p>
+  <h2>NetDash - Network Observability Dashboard</h2>
+  <p><b>GitHub Updates:</b> Prompt-driven via Web UI or <code>sudo netdash-update</code></p>
+  <p><b>Web UI Port:</b> <code>${WEB_PORT}/tcp</code> | <b>Syslog Port:</b> <code>${SYSLOG_PORT}/udp+tcp</code></p>
 </div>"
   qm set "${VMID}" --description "${vm_notes}" >/dev/null
 
@@ -798,12 +798,12 @@ EOF
   fi
 
   if qm guest cmd "${VMID}" ping >/dev/null 2>&1; then
-    msg_info "Waiting for Docker CE & NetDash container stack inside VM ${VMID}"
+    msg_info "Building Docker CE & NetDash containers inside VM ${VMID} (takes ~2-3 minutes on first boot)"
     local boot_tries=0
-    while [[ "${boot_tries}" -lt 90 ]]; do
-      sleep 4
+    while [[ "${boot_tries}" -lt 120 ]]; do
+      sleep 5
       boot_tries=$((boot_tries + 1))
-      if qm guest exec "${VMID}" -- grep -q "COMPLETE" "${BOOTSTRAP_LOG}" >/dev/null 2>&1; then
+      if qm guest exec "${VMID}" -- grep -q "COMPLETE" "${BOOTSTRAP_LOG}" 2>/dev/null | grep -qE '"exitcode"[[:space:]]*:[[:space:]]*0'; then
         msg_ok "Guest bootstrap & Docker Compose stack completed!"
         break
       fi
