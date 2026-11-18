@@ -302,12 +302,6 @@ proxmox_wizard() {
   [[ -z "${CI_PASSWORD}" ]] && CI_PASSWORD="netdash"
 
   # --- NetDash Application Telemetry Settings ---
-  if [[ -z "${GITHUB_TOKEN}" ]]; then
-    GITHUB_TOKEN=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-      --passwordbox "\nGitHub Personal Access Token (required for Private Repo; leave blank if Public):" 10 72 "" \
-      --title "GITHUB ACCESS TOKEN (PRIVATE REPO)" 3>&1 1>&2 2>&3) || die "Cancelled."
-  fi
-
   UNIFI_HOST=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
     --inputbox "\nUDM Pro Gateway IP / Hostname:" 10 68 "${GATEWAY_IP}" \
     --title "UNIFI GATEWAY HOST" 3>&1 1>&2 2>&3) || die "Cancelled."
@@ -818,9 +812,6 @@ EOF
 
   echo ""
   prompt_guest_input "GitHub Repository HTTPS URL" "${DEFAULT_REPO_URL}" REPO_URL
-  if [[ -z "${GITHUB_TOKEN}" ]]; then
-    prompt_guest_input "GitHub Personal Access Token (for Private Repo; leave blank if Public)" "" GITHUB_TOKEN "true"
-  fi
   if [[ -n "${GITHUB_TOKEN}" ]]; then
     git config --global credential.helper store
     echo "https://x-access-token:${GITHUB_TOKEN}@github.com" > /root/.git-credentials
