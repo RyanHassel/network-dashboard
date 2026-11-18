@@ -523,14 +523,21 @@ growpart /dev/sda 1 >/dev/null 2>&1 || growpart /dev/vda 1 >/dev/null 2>&1 || tr
 resize2fs /dev/sda1 >/dev/null 2>&1 || resize2fs /dev/vda1 >/dev/null 2>&1 || true
 
 # Ensure networking, DNS, and SSH host keys are active
-systemctl enable --now systemd-networkd systemd-resolved >/dev/null 2>&1 || true
+systemd-machine-id-setup >/dev/null 2>&1 || true
+rm -f /etc/resolv.conf
+cat << 'ERES' > /etc/resolv.conf
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+ERES
+systemctl enable --now systemd-networkd >/dev/null 2>&1 || true
+systemctl restart systemd-networkd >/dev/null 2>&1 || true
 ssh-keygen -A >/dev/null 2>&1 || true
 systemctl restart ssh || systemctl restart sshd || true
 sysctl --system >/dev/null 2>&1 || true
 
 # Wait up to 45s for network reachability
 for i in {1..15}; do
-  if ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || ping -c 1 -W 2 github.com >/dev/null 2>&1; then
+  if ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
     break
   fi
   echo "[NetDash Bootstrap] Waiting for network connectivity ($i/15)..."
@@ -539,7 +546,7 @@ done
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq qemu-guest-agent ca-certificates curl gnupg git ufw openssl lsb-release
+apt-get install -y -qq qemu-guest-agent net-tools ca-certificates curl gnupg git ufw openssl lsb-release
 systemctl enable --now qemu-guest-agent || true
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -624,6 +631,7 @@ EOF
     --run-command "rm -f /etc/systemd/network/* /etc/netplan/* 2>/dev/null || true" \
     --upload "${stage_dir}/10-netdash.network:/etc/systemd/network/10-netdash.network" \
     --run-command "chmod 0644 /etc/systemd/network/10-netdash.network && systemctl enable systemd-networkd" \
+    --run-command "rm -f /etc/resolv.conf && printf 'nameserver ${DNS_SERVER:-1.1.1.1}\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf" \
     --run-command "systemctl mask systemd-networkd-wait-online.service cloud-init-local.service cloud-init.service cloud-config.service cloud-final.service >/dev/null 2>&1 || true" \
     --upload "${stage_dir}/99-netdash.conf:/etc/sysctl.d/99-netdash.conf" \
     --upload "${stage_dir}/netdash-seed.env:/etc/netdash-seed.env" \
