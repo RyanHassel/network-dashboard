@@ -24,8 +24,8 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/RyanHassel/network-dashb
 
 ### What the Proxmox VE Installer Does
 1. **Interactive `whiptail` Wizard (Default or Advanced Mode)**:
-   - **Default Mode**: Auto-selects the next free `VMID`, `4 vCPUs (host)`, `8 GB fixed RAM`, `120 GB VirtIO SCSI SSD` (`discard=on, iothread=1, ssd=1`), `vmbr0` (`DHCP`), and prompts only for your storage pool and NetDash telemetry settings (UDM Pro IP & API key, SNMP community & targets, allowed subnets).
-   - **Advanced Mode**: Customize `VMID`, hostname, Debian 12 (Bookworm) or Debian 13 (Trixie), CPU cores, RAM, disk size, network bridge, Management **VLAN tag**, **Static IPv4/Gateway/DNS**, SSH password, and SSH public key.
+   - **Default Mode**: Auto-selects the next free `VMID`, `4 vCPUs (host)`, `8 GB fixed RAM`, `120 GB VirtIO SCSI SSD` (`discard=on, iothread=1, ssd=1`), lets you choose your Proxmox storage pool, **network bridge (`vmbr0`, `vmbr1`, etc.)**, optional **VLAN tag**, **DHCP vs. Static IPv4**, local console/SSH password, and NetDash telemetry settings (UDM Pro IP & API key, SNMP community & targets, allowed subnets).
+   - **Advanced Mode**: Customize `VMID`, hostname, Debian 12 (Bookworm) or Debian 13 (Trixie), CPU cores, RAM, disk size, SSH public key, and custom repository URL.
 2. **Cloud-Image & Cloud-Init Provisioning**:
    - Downloads the official Debian GenericCloud `.qcow2` image into `/var/lib/vz/template/cache/`.
    - Creates the KVM VM (`qm create` / `qm importdisk` / `qm resize`) and attaches a Cloud-Init vendor snippet.
