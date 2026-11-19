@@ -1629,13 +1629,6 @@ export const App: React.FC = () => {
       if (resp.ok) {
         const data: SystemUpdateStatus = await resp.json();
         setUpdateInfo(data);
-        if (
-          data.update_available &&
-          data.remote_sha !== promptDismissedSha &&
-          data.status !== "updating"
-        ) {
-          openUpdateModal();
-        }
       }
     } catch {
       // ignore
@@ -1910,6 +1903,25 @@ export const App: React.FC = () => {
       fetchDetailTrend(selectedDeviceDetailIp, detailIfIndex, detailTrendRange);
     }
   }, [selectedDeviceDetailIp, detailIfIndex, detailTrendRange]);
+
+  useEffect(() => {
+    if (
+      activeTab === "settings" &&
+      updateInfo?.update_available &&
+      updateInfo.remote_sha !== promptDismissedSha &&
+      updateInfo.status !== "updating" &&
+      !installingUpdate
+    ) {
+      openUpdateModal();
+    }
+  }, [
+    activeTab,
+    updateInfo?.update_available,
+    updateInfo?.remote_sha,
+    updateInfo?.status,
+    promptDismissedSha,
+    installingUpdate,
+  ]);
 
   useEffect(() => {
     fetchUpdateProgress().then((p) => {
@@ -2300,19 +2312,26 @@ export const App: React.FC = () => {
                 fetchServerInfo(false);
               }}
               className={`relative flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition ${
-                activeTab === "settings"
-                  ? "border-emerald-500/40 bg-slate-800 text-white"
-                  : "border-slate-800 bg-[#111827] text-slate-300 hover:border-slate-700 hover:text-white"
+                updateInfo?.update_available && !installingUpdate
+                  ? activeTab === "settings"
+                    ? "border-amber-400/70 bg-amber-500/25 text-amber-200"
+                    : "border-amber-500/50 bg-amber-500/15 text-amber-300 hover:border-amber-400/70 hover:bg-amber-500/25 hover:text-amber-200"
+                  : activeTab === "settings"
+                    ? "border-emerald-500/40 bg-slate-800 text-white"
+                    : "border-slate-800 bg-[#111827] text-slate-300 hover:border-slate-700 hover:text-white"
               }`}
-              title="Server Information, Updates & Background Services"
+              title={
+                updateInfo?.update_available && !installingUpdate
+                  ? `Update available (${updateInfo.commits_behind} commit${
+                      updateInfo.commits_behind === 1 ? "" : "s"
+                    }) — Open Settings`
+                  : "Server Information, Updates & Background Services"
+              }
             >
               <Settings className="h-3.5 w-3.5" />
               <span>Settings</span>
-              {updateInfo?.update_available && (
-                <span
-                  className="h-2 w-2 rounded-full bg-amber-400"
-                  title={`${updateInfo.commits_behind} update(s) available`}
-                />
+              {updateInfo?.update_available && !installingUpdate && (
+                <DownloadCloud className="h-3.5 w-3.5 shrink-0 text-amber-300" />
               )}
             </button>
 
@@ -2550,6 +2569,10 @@ export const App: React.FC = () => {
       {/* Native <dialog> Modal Prompt for Available GitHub Updates */}
       <dialog
         ref={updateDialogRef}
+        onCancel={(e) => {
+          e.preventDefault();
+          if (!installingUpdate) closeUpdateModal();
+        }}
         onClick={(e) => {
           if (e.target === updateDialogRef.current && !installingUpdate) {
             closeUpdateModal();
@@ -5214,14 +5237,25 @@ export const App: React.FC = () => {
             <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
               <div className="flex flex-wrap items-start justify-between gap-4">
                 <div>
-                  <div className="flex items-center gap-2.5">
+                  <div className="flex flex-wrap items-center gap-2.5">
                     <DownloadCloud className="h-4 w-4 text-emerald-400" />
                     <h3 className="text-sm font-semibold text-white">Server Software Updates</h3>
                     {updateInfo?.update_available ? (
-                      <span className="rounded border border-amber-500/40 bg-amber-500/15 px-2 py-0.5 font-mono-tabular text-[11px] font-medium text-amber-300">
-                        Update Available ({updateInfo.commits_behind} commit
-                        {updateInfo.commits_behind === 1 ? "" : "s"})
-                      </span>
+                      <>
+                        <span className="rounded border border-amber-500/40 bg-amber-500/15 px-2 py-0.5 font-mono-tabular text-[11px] font-medium text-amber-300">
+                          Update Available ({updateInfo.commits_behind} commit
+                          {updateInfo.commits_behind === 1 ? "" : "s"})
+                        </span>
+                        {!installingUpdate && promptDismissedSha === updateInfo.remote_sha && (
+                          <button
+                            type="button"
+                            onClick={openUpdateModal}
+                            className="text-xs font-medium text-amber-300 underline decoration-amber-400/70 underline-offset-4 transition hover:text-amber-200"
+                          >
+                            What's New!
+                          </button>
+                        )}
+                      </>
                     ) : (
                       <span className="rounded border border-emerald-500/30 bg-emerald-500/15 px-2 py-0.5 font-mono-tabular text-[11px] font-medium text-emerald-400">
                         Up to Date
@@ -5246,25 +5280,16 @@ export const App: React.FC = () => {
                     <span>{checkingUpdate ? "Checking GitHub..." : "Check for Updates"}</span>
                   </button>
                   {updateInfo?.update_available && (
-                    <>
-                      <button
-                        onClick={openUpdateModal}
-                        disabled={installingUpdate}
-                        className="rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-700 disabled:opacity-50"
-                      >
-                        Open Update Prompt
-                      </button>
-                      <button
-                        onClick={handleInstallUpdate}
-                        disabled={installingUpdate}
-                        className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
-                      >
-                        <DownloadCloud className="h-3.5 w-3.5" />
-                        <span>
-                          {installingUpdate ? "Installing Update..." : "Download & Install Now"}
-                        </span>
-                      </button>
-                    </>
+                    <button
+                      onClick={handleInstallUpdate}
+                      disabled={installingUpdate}
+                      className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
+                    >
+                      <DownloadCloud className="h-3.5 w-3.5" />
+                      <span>
+                        {installingUpdate ? "Installing Update..." : "Download & Install Now"}
+                      </span>
+                    </button>
                   )}
                 </div>
               </div>
@@ -5312,28 +5337,6 @@ export const App: React.FC = () => {
                     Downloading commits from GitHub and rebuilding containers on host... This page
                     will reload automatically once complete.
                   </span>
-                </div>
-              )}
-
-              {updateInfo?.update_available && !installingUpdate && (
-                <div className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-4">
-                  <div className="mb-2 flex items-center justify-between text-xs">
-                    <span className="font-semibold text-amber-300">
-                      Available Update ({updateInfo.current_sha} → {updateInfo.remote_sha}) —
-                      What's New
-                    </span>
-                    <span className="font-mono-tabular text-[11px] text-amber-200/80">
-                      {updateInfo.commits_behind} pending commit(s)
-                    </span>
-                  </div>
-                  <ul className="list-disc space-y-1 pl-4 text-xs text-slate-200">
-                    {(updateInfo.summary_bullets && updateInfo.summary_bullets.length > 0
-                      ? updateInfo.summary_bullets
-                      : (updateInfo.commits || []).map((c) => c.subject)
-                    ).map((bullet, idx) => (
-                      <li key={idx}>{bullet}</li>
-                    ))}
-                  </ul>
                 </div>
               )}
             </div>
