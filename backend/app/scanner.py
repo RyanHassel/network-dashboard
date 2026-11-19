@@ -1,7 +1,6 @@
 import asyncio
 import ipaddress
 import logging
-import os
 import subprocess
 import time
 from typing import Any, Dict, List, Optional
@@ -13,23 +12,7 @@ logger = logging.getLogger("netdash.scanner")
 
 
 class SubnetScanner:
-    """Allowed-CIDR Nmap ping/ARP scanner with UniFi client & OS ARP cache correlation."""
-
-    def __init__(self) -> None:
-        raw_subnets = os.getenv("ALLOWED_SUBNETS", "").strip()
-        self.subnets: List[str] = []
-        for s in raw_subnets.split(","):
-            cidr = s.strip()
-            if not cidr:
-                continue
-            try:
-                net = ipaddress.ip_network(cidr, strict=False)
-                if net.version == 4:
-                    self.subnets.append(str(net))
-            except ValueError:
-                logger.warning("Ignoring invalid subnet CIDR in ALLOWED_SUBNETS: %s", cidr)
-        # Cap at 10 subnets per architectural requirement
-        self.subnets = self.subnets[:10]
+    """Allowed-CIDR Nmap ping/ARP scanner reading dynamic subnets from TimescaleDB."""
 
     @staticmethod
     def _read_local_arp_table() -> Dict[str, str]:
@@ -60,7 +43,11 @@ class SubnetScanner:
                 addresses = nm[host].get("addresses", {})
                 mac = str(addresses.get("mac", "")).lower() or None
                 vendor_dict = nm[host].get("vendor", {})
-                vendor = next(iter(vendor_dict.values()), "") if isinstance(vendor_dict, dict) and vendor_dict else ""
+                vendor = (
+                    next(iter(vendor_dict.values()), "")
+                    if isinstance(vendor_dict, dict) and vendor_dict
+                    else ""
+                )
                 hostname = nm[host].hostname() or ""
                 discovered[host] = {
                     "mac": mac,
@@ -72,13 +59,24 @@ class SubnetScanner:
         return discovered
 
     async def scan_all_subnets(self, pool: asyncpg.Pool) -> List[Dict[str, Any]]:
-        if not self.subnets:
+        async with pool.acquire() as conn:
+            sub_rows = await conn.fetch(
+                """
+                SELECT subnet_cidr, label, vlan_id
+                FROM scan_subnets_config
+                WHERE enabled = TRUE
+                ORDER BY id ASC
+                LIMIT 10
+                """
+            )
+
+        subnets = [dict(r) for r in sub_rows]
+        if not subnets:
             return []
 
         summaries: List[Dict[str, Any]] = []
         loop = asyncio.get_running_loop()
 
-        # Pre-load UniFi client correlation lookup by IP and MAC
         unifi_by_ip: Dict[str, Dict[str, Any]] = {}
         unifi_by_mac: Dict[str, Dict[str, Any]] = {}
         async with pool.acquire() as conn:
@@ -96,15 +94,20 @@ class SubnetScanner:
                 if entry.get("mac"):
                     unifi_by_mac[entry["mac"].lower()] = entry
 
-        for cidr in self.subnets:
+        for sub_item in subnets:
+            cidr = str(sub_item["subnet_cidr"]).strip()
+            cfg_vlan = sub_item.get("vlan_id")
+            try:
+                net_obj = ipaddress.ip_network(cidr, strict=False)
+            except ValueError:
+                continue
+
             t0 = time.perf_counter()
-            net_obj = ipaddress.ip_network(cidr, strict=False)
             total_ips = max(0, net_obj.num_addresses - 2)
 
             discovered = await loop.run_in_executor(None, self._run_nmap_sweep, cidr)
             arp_map = await loop.run_in_executor(None, self._read_local_arp_table)
 
-            # Also include active UniFi clients known to be inside this subnet
             for u_ip, u_info in unifi_by_ip.items():
                 try:
                     if ipaddress.ip_address(u_ip) in net_obj and u_ip not in discovered:
@@ -127,7 +130,6 @@ class SubnetScanner:
                     )
                 }
 
-                # Mark all existing hosts in this subnet offline initially, then mark online ones up
                 await conn.execute(
                     "UPDATE discovered_hosts SET is_online = FALSE WHERE subnet_cidr = $1",
                     cidr,
@@ -138,13 +140,17 @@ class SubnetScanner:
                         new_hosts += 1
 
                     mac: Optional[str] = info.get("mac") or arp_map.get(ip_str)
-                    u_match = unifi_by_ip.get(ip_str) or (unifi_by_mac.get(mac) if mac else None) or {}
+                    u_match = (
+                        unifi_by_ip.get(ip_str)
+                        or (unifi_by_mac.get(mac) if mac else None)
+                        or {}
+                    )
                     if not mac and u_match.get("mac"):
                         mac = str(u_match["mac"]).lower()
 
                     hostname = info.get("hostname") or u_match.get("hostname") or ip_str
                     vendor = info.get("vendor") or u_match.get("oui_vendor") or ""
-                    vlan_id = u_match.get("vlan_id")
+                    vlan_id = u_match.get("vlan_id") or cfg_vlan
                     sw_mac = u_match.get("sw_mac")
                     sw_port = u_match.get("sw_port")
                     src = info.get("source", "nmap+arp" if mac else "nmap")

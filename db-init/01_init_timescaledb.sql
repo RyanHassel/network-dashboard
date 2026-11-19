@@ -322,3 +322,59 @@ ALTER TABLE device_logs SET (
 -- Compress log chunks older than 3 days; drop chunks older than 30 days
 SELECT add_compression_policy('device_logs', INTERVAL '3 days', if_not_exists => TRUE);
 SELECT add_retention_policy('device_logs', INTERVAL '30 days', if_not_exists => TRUE);
+
+-- ==============================================================================
+-- 5. Dynamic Dashboard Configuration (Onboarding, SNMP Profiles, Hosts, Subnets)
+-- ==============================================================================
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key        TEXT PRIMARY KEY,
+    value      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS snmp_profiles (
+    id            SERIAL PRIMARY KEY,
+    name          TEXT NOT NULL UNIQUE,
+    version       TEXT NOT NULL DEFAULT 'v2c',
+    port          INT NOT NULL DEFAULT 161,
+    community     TEXT DEFAULT 'public',
+    v3_user       TEXT DEFAULT '',
+    v3_auth_proto TEXT DEFAULT 'SHA',
+    v3_auth_key   TEXT DEFAULT '',
+    v3_priv_proto TEXT DEFAULT 'AES',
+    v3_priv_key   TEXT DEFAULT '',
+    poll_interval INT NOT NULL DEFAULT 60,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS snmp_targets_config (
+    id         SERIAL PRIMARY KEY,
+    device_ip  TEXT NOT NULL UNIQUE,
+    label      TEXT DEFAULT '',
+    profile_id INT REFERENCES snmp_profiles(id) ON DELETE SET NULL,
+    enabled    BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS scan_subnets_config (
+    id          SERIAL PRIMARY KEY,
+    subnet_cidr TEXT NOT NULL UNIQUE,
+    label       TEXT DEFAULT '',
+    vlan_id     INT,
+    enabled     BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS unifi_controllers_config (
+    id            SERIAL PRIMARY KEY,
+    name          TEXT NOT NULL DEFAULT 'UDM Pro',
+    host          TEXT NOT NULL UNIQUE,
+    api_key       TEXT NOT NULL DEFAULT '',
+    site_name     TEXT NOT NULL DEFAULT 'default',
+    verify_ssl    BOOLEAN NOT NULL DEFAULT FALSE,
+    poll_interval INT NOT NULL DEFAULT 30,
+    enabled       BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+

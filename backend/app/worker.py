@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import asyncpg
 import redis.asyncio as aioredis
 
+from app.db_schema import ensure_dynamic_config_tables
 from app.scanner import SubnetScanner
 from app.snmp_poller import SNMPPoller
 from app.unifi import UniFiCollector
@@ -48,19 +49,28 @@ async def unifi_loop(
     pool: asyncpg.Pool,
     redis_client: aioredis.Redis,
     stop_event: asyncio.Event,
+    unifi_trigger: asyncio.Event,
 ) -> None:
-    logger.info("Starting UDM Pro telemetry loop (interval=%ds)", UNIFI_POLL_INTERVAL)
+    logger.info("Starting optional UniFi telemetry loop (interval=%ds)", UNIFI_POLL_INTERVAL)
     while not stop_event.is_set():
+        unifi_trigger.clear()
         try:
             summary = await collector.poll_and_store(pool)
             if summary:
                 await publish_event(redis_client, "unifi_update", summary)
         except Exception as exc:
-            logger.error("Error in UDM Pro loop: %s", exc)
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=UNIFI_POLL_INTERVAL)
-        except asyncio.TimeoutError:
-            pass
+            logger.error("Error in UniFi loop: %s", exc)
+
+        done, pending = await asyncio.wait(
+            [
+                asyncio.create_task(stop_event.wait()),
+                asyncio.create_task(unifi_trigger.wait()),
+            ],
+            timeout=UNIFI_POLL_INTERVAL,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
 
 
 async def snmp_loop(
@@ -68,23 +78,28 @@ async def snmp_loop(
     pool: asyncpg.Pool,
     redis_client: aioredis.Redis,
     stop_event: asyncio.Event,
+    snmp_trigger: asyncio.Event,
 ) -> None:
-    logger.info(
-        "Starting SNMP poller loop (targets=%d, interval=%ds)",
-        len(poller.targets),
-        SNMP_POLL_INTERVAL,
-    )
+    logger.info("Starting dynamic SNMP poller loop (interval=%ds)", SNMP_POLL_INTERVAL)
     while not stop_event.is_set():
+        snmp_trigger.clear()
         try:
             results = await poller.poll_all(pool, redis_client)
             if results:
                 await publish_event(redis_client, "snmp_update", results)
         except Exception as exc:
             logger.error("Error in SNMP loop: %s", exc)
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=SNMP_POLL_INTERVAL)
-        except asyncio.TimeoutError:
-            pass
+
+        done, pending = await asyncio.wait(
+            [
+                asyncio.create_task(stop_event.wait()),
+                asyncio.create_task(snmp_trigger.wait()),
+            ],
+            timeout=SNMP_POLL_INTERVAL,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
 
 
 async def scanner_loop(
@@ -94,11 +109,7 @@ async def scanner_loop(
     stop_event: asyncio.Event,
     scan_trigger: asyncio.Event,
 ) -> None:
-    logger.info(
-        "Starting Nmap subnet scanner loop (subnets=%s, interval=%dm)",
-        scanner.subnets,
-        SUBNET_SCAN_MINUTES,
-    )
+    logger.info("Starting dynamic Nmap subnet scanner loop (interval=%dm)", SUBNET_SCAN_MINUTES)
     while not stop_event.is_set():
         scan_trigger.clear()
         try:
@@ -112,7 +123,6 @@ async def scanner_loop(
         except Exception as exc:
             logger.error("Error in subnet scanner loop: %s", exc)
 
-        # Wait either for the scheduled interval, manual scan trigger, or shutdown
         done, pending = await asyncio.wait(
             [
                 asyncio.create_task(stop_event.wait()),
@@ -128,6 +138,8 @@ async def scanner_loop(
 async def command_listener_loop(
     redis_client: aioredis.Redis,
     scan_trigger: asyncio.Event,
+    snmp_trigger: asyncio.Event,
+    unifi_trigger: asyncio.Event,
     stop_event: asyncio.Event,
 ) -> None:
     pubsub = redis_client.pubsub()
@@ -139,9 +151,12 @@ async def command_listener_loop(
                 raw = msg["data"]
                 if isinstance(raw, bytes):
                     raw = raw.decode("utf-8", errors="ignore")
-                if raw == "scan_now":
-                    logger.info("Received manual subnet scan trigger via Redis.")
+                if raw in ("scan_now", "reload_all"):
                     scan_trigger.set()
+                if raw in ("snmp_now", "reload_all"):
+                    snmp_trigger.set()
+                if raw in ("unifi_now", "reload_all"):
+                    unifi_trigger.set()
             await asyncio.sleep(0.2)
     finally:
         await pubsub.close()
@@ -150,6 +165,8 @@ async def command_listener_loop(
 async def main() -> None:
     stop_event = asyncio.Event()
     scan_trigger = asyncio.Event()
+    snmp_trigger = asyncio.Event()
+    unifi_trigger = asyncio.Event()
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -158,7 +175,6 @@ async def main() -> None:
         except NotImplementedError:
             pass
 
-    # Retry DB connection on startup
     pool = None
     for attempt in range(1, 20):
         try:
@@ -171,6 +187,8 @@ async def main() -> None:
     if pool is None:
         raise RuntimeError("Could not connect to TimescaleDB.")
 
+    await ensure_dynamic_config_tables(pool)
+
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
 
     unifi_collector = UniFiCollector()
@@ -178,10 +196,10 @@ async def main() -> None:
     subnet_scanner = SubnetScanner()
 
     await asyncio.gather(
-        unifi_loop(unifi_collector, pool, redis_client, stop_event),
-        snmp_loop(snmp_poller, pool, redis_client, stop_event),
+        unifi_loop(unifi_collector, pool, redis_client, stop_event, unifi_trigger),
+        snmp_loop(snmp_poller, pool, redis_client, stop_event, snmp_trigger),
         scanner_loop(subnet_scanner, pool, redis_client, stop_event, scan_trigger),
-        command_listener_loop(redis_client, scan_trigger, stop_event),
+        command_listener_loop(redis_client, scan_trigger, snmp_trigger, unifi_trigger, stop_event),
     )
 
     await redis_client.aclose()

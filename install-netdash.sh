@@ -301,31 +301,14 @@ proxmox_wizard() {
     --title "LOCAL CONSOLE & SSH PASSWORD" 3>&1 1>&2 2>&3) || die "Cancelled."
   [[ -z "${CI_PASSWORD}" ]] && CI_PASSWORD="netdash"
 
-  # --- NetDash Application Telemetry Settings ---
-  UNIFI_HOST=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-    --inputbox "\nUDM Pro Gateway IP / Hostname:" 10 68 "${GATEWAY_IP}" \
-    --title "UNIFI GATEWAY HOST" 3>&1 1>&2 2>&3) || die "Cancelled."
-
-  UNIFI_API_KEY=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-    --passwordbox "\nUDM Pro Integration API Key (X-API-KEY):" 10 68 "" \
-    --title "UNIFI API KEY" 3>&1 1>&2 2>&3) || die "Cancelled."
-
-  UNIFI_SITE=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-    --inputbox "\nUniFi Site Identifier (default is 'default'):" 10 68 "default" \
-    --title "UNIFI SITE" 3>&1 1>&2 2>&3) || die "Cancelled."
-
-  SNMP_COMMUNITY=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-    --inputbox "\nSNMP v2c Community String:" 10 68 "public" \
-    --title "SNMP COMMUNITY" 3>&1 1>&2 2>&3) || die "Cancelled."
-
-  SNMP_TARGETS=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-    --inputbox "\nSNMP Target Device IPs (comma-separated, up to 50 devices):" 10 68 "${UNIFI_HOST}" \
-    --title "SNMP TARGETS" 3>&1 1>&2 2>&3) || die "Cancelled."
-
-  ALLOWED_SUBNETS=$(whiptail --backtitle "Proxmox VE Helper-Scripts — ${APP}" \
-    --inputbox "\nAllowed Subnets for Nmap + ARP Scanner (comma-separated CIDRs):" 10 68 "${HOST_SUBNET}" \
-    --title "ALLOWED SUBNETS" 3>&1 1>&2 2>&3) || die "Cancelled."
-
+  # All telemetry targets, SNMP profiles/secrets, subnets, and optional UniFi
+  # controllers are configured inside the Web Dashboard after boot.
+  UNIFI_HOST=""
+  UNIFI_API_KEY=""
+  UNIFI_SITE="default"
+  SNMP_COMMUNITY="public"
+  SNMP_TARGETS=""
+  ALLOWED_SUBNETS=""
   WEB_PORT="8080"
   SYSLOG_PORT="514"
   SNMP_RAW_RETENTION_DAYS="180"
@@ -904,23 +887,23 @@ EOF
   msg_ok "Applied sysctl parameters"
 
   echo ""
-  prompt_guest_input "GitHub Repository HTTPS URL" "${DEFAULT_REPO_URL}" REPO_URL
+  REPO_URL="${DEFAULT_REPO_URL}"
   if [[ -n "${GITHUB_TOKEN}" ]]; then
     git config --global credential.helper store
     echo "https://x-access-token:${GITHUB_TOKEN}@github.com" > /root/.git-credentials
     chmod 600 /root/.git-credentials
   fi
-  prompt_guest_input "UDM Pro Gateway IP / Host" "192.168.1.1" UNIFI_HOST
-  prompt_guest_input "UDM Pro Integration API Key (X-API-KEY)" "" UNIFI_API_KEY "true"
-  prompt_guest_input "UniFi Site Name" "default" UNIFI_SITE
-  prompt_guest_input "SNMP Version (v2c or v3)" "v2c" SNMP_VERSION
-  prompt_guest_input "SNMP v2c Community String" "public" SNMP_COMMUNITY
-  prompt_guest_input "SNMP Poll Targets (comma-separated IPs)" "${UNIFI_HOST}" SNMP_TARGETS
-  prompt_guest_input "Allowed Subnets for Nmap Scanner (comma-separated CIDRs)" "192.168.1.0/24" ALLOWED_SUBNETS
-  prompt_guest_input "Raw SNMP Retention Days" "180" SNMP_RAW_RETENTION_DAYS
-  prompt_guest_input "Syslog Retention Days" "30" LOG_RETENTION_DAYS
-  prompt_guest_input "Syslog Listen Port (UDP/TCP)" "514" SYSLOG_PORT
-  prompt_guest_input "Dashboard Web HTTP Port" "8080" WEB_PORT
+  UNIFI_HOST=""
+  UNIFI_API_KEY=""
+  UNIFI_SITE="default"
+  SNMP_VERSION="v2c"
+  SNMP_COMMUNITY="public"
+  SNMP_TARGETS=""
+  ALLOWED_SUBNETS=""
+  SNMP_RAW_RETENTION_DAYS="180"
+  LOG_RETENTION_DAYS="30"
+  SYSLOG_PORT="514"
+  WEB_PORT="8080"
 
   if [[ -d "${INSTALL_DIR}/.git" ]]; then
     msg_info "Updating existing repository in ${INSTALL_DIR}"

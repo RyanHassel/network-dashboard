@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -11,6 +12,9 @@ import asyncpg
 import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from app.db_schema import ensure_dynamic_config_tables
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,6 +33,51 @@ db_pool: Optional[asyncpg.Pool] = None
 redis_client: Optional[aioredis.Redis] = None
 
 
+class SNMPProfilePayload(BaseModel):
+    name: str
+    version: str = "v2c"
+    port: int = 161
+    community: str = "public"
+    v3_user: str = ""
+    v3_auth_proto: str = "SHA"
+    v3_auth_key: str = ""
+    v3_priv_proto: str = "AES"
+    v3_priv_key: str = ""
+    poll_interval: int = 60
+
+
+class SNMPTargetPayload(BaseModel):
+    device_ip: str
+    label: str = ""
+    profile_id: Optional[int] = None
+    enabled: bool = True
+
+
+class SubnetConfigPayload(BaseModel):
+    subnet_cidr: str
+    label: str = ""
+    vlan_id: Optional[int] = None
+    enabled: bool = True
+
+
+class UniFiControllerPayload(BaseModel):
+    name: str = "UDM Pro"
+    host: str
+    api_key: str = ""
+    site_name: str = "default"
+    verify_ssl: bool = False
+    poll_interval: int = 30
+    enabled: bool = True
+
+
+class OnboardingPayload(BaseModel):
+    skipped: bool = False
+    subnets: List[SubnetConfigPayload] = []
+    snmp_profiles: List[SNMPProfilePayload] = []
+    snmp_targets: List[SNMPTargetPayload] = []
+    unifi_controllers: List[UniFiControllerPayload] = []
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_pool, redis_client
@@ -39,6 +88,8 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.warning("Waiting for TimescaleDB (%d/15): %s", attempt, exc)
             await asyncio.sleep(2)
+    if db_pool is not None:
+        await ensure_dynamic_config_tables(db_pool)
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     yield
     if redis_client:
@@ -49,7 +100,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="NetDash Observability API",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -68,6 +119,14 @@ def _get_pool() -> asyncpg.Pool:
     return db_pool
 
 
+async def _notify_worker(cmd: str) -> None:
+    if redis_client:
+        try:
+            await redis_client.publish("netdash:cmd", cmd)
+        except Exception:
+            pass
+
+
 async def _inspect_git_update(do_fetch: bool = False) -> Dict[str, Any]:
     """Inspects /opt/netdash-repo for available commits on origin/main without auto-installing."""
     if not (REPO_MOUNT_DIR / ".git").exists():
@@ -81,7 +140,6 @@ async def _inspect_git_update(do_fetch: bool = False) -> Dict[str, Any]:
             "checked_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    # Ensure git trusts the mounted repository directory
     proc_safe = await asyncio.create_subprocess_exec(
         "git",
         "config",
@@ -199,6 +257,391 @@ async def install_update() -> Dict[str, Any]:
         "status": "updating",
         "message": "Update installation triggered on host. Containers will rebuild and restart shortly.",
     }
+
+
+# ==============================================================================
+# Dynamic Configuration & First-Time Onboarding Endpoints
+# ==============================================================================
+
+
+@app.get("/api/config")
+async def get_all_config() -> Dict[str, Any]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        ob_val = await conn.fetchval("SELECT value FROM app_settings WHERE key = 'onboarding'")
+        onboarding = json.loads(ob_val) if isinstance(ob_val, str) else (ob_val or {"completed": False, "skipped": False})
+
+        profiles = await conn.fetch(
+            """
+            SELECT id, name, version, port, community, v3_user, v3_auth_proto,
+                   v3_auth_key, v3_priv_proto, v3_priv_key, poll_interval
+            FROM snmp_profiles
+            ORDER BY id ASC
+            """
+        )
+
+        targets = await conn.fetch(
+            """
+            SELECT t.id, t.device_ip, t.label, t.profile_id, t.enabled,
+                   p.name AS profile_name, p.version AS profile_version
+            FROM snmp_targets_config t
+            LEFT JOIN snmp_profiles p ON p.id = t.profile_id
+            ORDER BY t.id ASC
+            """
+        )
+
+        subnets = await conn.fetch(
+            """
+            SELECT id, subnet_cidr, label, vlan_id, enabled
+            FROM scan_subnets_config
+            ORDER BY id ASC
+            """
+        )
+
+        unifi_ctrls = await conn.fetch(
+            """
+            SELECT id, name, host, api_key, site_name, verify_ssl, poll_interval, enabled
+            FROM unifi_controllers_config
+            ORDER BY id ASC
+            """
+        )
+
+    return {
+        "onboarding": onboarding,
+        "snmp_profiles": [dict(r) for r in profiles],
+        "snmp_targets": [dict(r) for r in targets],
+        "subnets": [dict(r) for r in subnets],
+        "unifi_controllers": [dict(r) for r in unifi_ctrls],
+    }
+
+
+@app.post("/api/config/onboarding")
+async def complete_onboarding(payload: OnboardingPayload) -> Dict[str, Any]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        default_profile_id = await conn.fetchval(
+            "SELECT id FROM snmp_profiles ORDER BY id ASC LIMIT 1"
+        )
+
+        for p in payload.snmp_profiles:
+            if not p.name.strip():
+                continue
+            default_profile_id = await conn.fetchval(
+                """
+                INSERT INTO snmp_profiles (
+                    name, version, port, community, v3_user, v3_auth_proto,
+                    v3_auth_key, v3_priv_proto, v3_priv_key, poll_interval
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (name) DO UPDATE SET
+                    version = EXCLUDED.version,
+                    port = EXCLUDED.port,
+                    community = EXCLUDED.community,
+                    v3_user = EXCLUDED.v3_user,
+                    v3_auth_proto = EXCLUDED.v3_auth_proto,
+                    v3_auth_key = EXCLUDED.v3_auth_key,
+                    v3_priv_proto = EXCLUDED.v3_priv_proto,
+                    v3_priv_key = EXCLUDED.v3_priv_key,
+                    poll_interval = EXCLUDED.poll_interval
+                RETURNING id
+                """,
+                p.name.strip(),
+                p.version.strip().lower(),
+                p.port,
+                p.community.strip(),
+                p.v3_user.strip(),
+                p.v3_auth_proto.strip().upper(),
+                p.v3_auth_key.strip(),
+                p.v3_priv_proto.strip().upper(),
+                p.v3_priv_key.strip(),
+                p.poll_interval,
+            )
+
+        for t in payload.snmp_targets:
+            ip_val = t.device_ip.strip()
+            if not ip_val:
+                continue
+            await conn.execute(
+                """
+                INSERT INTO snmp_targets_config (device_ip, label, profile_id, enabled)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (device_ip) DO UPDATE SET
+                    label = EXCLUDED.label,
+                    profile_id = COALESCE(EXCLUDED.profile_id, snmp_targets_config.profile_id),
+                    enabled = EXCLUDED.enabled
+                """,
+                ip_val,
+                t.label.strip(),
+                t.profile_id or default_profile_id,
+                t.enabled,
+            )
+
+        for s in payload.subnets:
+            raw_cidr = s.subnet_cidr.strip()
+            if not raw_cidr:
+                continue
+            try:
+                norm_cidr = str(ipaddress.ip_network(raw_cidr, strict=False))
+            except ValueError:
+                continue
+            await conn.execute(
+                """
+                INSERT INTO scan_subnets_config (subnet_cidr, label, vlan_id, enabled)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (subnet_cidr) DO UPDATE SET
+                    label = EXCLUDED.label,
+                    vlan_id = EXCLUDED.vlan_id,
+                    enabled = EXCLUDED.enabled
+                """,
+                norm_cidr,
+                s.label.strip(),
+                s.vlan_id,
+                s.enabled,
+            )
+
+        for u in payload.unifi_controllers:
+            if not u.host.strip():
+                continue
+            await conn.execute(
+                """
+                INSERT INTO unifi_controllers_config (
+                    name, host, api_key, site_name, verify_ssl, poll_interval, enabled
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (host) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    api_key = EXCLUDED.api_key,
+                    site_name = EXCLUDED.site_name,
+                    verify_ssl = EXCLUDED.verify_ssl,
+                    poll_interval = EXCLUDED.poll_interval,
+                    enabled = EXCLUDED.enabled
+                """,
+                u.name.strip() or "UDM Pro",
+                u.host.strip(),
+                u.api_key.strip(),
+                u.site_name.strip() or "default",
+                u.verify_ssl,
+                u.poll_interval,
+                u.enabled,
+            )
+
+        await conn.execute(
+            """
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES ('onboarding', $1::jsonb, NOW())
+            ON CONFLICT (key) DO UPDATE SET
+                value = EXCLUDED.value,
+                updated_at = NOW()
+            """,
+            json.dumps({"completed": True, "skipped": payload.skipped}),
+        )
+
+    await _notify_worker("reload_all")
+    return await get_all_config()
+
+
+@app.post("/api/config/snmp-profiles")
+async def create_snmp_profile(payload: SNMPProfilePayload) -> Dict[str, Any]:
+    pool = _get_pool()
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Profile name is required.")
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO snmp_profiles (
+                name, version, port, community, v3_user, v3_auth_proto,
+                v3_auth_key, v3_priv_proto, v3_priv_key, poll_interval
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (name) DO UPDATE SET
+                version = EXCLUDED.version,
+                port = EXCLUDED.port,
+                community = EXCLUDED.community,
+                v3_user = EXCLUDED.v3_user,
+                v3_auth_proto = EXCLUDED.v3_auth_proto,
+                v3_auth_key = EXCLUDED.v3_auth_key,
+                v3_priv_proto = EXCLUDED.v3_priv_proto,
+                v3_priv_key = EXCLUDED.v3_priv_key,
+                poll_interval = EXCLUDED.poll_interval
+            """,
+            name,
+            payload.version.strip().lower(),
+            payload.port,
+            payload.community.strip(),
+            payload.v3_user.strip(),
+            payload.v3_auth_proto.strip().upper(),
+            payload.v3_auth_key.strip(),
+            payload.v3_priv_proto.strip().upper(),
+            payload.v3_priv_key.strip(),
+            payload.poll_interval,
+        )
+    await _notify_worker("snmp_now")
+    return await get_all_config()
+
+
+@app.put("/api/config/snmp-profiles/{profile_id}")
+async def update_snmp_profile(profile_id: int, payload: SNMPProfilePayload) -> Dict[str, Any]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE snmp_profiles
+            SET name = $1, version = $2, port = $3, community = $4,
+                v3_user = $5, v3_auth_proto = $6, v3_auth_key = $7,
+                v3_priv_proto = $8, v3_priv_key = $9, poll_interval = $10
+            WHERE id = $11
+            """,
+            payload.name.strip(),
+            payload.version.strip().lower(),
+            payload.port,
+            payload.community.strip(),
+            payload.v3_user.strip(),
+            payload.v3_auth_proto.strip().upper(),
+            payload.v3_auth_key.strip(),
+            payload.v3_priv_proto.strip().upper(),
+            payload.v3_priv_key.strip(),
+            payload.poll_interval,
+            profile_id,
+        )
+    await _notify_worker("snmp_now")
+    return await get_all_config()
+
+
+@app.delete("/api/config/snmp-profiles/{profile_id}")
+async def delete_snmp_profile(profile_id: int) -> Dict[str, Any]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM snmp_profiles WHERE id = $1", profile_id)
+    await _notify_worker("snmp_now")
+    return await get_all_config()
+
+
+@app.post("/api/config/snmp-targets")
+async def create_snmp_target(payload: SNMPTargetPayload) -> Dict[str, Any]:
+    pool = _get_pool()
+    ip_str = payload.device_ip.strip()
+    if not ip_str:
+        raise HTTPException(status_code=400, detail="Host IP or hostname is required.")
+    async with pool.acquire() as conn:
+        profile_id = payload.profile_id
+        if not profile_id:
+            profile_id = await conn.fetchval("SELECT id FROM snmp_profiles ORDER BY id ASC LIMIT 1")
+        await conn.execute(
+            """
+            INSERT INTO snmp_targets_config (device_ip, label, profile_id, enabled)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (device_ip) DO UPDATE SET
+                label = EXCLUDED.label,
+                profile_id = EXCLUDED.profile_id,
+                enabled = EXCLUDED.enabled
+            """,
+            ip_str,
+            payload.label.strip(),
+            profile_id,
+            payload.enabled,
+        )
+    await _notify_worker("snmp_now")
+    return await get_all_config()
+
+
+@app.delete("/api/config/snmp-targets/{target_id}")
+async def delete_snmp_target(target_id: int) -> Dict[str, Any]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        dev_ip = await conn.fetchval(
+            "DELETE FROM snmp_targets_config WHERE id = $1 RETURNING device_ip",
+            target_id,
+        )
+        if dev_ip:
+            await conn.execute("DELETE FROM snmp_devices WHERE device_ip = $1", dev_ip)
+    return await get_all_config()
+
+
+@app.post("/api/config/subnets")
+async def create_subnet_config(payload: SubnetConfigPayload) -> Dict[str, Any]:
+    raw_cidr = payload.subnet_cidr.strip()
+    try:
+        net = ipaddress.ip_network(raw_cidr, strict=False)
+        if net.version != 4:
+            raise ValueError("Only IPv4 CIDRs supported")
+        norm_cidr = str(net)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid IPv4 CIDR: {raw_cidr}")
+
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO scan_subnets_config (subnet_cidr, label, vlan_id, enabled)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (subnet_cidr) DO UPDATE SET
+                label = EXCLUDED.label,
+                vlan_id = EXCLUDED.vlan_id,
+                enabled = EXCLUDED.enabled
+            """,
+            norm_cidr,
+            payload.label.strip(),
+            payload.vlan_id,
+            payload.enabled,
+        )
+    await _notify_worker("scan_now")
+    return await get_all_config()
+
+
+@app.delete("/api/config/subnets/{subnet_id}")
+async def delete_subnet_config(subnet_id: int) -> Dict[str, Any]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        cidr = await conn.fetchval(
+            "DELETE FROM scan_subnets_config WHERE id = $1 RETURNING subnet_cidr",
+            subnet_id,
+        )
+        if cidr:
+            await conn.execute("DELETE FROM discovered_hosts WHERE subnet_cidr = $1", cidr)
+    return await get_all_config()
+
+
+@app.post("/api/config/unifi")
+async def upsert_unifi_controller(payload: UniFiControllerPayload) -> Dict[str, Any]:
+    host = payload.host.strip()
+    if not host:
+        raise HTTPException(status_code=400, detail="UniFi controller host/IP is required.")
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO unifi_controllers_config (
+                name, host, api_key, site_name, verify_ssl, poll_interval, enabled
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (host) DO UPDATE SET
+                name = EXCLUDED.name,
+                api_key = CASE WHEN EXCLUDED.api_key != '' THEN EXCLUDED.api_key ELSE unifi_controllers_config.api_key END,
+                site_name = EXCLUDED.site_name,
+                verify_ssl = EXCLUDED.verify_ssl,
+                poll_interval = EXCLUDED.poll_interval,
+                enabled = EXCLUDED.enabled
+            """,
+            payload.name.strip() or "UDM Pro",
+            host,
+            payload.api_key.strip(),
+            payload.site_name.strip() or "default",
+            payload.verify_ssl,
+            payload.poll_interval,
+            payload.enabled,
+        )
+    await _notify_worker("unifi_now")
+    return await get_all_config()
+
+
+@app.delete("/api/config/unifi/{ctrl_id}")
+async def delete_unifi_controller(ctrl_id: int) -> Dict[str, Any]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM unifi_controllers_config WHERE id = $1", ctrl_id)
+    return await get_all_config()
+
+
+# ==============================================================================
+# Observability Telemetry Query Endpoints
+# ==============================================================================
 
 
 @app.get("/api/overview")
@@ -351,10 +794,6 @@ async def get_snmp_trends(
     if_index: int = Query(...),
     range_key: str = Query("24h", alias="range"),
 ) -> Dict[str, Any]:
-    """
-    Routes time-range queries <= 24h to `snmp_metrics_raw` and queries > 24h
-    (`7d`, `30d`, `1y`, `all`) to `snmp_metrics_hourly` or `snmp_metrics_daily`.
-    """
     pool = _get_pool()
     rk = range_key.lower()
 
@@ -413,7 +852,6 @@ async def get_snmp_trends(
             )
             source_table = "snmp_metrics_hourly"
         else:
-            # 1y or all -> query snmp_metrics_daily (retained indefinitely)
             where_time = "AND bucket > NOW() - INTERVAL '365 days'" if rk == "1y" else ""
             rows = await conn.fetch(
                 f"""
@@ -462,10 +900,12 @@ async def get_snmp_trends(
 @app.get("/api/scanner/hosts")
 async def get_discovered_hosts(subnet: Optional[str] = None) -> Dict[str, Any]:
     pool = _get_pool()
-    allowed_raw = os.getenv("ALLOWED_SUBNETS", "")
-    configured_subnets = [s.strip() for s in allowed_raw.split(",") if s.strip()]
-
     async with pool.acquire() as conn:
+        sub_rows = await conn.fetch(
+            "SELECT subnet_cidr FROM scan_subnets_config WHERE enabled = TRUE ORDER BY id ASC"
+        )
+        configured_subnets = [str(r["subnet_cidr"]) for r in sub_rows]
+
         if subnet:
             rows = await conn.fetch(
                 """
@@ -520,8 +960,7 @@ async def get_discovered_hosts(subnet: Optional[str] = None) -> Dict[str, Any]:
 
 @app.post("/api/scanner/trigger")
 async def trigger_subnet_scan() -> Dict[str, str]:
-    if redis_client:
-        await redis_client.publish("netdash:cmd", "scan_now")
+    await _notify_worker("scan_now")
     return {"status": "triggered", "message": "Immediate Nmap subnet sweep queued."}
 
 

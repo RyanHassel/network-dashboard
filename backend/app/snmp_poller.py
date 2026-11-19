@@ -10,7 +10,6 @@ import redis.asyncio as aioredis
 
 logger = logging.getLogger("netdash.snmp")
 
-# Standard numeric OIDs for SNMPv2-MIB, IF-MIB (64-bit ifXTable), and HOST-RESOURCES-MIB
 OID_SYS_DESCR = "1.3.6.1.2.1.1.1.0"
 OID_SYS_OBJECT_ID = "1.3.6.1.2.1.1.2.0"
 OID_SYS_UPTIME = "1.3.6.1.2.1.1.3.0"
@@ -34,46 +33,50 @@ OID_HR_PROC_LOAD = "1.3.6.1.2.1.25.3.3.1.2"
 
 
 class SNMPPoller:
-    """Asynchronous SNMPv2c/v3 GETBULK collector with 64-bit counter delta rate calculation."""
+    """Asynchronous SNMPv2c/v3 GETBULK collector using per-host database profiles & secrets."""
 
     def __init__(self) -> None:
-        raw_targets = os.getenv("SNMP_TARGETS", "").strip()
-        self.targets = [t.strip() for t in raw_targets.split(",") if t.strip()][:50]
-        self.version = os.getenv("SNMP_VERSION", "v2c").strip().lower()
-        self.community = os.getenv("SNMP_COMMUNITY", "public").strip() or "public"
-        self.port = int(os.getenv("SNMP_PORT", "161") or 161)
-        self.v3_user = os.getenv("SNMP_V3_USER", "").strip()
-        self.v3_auth_key = os.getenv("SNMP_V3_AUTH_KEY", "").strip()
-        self.v3_priv_key = os.getenv("SNMP_V3_PRIV_KEY", "").strip()
-        self.v3_auth_proto = os.getenv("SNMP_V3_AUTH_PROTOCOL", "SHA").strip().upper()
-        self.v3_priv_proto = os.getenv("SNMP_V3_PRIV_PROTOCOL", "AES").strip().upper()
+        self.default_version = os.getenv("SNMP_VERSION", "v2c").strip().lower()
+        self.default_community = os.getenv("SNMP_COMMUNITY", "public").strip() or "public"
+        self.default_port = int(os.getenv("SNMP_PORT", "161") or 161)
 
-    def _build_auth_args(self) -> List[str]:
-        if self.version == "v3" and self.v3_user:
-            args = ["-v3", "-u", self.v3_user]
-            if self.v3_auth_key and self.v3_priv_key:
+    @staticmethod
+    def _build_auth_args(profile: Dict[str, Any]) -> List[str]:
+        version = str(profile.get("version") or "v2c").strip().lower()
+        community = str(profile.get("community") or "public").strip()
+        v3_user = str(profile.get("v3_user") or "").strip()
+        v3_auth_key = str(profile.get("v3_auth_key") or "").strip()
+        v3_priv_key = str(profile.get("v3_priv_key") or "").strip()
+        v3_auth_proto = str(profile.get("v3_auth_proto") or "SHA").strip().upper()
+        v3_priv_proto = str(profile.get("v3_priv_proto") or "AES").strip().upper()
+
+        if version == "v3" and v3_user:
+            args = ["-v3", "-u", v3_user]
+            if v3_auth_key and v3_priv_key:
                 args.extend(
                     [
                         "-l",
                         "authPriv",
                         "-a",
-                        self.v3_auth_proto,
+                        v3_auth_proto,
                         "-A",
-                        self.v3_auth_key,
+                        v3_auth_key,
                         "-x",
-                        self.v3_priv_proto,
+                        v3_priv_proto,
                         "-X",
-                        self.v3_priv_key,
+                        v3_priv_key,
                     ]
                 )
-            elif self.v3_auth_key:
-                args.extend(["-l", "authNoPriv", "-a", self.v3_auth_proto, "-A", self.v3_auth_key])
+            elif v3_auth_key:
+                args.extend(["-l", "authNoPriv", "-a", v3_auth_proto, "-A", v3_auth_key])
             else:
                 args.extend(["-l", "noAuthNoPriv"])
             return args
-        return ["-v2c", "-c", self.community]
+        return ["-v2c", "-c", community]
 
-    async def _snmp_walk_oid(self, target: str, base_oid: str) -> Dict[str, str]:
+    async def _snmp_walk_oid(
+        self, target: str, port: int, auth_args: List[str], base_oid: str
+    ) -> Dict[str, str]:
         cmd = [
             "snmpbulkwalk",
             "-On",
@@ -82,8 +85,8 @@ class SNMPPoller:
             "2",
             "-r",
             "1",
-            *self._build_auth_args(),
-            f"{target}:{self.port}",
+            *auth_args,
+            f"{target}:{port}",
             base_oid,
         ]
         try:
@@ -117,40 +120,40 @@ class SNMPPoller:
 
     async def _poll_single_device(
         self,
-        target: str,
+        target_cfg: Dict[str, Any],
         pool: asyncpg.Pool,
         redis_client: aioredis.Redis,
     ) -> Optional[Dict[str, Any]]:
-        start_ts = time.perf_counter()
+        target = str(target_cfg["device_ip"]).strip()
+        label = str(target_cfg.get("label") or "").strip()
+        port = int(target_cfg.get("port") or self.default_port)
+        auth_args = self._build_auth_args(target_cfg)
 
-        # Fetch system scalars first
-        sys_scalars = await self._snmp_walk_oid(target, "1.3.6.1.2.1.1")
+        start_ts = time.perf_counter()
+        sys_scalars = await self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.2.1.1")
         if not sys_scalars:
             async with pool.acquire() as conn:
                 await conn.execute(
                     """
-                    INSERT INTO snmp_devices (device_ip, is_reachable, last_polled)
-                    VALUES ($1, FALSE, NOW())
+                    INSERT INTO snmp_devices (device_ip, sys_name, is_reachable, last_polled)
+                    VALUES ($1, $2, FALSE, NOW())
                     ON CONFLICT (device_ip) DO UPDATE SET
+                        sys_name = COALESCE(NULLIF($2, ''), snmp_devices.sys_name),
                         is_reachable = FALSE,
                         last_polled = NOW()
                     """,
                     target,
+                    label or target,
                 )
             return None
 
         sys_descr = sys_scalars.get("1.0", "")
         sys_obj_id = sys_scalars.get("2.0", "")
         raw_uptime = sys_scalars.get("3.0", "0").split(":")[0].strip()
-        try:
-            # Handle timeticks or days/hours string
-            sys_uptime = int(raw_uptime) if raw_uptime.isdigit() else 0
-        except ValueError:
-            sys_uptime = 0
-        sys_name = sys_scalars.get("5.0", target) or target
+        sys_uptime = int(raw_uptime) if raw_uptime.isdigit() else 0
+        sys_name = label or sys_scalars.get("5.0", target) or target
         sys_location = sys_scalars.get("6.0", "")
 
-        # Walk interface tables & CPU load concurrently
         (
             if_names,
             if_descrs,
@@ -165,18 +168,18 @@ class SNMPPoller:
             out_disc,
             cpu_loads,
         ) = await asyncio.gather(
-            self._snmp_walk_oid(target, OID_IF_NAME),
-            self._snmp_walk_oid(target, OID_IF_DESCR),
-            self._snmp_walk_oid(target, OID_IF_ALIAS),
-            self._snmp_walk_oid(target, OID_IF_HIGH_SPEED),
-            self._snmp_walk_oid(target, OID_IF_OPER_STATUS),
-            self._snmp_walk_oid(target, OID_IF_HC_IN_OCTETS),
-            self._snmp_walk_oid(target, OID_IF_HC_OUT_OCTETS),
-            self._snmp_walk_oid(target, OID_IF_IN_ERRORS),
-            self._snmp_walk_oid(target, OID_IF_OUT_ERRORS),
-            self._snmp_walk_oid(target, OID_IF_IN_DISCARDS),
-            self._snmp_walk_oid(target, OID_IF_OUT_DISCARDS),
-            self._snmp_walk_oid(target, OID_HR_PROC_LOAD),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_NAME),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_DESCR),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_ALIAS),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_HIGH_SPEED),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_OPER_STATUS),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_HC_IN_OCTETS),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_HC_OUT_OCTETS),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_IN_ERRORS),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_OUT_ERRORS),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_IN_DISCARDS),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_OUT_DISCARDS),
+            self._snmp_walk_oid(target, port, auth_args, OID_HR_PROC_LOAD),
         )
 
         cpu_vals = [float(v) for v in cpu_loads.values() if v.replace(".", "", 1).isdigit()]
@@ -207,7 +210,6 @@ class SNMPPoller:
             in_dsc = int(in_disc.get(k, "0") or 0) if in_disc.get(k, "0").isdigit() else 0
             out_dsc = int(out_disc.get(k, "0") or 0) if out_disc.get(k, "0").isdigit() else 0
 
-            # Compute delta bps against previous counter stored in Redis
             redis_key = f"snmp:prev:{target}:{idx}"
             prev_raw = await redis_client.get(redis_key)
             in_bps = 0.0
@@ -324,9 +326,31 @@ class SNMPPoller:
     async def poll_all(
         self, pool: asyncpg.Pool, redis_client: aioredis.Redis
     ) -> List[Dict[str, Any]]:
-        if not self.targets:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT t.device_ip, t.label,
+                       COALESCE(p.version, 'v2c') AS version,
+                       COALESCE(p.port, 161) AS port,
+                       COALESCE(p.community, 'public') AS community,
+                       COALESCE(p.v3_user, '') AS v3_user,
+                       COALESCE(p.v3_auth_proto, 'SHA') AS v3_auth_proto,
+                       COALESCE(p.v3_auth_key, '') AS v3_auth_key,
+                       COALESCE(p.v3_priv_proto, 'AES') AS v3_priv_proto,
+                       COALESCE(p.v3_priv_key, '') AS v3_priv_key
+                FROM snmp_targets_config t
+                LEFT JOIN snmp_profiles p ON p.id = t.profile_id
+                WHERE t.enabled = TRUE
+                ORDER BY t.id ASC
+                LIMIT 50
+                """
+            )
+
+        targets = [dict(r) for r in rows]
+        if not targets:
             return []
-        tasks = [self._poll_single_device(t, pool, redis_client) for t in self.targets]
+
+        tasks = [self._poll_single_device(t, pool, redis_client) for t in targets]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         valid: List[Dict[str, Any]] = []
         for res in results:
