@@ -621,7 +621,19 @@ if ! command -v docker >/dev/null 2>&1; then
   systemctl enable --now docker
 fi
 
-source /etc/netdash-seed.env
+usermod -aG docker netdash >/dev/null 2>&1 || true
+
+get_seed_val() {
+  awk -F'=' -v k="$1" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' /etc/netdash-seed.env
+}
+
+REPO_URL="$(get_seed_val REPO_URL)"
+GITHUB_TOKEN="$(get_seed_val GITHUB_TOKEN)"
+WEB_PORT="$(get_seed_val WEB_PORT)"
+SYSLOG_PORT="$(get_seed_val SYSLOG_PORT)"
+[[ -z "${WEB_PORT}" ]] && WEB_PORT="8080"
+[[ -z "${SYSLOG_PORT}" ]] && SYSLOG_PORT="514"
+
 if [[ -n "${GITHUB_TOKEN:-}" ]]; then
   git config --global credential.helper store
   echo "https://x-access-token:${GITHUB_TOKEN}@github.com" > /root/.git-credentials
@@ -800,11 +812,20 @@ EOF
   if qm guest cmd "${VMID}" ping >/dev/null 2>&1; then
     msg_info "Building Docker CE & NetDash containers inside VM ${VMID} (takes ~2-3 minutes on first boot)"
     local boot_tries=0
+    # Wait for first-boot script to either finish or fail (checking every 5s)
     while [[ "${boot_tries}" -lt 120 ]]; do
       sleep 5
       boot_tries=$((boot_tries + 1))
       if qm guest exec "${VMID}" -- grep -q "COMPLETE" "${BOOTSTRAP_LOG}" 2>/dev/null | grep -qE '"exitcode"[[:space:]]*:[[:space:]]*0'; then
         msg_ok "Guest bootstrap & Docker Compose stack completed!"
+        break
+      fi
+      if ! qm guest exec "${VMID}" -- systemctl is-active --quiet netdash-firstboot.service 2>/dev/null | grep -qE '"exitcode"[[:space:]]*:[[:space:]]*0'; then
+        if qm guest exec "${VMID}" -- grep -q "COMPLETE" "${BOOTSTRAP_LOG}" 2>/dev/null | grep -qE '"exitcode"[[:space:]]*:[[:space:]]*0'; then
+          msg_ok "Guest bootstrap & Docker Compose stack completed!"
+        else
+          msg_warn "First-boot service exited early; check ${BOOTSTRAP_LOG} inside VM ${VMID}."
+        fi
         break
       fi
     done
