@@ -520,10 +520,18 @@ async def create_snmp_target(payload: SNMPTargetPayload) -> Dict[str, Any]:
     ip_str = payload.device_ip.strip()
     if not ip_str:
         raise HTTPException(status_code=400, detail="Host IP or hostname is required.")
+    label_str = payload.label.strip()
     async with pool.acquire() as conn:
-        profile_id = payload.profile_id
-        if not profile_id:
-            profile_id = await conn.fetchval("SELECT id FROM snmp_profiles ORDER BY id ASC LIMIT 1")
+        valid_profile_id = None
+        if payload.profile_id:
+            valid_profile_id = await conn.fetchval(
+                "SELECT id FROM snmp_profiles WHERE id = $1", payload.profile_id
+            )
+        if not valid_profile_id:
+            valid_profile_id = await conn.fetchval(
+                "SELECT id FROM snmp_profiles ORDER BY id ASC LIMIT 1"
+            )
+
         await conn.execute(
             """
             INSERT INTO snmp_targets_config (device_ip, label, profile_id, enabled)
@@ -534,9 +542,53 @@ async def create_snmp_target(payload: SNMPTargetPayload) -> Dict[str, Any]:
                 enabled = EXCLUDED.enabled
             """,
             ip_str,
-            payload.label.strip(),
-            profile_id,
+            label_str,
+            valid_profile_id,
             payload.enabled,
+        )
+
+        # Immediately seed snmp_devices so the host is visible right away before first 60s poll
+        await conn.execute(
+            """
+            INSERT INTO snmp_devices (device_ip, sys_name, is_reachable, last_polled)
+            VALUES ($1, $2, TRUE, NOW())
+            ON CONFLICT (device_ip) DO UPDATE SET
+                sys_name = COALESCE(NULLIF($2, ''), snmp_devices.sys_name)
+            """,
+            ip_str,
+            label_str or ip_str,
+        )
+    await _notify_worker("snmp_now")
+    return await get_all_config()
+
+
+@app.put("/api/config/snmp-targets/{target_id}")
+async def update_snmp_target(target_id: int, payload: SNMPTargetPayload) -> Dict[str, Any]:
+    pool = _get_pool()
+    ip_str = payload.device_ip.strip()
+    if not ip_str:
+        raise HTTPException(status_code=400, detail="Host IP or hostname is required.")
+    async with pool.acquire() as conn:
+        valid_profile_id = None
+        if payload.profile_id:
+            valid_profile_id = await conn.fetchval(
+                "SELECT id FROM snmp_profiles WHERE id = $1", payload.profile_id
+            )
+        if not valid_profile_id:
+            valid_profile_id = await conn.fetchval(
+                "SELECT id FROM snmp_profiles ORDER BY id ASC LIMIT 1"
+            )
+        await conn.execute(
+            """
+            UPDATE snmp_targets_config
+            SET device_ip = $1, label = $2, profile_id = $3, enabled = $4
+            WHERE id = $5
+            """,
+            ip_str,
+            payload.label.strip(),
+            valid_profile_id,
+            payload.enabled,
+            target_id,
         )
     await _notify_worker("snmp_now")
     return await get_all_config()
@@ -962,6 +1014,306 @@ async def get_discovered_hosts(subnet: Optional[str] = None) -> Dict[str, Any]:
 async def trigger_subnet_scan() -> Dict[str, str]:
     await _notify_worker("scan_now")
     return {"status": "triggered", "message": "Immediate Nmap subnet sweep queued."}
+
+
+# ==============================================================================
+# Unified Devices Inventory & Per-Device Detailed Telemetry Page Endpoints
+# ==============================================================================
+
+
+@app.get("/api/devices")
+async def get_all_devices() -> Dict[str, Any]:
+    """Combines all discovered Nmap/ARP hosts, SNMP targets/devices, and UniFi devices/clients."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        disc_rows = await conn.fetch(
+            """
+            SELECT host(ip_address) AS ip_address, subnet_cidr, mac_address,
+                   hostname, vendor, vlan_id, is_online, discovery_source,
+                   switch_mac, switch_port, first_seen, last_seen
+            FROM discovered_hosts
+            ORDER BY ip_address ASC
+            """
+        )
+
+        snmp_cfg_rows = await conn.fetch(
+            """
+            SELECT t.id AS target_id, t.device_ip, t.label, t.profile_id, t.enabled,
+                   p.name AS profile_name, p.version AS profile_version
+            FROM snmp_targets_config t
+            LEFT JOIN snmp_profiles p ON p.id = t.profile_id
+            """
+        )
+
+        snmp_dev_rows = await conn.fetch(
+            """
+            SELECT device_ip, sys_name, sys_descr, sys_object_id, sys_location,
+                   sys_uptime_ticks, cpu_usage_pct, mem_usage_pct, interface_count,
+                   is_reachable, last_poll_duration_ms, last_polled
+            FROM snmp_devices
+            """
+        )
+
+        unifi_dev_rows = await conn.fetch(
+            """
+            SELECT mac, ip_address, name, model, device_type, firmware_version,
+                   status, uptime_sec, cpu_usage_pct, mem_usage_pct, temp_celsius,
+                   poe_total_watts, num_sta, last_seen
+            FROM unifi_devices
+            WHERE ip_address IS NOT NULL AND ip_address != ''
+            """
+        )
+
+        unifi_cli_rows = await conn.fetch(
+            """
+            SELECT mac, ip_address, hostname, oui_vendor, is_wired, network_name,
+                   vlan_id, sw_mac, sw_port, essid, signal_dbm, last_seen
+            FROM unifi_clients
+            WHERE ip_address IS NOT NULL AND ip_address != ''
+            """
+        )
+
+        log_counts = await conn.fetch(
+            """
+            SELECT source_ip, COUNT(*) AS log_count_24h
+            FROM device_logs
+            WHERE time > NOW() - INTERVAL '24 hours'
+            GROUP BY source_ip
+            """
+        )
+
+    by_ip: Dict[str, Dict[str, Any]] = {}
+
+    def _ensure_ip(ip_str: str) -> Dict[str, Any]:
+        if ip_str not in by_ip:
+            by_ip[ip_str] = {
+                "ip_address": ip_str,
+                "hostname": ip_str,
+                "mac_address": None,
+                "vendor": None,
+                "subnet_cidr": None,
+                "vlan_id": None,
+                "is_online": False,
+                "snmp_enabled": False,
+                "snmp_reachable": None,
+                "snmp_profile_name": None,
+                "snmp_profile_id": None,
+                "snmp_target_id": None,
+                "sys_descr": None,
+                "sys_location": None,
+                "cpu_usage_pct": None,
+                "interface_count": 0,
+                "uptime_sec": None,
+                "sources": [],
+                "log_count_24h": 0,
+                "last_seen": None,
+            }
+        return by_ip[ip_str]
+
+    for r in disc_rows:
+        ip_str = str(r["ip_address"])
+        item = _ensure_ip(ip_str)
+        item["hostname"] = r["hostname"] or item["hostname"]
+        item["mac_address"] = r["mac_address"] or item["mac_address"]
+        item["vendor"] = r["vendor"] or item["vendor"]
+        item["subnet_cidr"] = r["subnet_cidr"]
+        item["vlan_id"] = r["vlan_id"]
+        item["is_online"] = bool(r["is_online"])
+        if "Nmap/ARP" not in item["sources"]:
+            item["sources"].append("Nmap/ARP")
+        if r["last_seen"]:
+            item["last_seen"] = r["last_seen"].isoformat()
+
+    for r in snmp_cfg_rows:
+        ip_str = str(r["device_ip"])
+        item = _ensure_ip(ip_str)
+        if r["label"]:
+            item["hostname"] = r["label"]
+        item["snmp_enabled"] = bool(r["enabled"])
+        item["snmp_profile_name"] = r["profile_name"]
+        item["snmp_profile_id"] = r["profile_id"]
+        item["snmp_target_id"] = r["target_id"]
+        if "SNMP" not in item["sources"]:
+            item["sources"].append("SNMP")
+
+    for r in snmp_dev_rows:
+        ip_str = str(r["device_ip"])
+        item = _ensure_ip(ip_str)
+        if r["sys_name"] and (item["hostname"] == ip_str or not item["hostname"]):
+            item["hostname"] = r["sys_name"]
+        item["snmp_reachable"] = bool(r["is_reachable"])
+        if r["is_reachable"]:
+            item["is_online"] = True
+        item["sys_descr"] = r["sys_descr"]
+        item["sys_location"] = r["sys_location"]
+        item["cpu_usage_pct"] = float(r["cpu_usage_pct"] or 0.0)
+        item["interface_count"] = int(r["interface_count"] or 0)
+        if r["sys_uptime_ticks"]:
+            item["uptime_sec"] = int(r["sys_uptime_ticks"]) // 100
+        if "SNMP" not in item["sources"]:
+            item["sources"].append("SNMP")
+        if r["last_polled"]:
+            item["last_seen"] = r["last_polled"].isoformat()
+
+    for r in unifi_dev_rows:
+        ip_str = str(r["ip_address"])
+        item = _ensure_ip(ip_str)
+        if r["name"]:
+            item["hostname"] = r["name"]
+        item["mac_address"] = r["mac"] or item["mac_address"]
+        item["vendor"] = item["vendor"] or f"Ubiquiti ({r['model']})"
+        if r["status"] == "online":
+            item["is_online"] = True
+        item["cpu_usage_pct"] = float(r["cpu_usage_pct"] or 0.0)
+        item["uptime_sec"] = int(r["uptime_sec"] or 0)
+        if "UniFi" not in item["sources"]:
+            item["sources"].append("UniFi")
+        if r["last_seen"]:
+            item["last_seen"] = r["last_seen"].isoformat()
+
+    for r in unifi_cli_rows:
+        ip_str = str(r["ip_address"])
+        item = _ensure_ip(ip_str)
+        if r["hostname"] and item["hostname"] == ip_str:
+            item["hostname"] = r["hostname"]
+        item["mac_address"] = r["mac"] or item["mac_address"]
+        item["vendor"] = r["oui_vendor"] or item["vendor"]
+        item["vlan_id"] = r["vlan_id"] or item["vlan_id"]
+        if "UniFi" not in item["sources"]:
+            item["sources"].append("UniFi")
+
+    for r in log_counts:
+        ip_str = str(r["source_ip"])
+        item = _ensure_ip(ip_str)
+        item["log_count_24h"] = int(r["log_count_24h"] or 0)
+        if "Syslog" not in item["sources"]:
+            item["sources"].append("Syslog")
+
+    def _ip_sort_key(d: Dict[str, Any]):
+        try:
+            return (0, int(ipaddress.ip_address(d["ip_address"])))
+        except ValueError:
+            return (1, d["ip_address"])
+
+    devices_list = sorted(by_ip.values(), key=_ip_sort_key)
+    return {"devices": devices_list}
+
+
+@app.get("/api/devices/{device_ip}")
+async def get_device_detail(device_ip: str) -> Dict[str, Any]:
+    """Returns all polled and correlated information for a specific device IP."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        host_row = await conn.fetchrow(
+            """
+            SELECT host(ip_address) AS ip_address, subnet_cidr, mac_address,
+                   hostname, vendor, vlan_id, is_online, latency_ms,
+                   discovery_source, switch_mac, switch_port, first_seen, last_seen
+            FROM discovered_hosts
+            WHERE host(ip_address) = $1
+            """,
+            device_ip,
+        )
+
+        snmp_cfg_row = await conn.fetchrow(
+            """
+            SELECT t.id AS target_id, t.device_ip, t.label, t.profile_id, t.enabled,
+                   p.name AS profile_name, p.version AS profile_version, p.port AS profile_port
+            FROM snmp_targets_config t
+            LEFT JOIN snmp_profiles p ON p.id = t.profile_id
+            WHERE t.device_ip = $1
+            """,
+            device_ip,
+        )
+
+        snmp_sys_row = await conn.fetchrow(
+            """
+            SELECT device_ip, sys_name, sys_descr, sys_object_id, sys_location,
+                   sys_uptime_ticks, cpu_usage_pct, mem_usage_pct, interface_count,
+                   is_reachable, last_poll_duration_ms, last_polled
+            FROM snmp_devices
+            WHERE device_ip = $1
+            """,
+            device_ip,
+        )
+
+        snmp_if_rows = await conn.fetch(
+            """
+            SELECT DISTINCT ON (if_index)
+                if_index, if_name, if_descr, if_alias, if_speed_bps, if_oper_status,
+                in_octets, out_octets, in_bps, out_bps, in_errors, out_errors,
+                in_discards, out_discards, cpu_usage, sys_uptime, time
+            FROM snmp_metrics_raw
+            WHERE device_ip = $1
+            ORDER BY if_index ASC, time DESC
+            """,
+            device_ip,
+        )
+
+        unifi_dev_row = await conn.fetchrow(
+            """
+            SELECT mac, ip_address, name, model, device_type, firmware_version,
+                   status, uptime_sec, cpu_usage_pct, mem_usage_pct, temp_celsius,
+                   poe_total_watts, poe_max_watts, num_sta, rx_bps, tx_bps, port_table, last_seen
+            FROM unifi_devices
+            WHERE ip_address = $1
+            """,
+            device_ip,
+        )
+
+        unifi_cli_row = await conn.fetchrow(
+            """
+            SELECT mac, ip_address, hostname, oui_vendor, is_wired, network_name,
+                   vlan_id, sw_mac, sw_port, ap_mac, essid, channel, rssi, signal_dbm,
+                   rx_bps, tx_bps, rx_bytes, tx_bytes, uptime_sec, last_seen
+            FROM unifi_clients
+            WHERE ip_address = $1
+            """,
+            device_ip,
+        )
+
+        log_rows = await conn.fetch(
+            """
+            SELECT time, source_ip, hostname, facility, severity, severity_num,
+                   app_name, proc_id, message
+            FROM device_logs
+            WHERE source_ip = $1
+            ORDER BY time DESC
+            LIMIT 100
+            """,
+            device_ip,
+        )
+
+    def _serialize(row: Optional[asyncpg.Record]) -> Optional[Dict[str, Any]]:
+        if not row:
+            return None
+        d = dict(row)
+        for k, v in list(d.items()):
+            if hasattr(v, "isoformat"):
+                d[k] = v.isoformat()
+        if isinstance(d.get("port_table"), str):
+            try:
+                d["port_table"] = json.loads(d["port_table"])
+            except Exception:
+                d["port_table"] = []
+        return d
+
+    return {
+        "ip_address": device_ip,
+        "discovered_host": _serialize(host_row),
+        "snmp_config": _serialize(snmp_cfg_row),
+        "snmp_system": _serialize(snmp_sys_row),
+        "snmp_interfaces": [_serialize(r) for r in snmp_if_rows],
+        "unifi_device": _serialize(unifi_dev_row),
+        "unifi_client": _serialize(unifi_cli_row),
+        "recent_logs": [_serialize(r) for r in log_rows],
+    }
+
+
+@app.post("/api/devices/{device_ip}/poll")
+async def trigger_device_poll(device_ip: str) -> Dict[str, str]:
+    await _notify_worker("snmp_now")
+    return {"status": "triggered", "message": f"Immediate SNMP poll queued for {device_ip}."}
 
 
 @app.get("/api/logs")
