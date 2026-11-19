@@ -81,10 +81,13 @@ async def snmp_loop(
     snmp_trigger: asyncio.Event,
 ) -> None:
     logger.info("Starting dynamic SNMP poller loop (interval=%ds)", SNMP_POLL_INTERVAL)
+    first_run = True
     while not stop_event.is_set():
         snmp_trigger.clear()
         try:
-            results = await poller.poll_all(pool, redis_client)
+            force_flag = first_run or bool(await redis_client.getdel("snmp:force_rematch"))
+            first_run = False
+            results = await poller.poll_all(pool, redis_client, force_rematch=force_flag)
             if results:
                 await publish_event(redis_client, "snmp_update", results)
         except Exception as exc:
@@ -153,7 +156,9 @@ async def command_listener_loop(
                     raw = raw.decode("utf-8", errors="ignore")
                 if raw in ("scan_now", "reload_all"):
                     scan_trigger.set()
-                if raw in ("snmp_now", "reload_all"):
+                if raw in ("snmp_now", "reload_all", "rematch_mibs"):
+                    if raw == "rematch_mibs":
+                        await redis_client.set("snmp:force_rematch", "1", ex=60)
                     snmp_trigger.set()
                 if raw in ("unifi_now", "reload_all"):
                     unifi_trigger.set()

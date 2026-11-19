@@ -809,9 +809,139 @@ class SNMPPoller:
             "poll_ms": poll_ms,
         }
 
+    async def auto_discover_and_rematch_devices(
+        self,
+        pool: asyncpg.Pool,
+        redis_client: aioredis.Redis,
+        force: bool = False,
+    ) -> int:
+        """
+        Automatically updates previously discovered devices in `discovered_hosts` and `snmp_devices`:
+        1. Backfills vendor MIB profile matching on any existing `snmp_devices` rows.
+        2. Probes online `discovered_hosts` against all configured `snmp_profiles` and automatically
+           enrolls responsive devices with their matched SNMP profile & Vendor MIBs.
+        """
+        matched_count = 0
+        async with pool.acquire() as conn:
+            # 1. Backfill vendor_name / matched_mibs on any previously polled snmp_devices
+            existing_snmp = await conn.fetch(
+                """
+                SELECT device_ip, sys_name, sys_descr, sys_object_id, vendor_name, matched_mibs
+                FROM snmp_devices
+                """
+            )
+            for row in existing_snmp:
+                vp = match_device_vendor_profile(
+                    row["sys_object_id"] or "",
+                    row["sys_descr"] or "",
+                    row["sys_name"] or "",
+                )
+                await conn.execute(
+                    """
+                    UPDATE snmp_devices
+                    SET vendor_name = $1,
+                        device_category = $2,
+                        matched_mibs = CASE
+                            WHEN matched_mibs IS NULL OR matched_mibs = '[]'::jsonb
+                            THEN $3::jsonb
+                            ELSE matched_mibs
+                        END
+                    WHERE device_ip = $4
+                    """,
+                    vp["vendor_name"],
+                    vp["category"],
+                    json.dumps(vp["mibs"]),
+                    row["device_ip"],
+                )
+
+            # 2. Fetch all configured SNMP profiles and previously discovered hosts
+            profiles = [
+                dict(p)
+                for p in await conn.fetch(
+                    """
+                    SELECT id, name, version, port, community, v3_user,
+                           v3_auth_proto, v3_auth_key, v3_priv_proto, v3_priv_key
+                    FROM snmp_profiles
+                    ORDER BY id ASC
+                    """
+                )
+            ]
+
+            discovered = [
+                dict(d)
+                for d in await conn.fetch(
+                    """
+                    SELECT host(d.ip_address) AS ip_address, d.hostname, d.vendor,
+                           t.id AS target_id, t.profile_id, s.is_reachable
+                    FROM discovered_hosts d
+                    LEFT JOIN snmp_targets_config t ON t.device_ip = host(d.ip_address)
+                    LEFT JOIN snmp_devices s ON s.device_ip = host(d.ip_address)
+                    WHERE d.is_online = TRUE
+                    ORDER BY d.ip_address ASC
+                    LIMIT 60
+                    """
+                )
+            ]
+
+        if not profiles or not discovered:
+            return matched_count
+
+        async def _probe_host(host_row: Dict[str, Any]) -> None:
+            nonlocal matched_count
+            ip_str = str(host_row["ip_address"])
+            # Skip if already reachable via SNMP and not forced
+            if host_row.get("target_id") and host_row.get("is_reachable") and not force:
+                return
+
+            cooldown_key = f"snmp:autoprobe:{ip_str}"
+            if not force and await redis_client.get(cooldown_key):
+                return
+
+            for prof in profiles:
+                port = int(prof.get("port") or 161)
+                auth_args = self._build_auth_args(prof)
+                scalars = await self._snmp_walk_oid(
+                    ip_str, port, auth_args, "1.3.6.1.2.1.1", timeout=2.5
+                )
+                if scalars:
+                    label = host_row.get("hostname") or ""
+                    if label == ip_str:
+                        label = ""
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            """
+                            INSERT INTO snmp_targets_config (device_ip, label, profile_id, enabled)
+                            VALUES ($1, $2, $3, TRUE)
+                            ON CONFLICT (device_ip) DO UPDATE SET
+                                profile_id = EXCLUDED.profile_id,
+                                enabled = TRUE
+                            """,
+                            ip_str,
+                            label,
+                            prof["id"],
+                        )
+                    matched_count += 1
+                    await redis_client.delete(cooldown_key)
+                    return
+
+            # Mark probed for 15 minutes so unreachable/non-SNMP hosts aren't re-probed every minute
+            await redis_client.set(cooldown_key, "1", ex=900)
+
+        # Probe in small concurrent batches of 10
+        for i in range(0, len(discovered), 10):
+            batch = discovered[i : i + 10]
+            await asyncio.gather(*[_probe_host(h) for h in batch], return_exceptions=True)
+
+        return matched_count
+
     async def poll_all(
-        self, pool: asyncpg.Pool, redis_client: aioredis.Redis
+        self, pool: asyncpg.Pool, redis_client: aioredis.Redis, force_rematch: bool = False
     ) -> List[Dict[str, Any]]:
+        try:
+            await self.auto_discover_and_rematch_devices(pool, redis_client, force=force_rematch)
+        except Exception as exc:
+            logger.debug("Auto-discover MIB rematch error: %s", exc)
+
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """

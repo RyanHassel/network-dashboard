@@ -42,6 +42,7 @@ interface SystemUpdateStatus {
   remote_sha: string;
   commits_behind: number;
   commits: GitCommitInfo[];
+  summary_bullets?: string[];
   status: "idle" | "updating";
   checked_at: string;
 }
@@ -105,6 +106,8 @@ interface UnifiedDeviceItem {
   hostname: string;
   mac_address: string | null;
   vendor: string | null;
+  device_category?: string | null;
+  matched_mibs?: string[];
   subnet_cidr: string | null;
   vlan_id: number | null;
   is_online: boolean;
@@ -217,6 +220,11 @@ interface DeviceDetailPayload {
     last_poll_duration_ms: number;
     last_polled: string | null;
   } | null;
+  matched_mib_profile?: {
+    vendor: string;
+    category: string;
+    mibs: string[];
+  };
   snmp_interfaces: Array<{
     if_index: number;
     if_name: string;
@@ -424,6 +432,25 @@ function formatUptime(sec: number | undefined | null): string {
   return `${m}m`;
 }
 
+function formatChartAxisTimestamp(rawLabel: string, spanMs: number): string {
+  if (!rawLabel) return "";
+  const dt = new Date(rawLabel);
+  if (Number.isNaN(dt.getTime())) return rawLabel;
+  // Multi-day spans (>36 hours): include Month & Day
+  if (spanMs > 36 * 3600 * 1000) {
+    if (spanMs > 14 * 86400 * 1000) {
+      return dt.toLocaleDateString([], { month: "short", day: "numeric" });
+    }
+    return dt.toLocaleString([], {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+  return dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
 const DualAreaSparkChart: React.FC<{
   points: Array<{ label: string; inVal: number; outVal: number; p95In?: number }>;
   height?: number;
@@ -444,6 +471,22 @@ const DualAreaSparkChart: React.FC<{
     1000,
     ...points.map((p) => Math.max(p.inVal, p.outVal, p.p95In || 0)),
   );
+
+  const firstTs = new Date(points[0].label).getTime();
+  const lastTs = new Date(points[points.length - 1].label).getTime();
+  const spanMs =
+    !Number.isNaN(firstTs) && !Number.isNaN(lastTs) ? Math.max(0, lastTs - firstTs) : 0;
+
+  const tickCount = Math.min(6, points.length);
+  const tickIndices: number[] = [];
+  if (tickCount === 1) {
+    tickIndices.push(0);
+  } else {
+    for (let t = 0; t < tickCount; t++) {
+      const idx = Math.round((t / (tickCount - 1)) * (points.length - 1));
+      if (!tickIndices.includes(idx)) tickIndices.push(idx);
+    }
+  }
 
   const toCoords = (vals: number[]) =>
     vals
@@ -497,6 +540,28 @@ const DualAreaSparkChart: React.FC<{
             strokeWidth="1"
           />
         ))}
+        <line
+          x1={0}
+          y1={height - 20}
+          x2={width}
+          y2={height - 20}
+          stroke="#1E293B"
+          strokeWidth="1"
+        />
+        {tickIndices.map((idx) => {
+          const x = points.length === 1 ? width / 2 : (idx / (points.length - 1)) * width;
+          return (
+            <line
+              key={idx}
+              x1={x}
+              y1={height - 20}
+              x2={x}
+              y2={height - 13}
+              stroke="#334155"
+              strokeWidth="1"
+            />
+          );
+        })}
         <polygon points={inArea} fill="url(#rxGrad)" />
         <polygon points={outArea} fill="url(#txGrad)" />
         <polyline
@@ -514,6 +579,11 @@ const DualAreaSparkChart: React.FC<{
           vectorEffect="non-scaling-stroke"
         />
       </svg>
+      <div className="mt-1 flex items-center justify-between border-t border-slate-800/70 pt-1.5 font-mono-tabular text-[11px] text-slate-400">
+        {tickIndices.map((idx) => (
+          <span key={idx}>{formatChartAxisTimestamp(points[idx].label, spanMs)}</span>
+        ))}
+      </div>
     </div>
   );
 };
@@ -612,10 +682,11 @@ export const App: React.FC = () => {
   const [selectedDeviceDetailIp, setSelectedDeviceDetailIp] = useState<string | null>(null);
   const [deviceDetail, setDeviceDetail] = useState<DeviceDetailPayload | null>(null);
   const [loadingDeviceDetail, setLoadingDeviceDetail] = useState(false);
-  const [detailIfIndex, setDetailIfIndex] = useState<number>(1);
+  const [detailIfIndex, setDetailIfIndex] = useState<number>(0);
   const [detailTrendRange, setDetailTrendRange] = useState<string>("24h");
   const [detailTrendSeries, setDetailTrendSeries] = useState<SNMPTrendPoint[]>([]);
   const [pollingDeviceNow, setPollingDeviceNow] = useState(false);
+  const [rematchingMibs, setRematchingMibs] = useState(false);
 
   // Domain Telemetry State
   const [overview, setOverview] = useState<OverviewPayload | null>(null);
@@ -738,7 +809,7 @@ export const App: React.FC = () => {
     }
   };
 
-  const fetchDeviceDetail = async (ip: string) => {
+  const fetchDeviceDetail = async (ip: string, resetToOverview = false) => {
     setLoadingDeviceDetail(true);
     try {
       const r = await fetch(`/api/devices/${encodeURIComponent(ip)}`);
@@ -746,9 +817,9 @@ export const App: React.FC = () => {
         const data: DeviceDetailPayload = await r.json();
         setDeviceDetail(data);
         if (data.snmp_interfaces && data.snmp_interfaces.length > 0) {
-          const firstIdx = data.snmp_interfaces[0].if_index;
-          setDetailIfIndex(firstIdx);
-          fetchDetailTrend(ip, firstIdx, detailTrendRange);
+          const targetIdx = resetToOverview ? 0 : detailIfIndex;
+          if (resetToOverview) setDetailIfIndex(0);
+          fetchDetailTrend(ip, targetIdx, detailTrendRange);
         } else {
           setDetailTrendSeries([]);
         }
@@ -774,8 +845,28 @@ export const App: React.FC = () => {
 
   const openDevicePage = (ip: string) => {
     setSelectedDeviceDetailIp(ip);
+    setDetailIfIndex(0);
     setActiveTab("devices");
-    fetchDeviceDetail(ip);
+    fetchDeviceDetail(ip, true);
+  };
+
+  const handleRematchAllMibs = async () => {
+    setRematchingMibs(true);
+    try {
+      await fetch("/api/devices/rematch-mibs", { method: "POST" });
+      setTimeout(() => {
+        fetchAllDevices();
+        fetchConfig();
+        fetchOverview();
+        fetchInterfaces();
+        if (selectedDeviceDetailIp) {
+          fetchDeviceDetail(selectedDeviceDetailIp, false);
+        }
+        setRematchingMibs(false);
+      }, 4500);
+    } catch {
+      setRematchingMibs(false);
+    }
   };
 
   const handlePollSingleDeviceNow = async (ip: string) => {
@@ -1240,13 +1331,13 @@ export const App: React.FC = () => {
   }, [activeTab, selectedDeviceDetailIp, logsPaused, logSeverity, logSourceIp, logSearch]);
 
   useEffect(() => {
-    if (selectedDeviceIp && selectedIfIndex) {
+    if (selectedDeviceIp && selectedIfIndex >= 0) {
       fetchTrends(selectedDeviceIp, selectedIfIndex, trendRange);
     }
   }, [selectedDeviceIp, selectedIfIndex, trendRange]);
 
   useEffect(() => {
-    if (selectedDeviceDetailIp && detailIfIndex) {
+    if (selectedDeviceDetailIp && detailIfIndex >= 0) {
       fetchDetailTrend(selectedDeviceDetailIp, detailIfIndex, detailTrendRange);
     }
   }, [selectedDeviceDetailIp, detailIfIndex, detailTrendRange]);
@@ -1635,12 +1726,33 @@ export const App: React.FC = () => {
             </div>
           </div>
 
+          {((updateInfo?.summary_bullets && updateInfo.summary_bullets.length > 0) ||
+            (updateInfo?.commits && updateInfo.commits.length > 0)) && (
+            <div>
+              <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-emerald-400">
+                What's New — Summary of Changes
+              </p>
+              <div className="max-h-40 overflow-y-auto rounded-lg border border-emerald-500/25 bg-[#090D16] p-3">
+                <ul className="list-disc space-y-1.5 pl-4 text-xs text-slate-200">
+                  {(updateInfo?.summary_bullets && updateInfo.summary_bullets.length > 0
+                    ? updateInfo.summary_bullets
+                    : (updateInfo?.commits || []).map((c) => c.subject)
+                  ).map((bullet, idx) => (
+                    <li key={idx} className="leading-relaxed">
+                      {bullet}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+          )}
+
           {updateInfo?.commits && updateInfo.commits.length > 0 && (
             <div>
               <p className="mb-2 text-xs font-medium uppercase tracking-wider text-slate-400">
                 Pending Commits (origin/main)
               </p>
-              <div className="max-h-48 space-y-1.5 overflow-y-auto rounded-lg border border-slate-800 bg-[#090D16] p-2.5">
+              <div className="max-h-36 space-y-1.5 overflow-y-auto rounded-lg border border-slate-800 bg-[#090D16] p-2.5">
                 {updateInfo.commits.map((c) => (
                   <div
                     key={c.sha}
@@ -1793,6 +1905,36 @@ export const App: React.FC = () => {
                   </div>
                 </div>
               </div>
+            </div>
+
+            {/* Network Throughput Overview Graph with Time Axis */}
+            <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-sm font-semibold text-white">
+                    Network Traffic Overview (Last 60 Minutes)
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    {gw
+                      ? `UniFi Gateway (${gw.gateway_name} • ${gw.wan_ip || "WAN"}) real-time throughput`
+                      : "Aggregated inbound & outbound traffic across all polled SNMP network interfaces"}
+                  </p>
+                </div>
+                {gw && (
+                  <div className="flex items-center gap-4 font-mono-tabular text-xs">
+                    <span className="text-emerald-400">RX: {formatBps(gw.wan_rx_bps)}</span>
+                    <span className="text-sky-400">TX: {formatBps(gw.wan_tx_bps)}</span>
+                    <span className="text-slate-400">Latency: {gw.wan_latency_ms.toFixed(1)} ms</span>
+                  </div>
+                )}
+              </div>
+              <DualAreaSparkChart
+                points={(overview?.wan_series || []).map((pt) => ({
+                  label: pt.time,
+                  inVal: pt.rx_bps,
+                  outVal: pt.tx_bps,
+                }))}
+              />
             </div>
 
             <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
@@ -1990,7 +2132,20 @@ export const App: React.FC = () => {
                 </div>
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={handleRematchAllMibs}
+                  disabled={rematchingMibs}
+                  className="flex items-center gap-1.5 rounded-md border border-sky-500/40 bg-sky-500/15 px-3 py-1.5 text-xs font-medium text-sky-300 hover:bg-sky-500/25 disabled:opacity-50"
+                  title="Automatically match all previously discovered devices with vendor MIBs and probe SNMP"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${rematchingMibs ? "animate-spin" : ""}`} />
+                  <span>
+                    {rematchingMibs
+                      ? "Auto-Matching & Probing MIBs..."
+                      : "Auto-Match & Poll Devices with MIBs"}
+                  </span>
+                </button>
                 <button
                   onClick={triggerScanNow}
                   disabled={scanningNow}
@@ -2079,8 +2234,25 @@ export const App: React.FC = () => {
                             {d.hostname || d.ip_address}
                           </td>
                           <td className="py-3 text-slate-300">{d.mac_address || "—"}</td>
-                          <td className="max-w-xs truncate py-3 font-sans text-slate-400">
-                            {d.vendor || d.sys_descr || "—"}
+                          <td className="max-w-xs py-3 font-sans text-slate-300">
+                            <div className="truncate">{d.vendor || d.sys_descr || "—"}</div>
+                            {d.matched_mibs && d.matched_mibs.length > 0 && (
+                              <div className="mt-1 flex flex-wrap gap-1">
+                                {d.matched_mibs.slice(0, 3).map((mib) => (
+                                  <span
+                                    key={mib}
+                                    className="rounded border border-sky-500/25 bg-sky-500/10 px-1.5 py-0.2 font-mono-tabular text-[10px] text-sky-300"
+                                  >
+                                    {mib}
+                                  </span>
+                                ))}
+                                {d.matched_mibs.length > 3 && (
+                                  <span className="font-mono-tabular text-[10px] text-slate-500">
+                                    +{d.matched_mibs.length - 3}
+                                  </span>
+                                )}
+                              </div>
+                            )}
                           </td>
                           <td className="py-3 text-slate-400">
                             {d.subnet_cidr || "—"}
@@ -2388,9 +2560,39 @@ export const App: React.FC = () => {
                         </dl>
                       </div>
                     ) : (
-                      <div className="py-8 text-center text-xs text-slate-500">
-                        SNMP polling is not enabled on this host yet. Click{" "}
-                        <strong>Enable SNMP Polling on This Device</strong> above to query it.
+                      <div className="space-y-3 text-xs">
+                        {deviceDetail?.matched_mib_profile && (
+                          <div className="rounded-lg border border-sky-500/30 bg-sky-500/10 p-3">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div>
+                                <span className="text-[11px] uppercase tracking-wider text-sky-300">
+                                  Auto-Matched Vendor MIB Profile
+                                </span>
+                                <div className="text-sm font-semibold text-white">
+                                  {deviceDetail.matched_mib_profile.vendor} —{" "}
+                                  {deviceDetail.matched_mib_profile.category}
+                                </div>
+                              </div>
+                            </div>
+                            {deviceDetail.matched_mib_profile.mibs.length > 0 && (
+                              <div className="mt-2 flex flex-wrap gap-1.5">
+                                {deviceDetail.matched_mib_profile.mibs.map((mib) => (
+                                  <span
+                                    key={mib}
+                                    className="rounded border border-sky-400/30 bg-[#090D16] px-2 py-0.5 font-mono-tabular text-[10px] text-sky-300"
+                                  >
+                                    {mib}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        <div className="py-4 text-center text-xs text-slate-400">
+                          SNMP telemetry has not been collected from this host yet. Click{" "}
+                          <strong className="text-white">Enable SNMP Polling on This Device</strong>{" "}
+                          above to poll its matched MIBs.
+                        </div>
                       </div>
                     )}
                   </div>
@@ -2594,27 +2796,47 @@ export const App: React.FC = () => {
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div>
                         <h3 className="text-sm font-semibold text-white">
-                          Polled Network Interfaces ({deviceDetail.snmp_interfaces.length}) —
-                          Throughput & 64-Bit Counters
+                          {detailIfIndex === 0
+                            ? `Device Traffic Overview — All Ports / Interfaces Combined (${deviceDetail.snmp_interfaces.length} Ports)`
+                            : `Port #${detailIfIndex} (${
+                                deviceDetail.snmp_interfaces.find(
+                                  (i) => i.if_index === detailIfIndex,
+                                )?.if_name || "Interface"
+                              }) — Historical Throughput`}
                         </h3>
                         <p className="text-xs text-slate-400">
-                          Click any interface row below to view its historical bandwidth chart.
+                          {detailIfIndex === 0
+                            ? "Showing total aggregated inbound & outbound traffic across all ports/interfaces on this device. Click any interface row below to inspect an individual port."
+                            : "Showing traffic for selected port. Click 'All Ports Combined (Overview)' to return to total device traffic."}
                         </p>
                       </div>
-                      <div className="flex items-center gap-1 rounded-lg border border-slate-800 bg-[#090D16] p-1">
-                        {["1h", "6h", "24h", "7d", "30d", "1y", "all"].map((rk) => (
-                          <button
-                            key={rk}
-                            onClick={() => setDetailTrendRange(rk)}
-                            className={`rounded px-2.5 py-1 font-mono-tabular text-xs font-medium uppercase transition ${
-                              detailTrendRange === rk
-                                ? "bg-emerald-600 text-white"
-                                : "text-slate-400 hover:text-slate-200"
-                            }`}
-                          >
-                            {rk}
-                          </button>
-                        ))}
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setDetailIfIndex(0)}
+                          className={`rounded-md border px-3 py-1.5 text-xs font-medium transition ${
+                            detailIfIndex === 0
+                              ? "border-emerald-500/50 bg-emerald-600 text-white"
+                              : "border-slate-700 bg-[#090D16] text-slate-300 hover:bg-slate-800"
+                          }`}
+                        >
+                          All Ports Combined (Overview)
+                        </button>
+                        <div className="flex items-center gap-1 rounded-lg border border-slate-800 bg-[#090D16] p-1">
+                          {["1h", "6h", "24h", "7d", "30d", "1y", "all"].map((rk) => (
+                            <button
+                              key={rk}
+                              onClick={() => setDetailTrendRange(rk)}
+                              className={`rounded px-2.5 py-1 font-mono-tabular text-xs font-medium uppercase transition ${
+                                detailTrendRange === rk
+                                  ? "bg-emerald-600 text-white"
+                                  : "text-slate-400 hover:text-slate-200"
+                              }`}
+                            >
+                              {rk}
+                            </button>
+                          ))}
+                        </div>
                       </div>
                     </div>
 
@@ -2646,7 +2868,11 @@ export const App: React.FC = () => {
                           {deviceDetail.snmp_interfaces.map((intf) => (
                             <tr
                               key={intf.if_index}
-                              onClick={() => setDetailIfIndex(intf.if_index)}
+                              onClick={() =>
+                                setDetailIfIndex(
+                                  detailIfIndex === intf.if_index ? 0 : intf.if_index,
+                                )
+                              }
                               className={`cursor-pointer hover:bg-slate-800/40 ${
                                 detailIfIndex === intf.if_index ? "bg-slate-800/60" : ""
                               }`}
@@ -2761,6 +2987,7 @@ export const App: React.FC = () => {
                     onChange={(e) => setSelectedIfIndex(Number(e.target.value))}
                     className="mt-1 rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 font-mono-tabular text-xs text-white"
                   >
+                    <option value={0}>All Ports / Interfaces Combined (Total Device Traffic)</option>
                     {interfaces
                       .filter((i) => !selectedDeviceIp || i.device_ip === selectedDeviceIp)
                       .map((i) => (
@@ -2803,8 +3030,9 @@ export const App: React.FC = () => {
 
             <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
               <h3 className="mb-3 text-sm font-semibold text-white">
-                Interface Throughput Trend ({selectedDeviceIp || "No Device"} • ifIndex #
-                {selectedIfIndex})
+                {selectedIfIndex === 0
+                  ? `All Ports Combined Throughput Trend (${selectedDeviceIp || "No Device"})`
+                  : `Interface Throughput Trend (${selectedDeviceIp || "No Device"} • ifIndex #${selectedIfIndex})`}
               </h3>
               <DualAreaSparkChart
                 points={trendSeries.map((pt) => ({

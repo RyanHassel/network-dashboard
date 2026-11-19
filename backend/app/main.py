@@ -15,7 +15,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.db_schema import ensure_dynamic_config_tables
-from app.mib_catalog import MIBS_DIR, VENDOR_CATALOG, list_backend_mibs, parse_mib_text
+from app.mib_catalog import (
+    MIBS_DIR,
+    VENDOR_CATALOG,
+    list_backend_mibs,
+    match_device_vendor_profile,
+    parse_mib_text,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -193,25 +199,46 @@ async def _inspect_git_update(do_fetch: bool = False) -> Dict[str, Any]:
     commits_behind = int(behind_str) if behind_str.isdigit() else 0
 
     commits: List[Dict[str, str]] = []
+    summary_bullets: List[str] = []
     if commits_behind > 0:
         log_out = await _run_git(
             "log",
             "HEAD..origin/main",
             "-n",
-            "10",
+            "15",
             "--pretty=format:%h|%s|%an|%ar",
         )
         for line in log_out.splitlines():
             parts = line.split("|", 3)
             if len(parts) == 4:
+                sha_val, subj_val, auth_val, date_val = parts[0], parts[1].strip(), parts[2], parts[3]
                 commits.append(
                     {
-                        "sha": parts[0],
-                        "subject": parts[1],
-                        "author": parts[2],
-                        "date": parts[3],
+                        "sha": sha_val,
+                        "subject": subj_val,
+                        "author": auth_val,
+                        "date": date_val,
                     }
                 )
+                # Split multi-feature commit subjects into clean individual bullet points
+                raw_clauses = [
+                    c.strip().rstrip(".")
+                    for c in subj_val.replace(" and ", ", ").split(",")
+                    if c.strip()
+                ]
+                for clause in raw_clauses:
+                    formatted = clause[0].upper() + clause[1:] if clause else ""
+                    if formatted and formatted not in summary_bullets:
+                        summary_bullets.append(formatted)
+
+        # Also extract any explicit markdown bullet lines from commit bodies
+        body_out = await _run_git("log", "HEAD..origin/main", "-n", "15", "--pretty=format:%b")
+        for bline in body_out.splitlines():
+            bclean = bline.strip()
+            if bclean.startswith(("- ", "* ", "• ")):
+                btext = bclean[2:].strip()
+                if btext and btext not in summary_bullets:
+                    summary_bullets.append(btext)
 
     trigger_file = REPO_MOUNT_DIR / ".trigger-update"
     status_file = REPO_MOUNT_DIR / ".update-status.json"
@@ -223,6 +250,7 @@ async def _inspect_git_update(do_fetch: bool = False) -> Dict[str, Any]:
         "remote_sha": remote_sha,
         "commits_behind": commits_behind,
         "commits": commits,
+        "summary_bullets": summary_bullets[:15],
         "status": "updating" if is_updating else "idle",
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -732,6 +760,30 @@ async def get_pulse_overview() -> Dict[str, Any]:
             """
         )
 
+        # Fallback: when UniFi gateway is not configured, aggregate SNMP traffic across all polled interfaces
+        if not wan_history:
+            wan_history = await conn.fetch(
+                """
+                SELECT bucket,
+                       SUM(if_rx) AS rx_bps,
+                       SUM(if_tx) AS tx_bps,
+                       0.0 AS latency_ms
+                FROM (
+                    SELECT time_bucket('1 minute', time) AS bucket,
+                           device_ip,
+                           if_index,
+                           AVG(in_bps) AS if_rx,
+                           AVG(out_bps) AS if_tx
+                    FROM snmp_metrics_raw
+                    WHERE time > NOW() - INTERVAL '1 hour'
+                      AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+                    GROUP BY bucket, device_ip, if_index
+                ) sub
+                GROUP BY bucket
+                ORDER BY bucket ASC
+                """
+            )
+
         unifi_devs = await conn.fetch(
             """
             SELECT mac, ip_address, name, model, device_type, firmware_version,
@@ -849,9 +901,13 @@ async def get_snmp_interfaces(device_ip: Optional[str] = None) -> Dict[str, Any]
 @app.get("/api/snmp/trends")
 async def get_snmp_trends(
     device_ip: str = Query(...),
-    if_index: int = Query(...),
+    if_index: int = Query(0),
     range_key: str = Query("24h", alias="range"),
 ) -> Dict[str, Any]:
+    """
+    When if_index == 0, aggregates traffic across ALL interfaces on the device.
+    When if_index > 0, returns traffic for that specific interface.
+    """
     pool = _get_pool()
     rk = range_key.lower()
 
@@ -865,72 +921,151 @@ async def get_snmp_trends(
     }
 
     async with pool.acquire() as conn:
-        if rk in ("1h", "6h", "24h"):
-            sql_interval = interval_map[rk]
-            rows = await conn.fetch(
-                f"""
-                SELECT time AS bucket,
-                       in_bps AS avg_in_bps,
-                       in_bps AS max_in_bps,
-                       in_bps AS p95_in_bps,
-                       out_bps AS avg_out_bps,
-                       out_bps AS max_out_bps,
-                       out_bps AS p95_out_bps,
-                       cpu_usage AS avg_cpu_usage
-                FROM snmp_metrics_raw
-                WHERE device_ip = $1
-                  AND if_index = $2
-                  AND time > NOW() - INTERVAL '{sql_interval}'
-                ORDER BY time ASC
-                """,
-                device_ip,
-                if_index,
-            )
-            source_table = "snmp_metrics_raw"
-        elif rk in ("7d", "30d"):
-            sql_interval = interval_map[rk]
-            rows = await conn.fetch(
-                f"""
-                SELECT bucket,
-                       avg_in_bps,
-                       max_in_bps,
-                       p95_in_bps,
-                       avg_out_bps,
-                       max_out_bps,
-                       p95_out_bps,
-                       avg_cpu_usage
-                FROM snmp_metrics_hourly
-                WHERE device_ip = $1
-                  AND if_index = $2
-                  AND bucket > NOW() - INTERVAL '{sql_interval}'
-                ORDER BY bucket ASC
-                """,
-                device_ip,
-                if_index,
-            )
-            source_table = "snmp_metrics_hourly"
+        if if_index <= 0:
+            # All Ports / Interfaces Combined Traffic Overview for this device
+            if rk in ("1h", "6h", "24h"):
+                sql_interval = interval_map[rk]
+                rows = await conn.fetch(
+                    f"""
+                    SELECT bucket,
+                           SUM(if_avg_in) AS avg_in_bps,
+                           SUM(if_max_in) AS max_in_bps,
+                           SUM(if_max_in) AS p95_in_bps,
+                           SUM(if_avg_out) AS avg_out_bps,
+                           SUM(if_max_out) AS max_out_bps,
+                           SUM(if_max_out) AS p95_out_bps,
+                           AVG(if_cpu) AS avg_cpu_usage
+                    FROM (
+                        SELECT time_bucket('1 minute', time) AS bucket,
+                               if_index,
+                               AVG(in_bps) AS if_avg_in,
+                               MAX(in_bps) AS if_max_in,
+                               AVG(out_bps) AS if_avg_out,
+                               MAX(out_bps) AS if_max_out,
+                               AVG(cpu_usage) AS if_cpu
+                        FROM snmp_metrics_raw
+                        WHERE device_ip = $1
+                          AND time > NOW() - INTERVAL '{sql_interval}'
+                          AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+                        GROUP BY bucket, if_index
+                    ) sub
+                    GROUP BY bucket
+                    ORDER BY bucket ASC
+                    """,
+                    device_ip,
+                )
+                source_table = "snmp_metrics_raw (All Interfaces Combined)"
+            elif rk in ("7d", "30d"):
+                sql_interval = interval_map[rk]
+                rows = await conn.fetch(
+                    f"""
+                    SELECT bucket,
+                           SUM(avg_in_bps) AS avg_in_bps,
+                           SUM(max_in_bps) AS max_in_bps,
+                           SUM(p95_in_bps) AS p95_in_bps,
+                           SUM(avg_out_bps) AS avg_out_bps,
+                           SUM(max_out_bps) AS max_out_bps,
+                           SUM(p95_out_bps) AS p95_out_bps,
+                           AVG(avg_cpu_usage) AS avg_cpu_usage
+                    FROM snmp_metrics_hourly
+                    WHERE device_ip = $1
+                      AND bucket > NOW() - INTERVAL '{sql_interval}'
+                      AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+                    GROUP BY bucket
+                    ORDER BY bucket ASC
+                    """,
+                    device_ip,
+                )
+                source_table = "snmp_metrics_hourly (All Interfaces Combined)"
+            else:
+                where_time = "AND bucket > NOW() - INTERVAL '365 days'" if rk == "1y" else ""
+                rows = await conn.fetch(
+                    f"""
+                    SELECT bucket,
+                           SUM(avg_in_bps) AS avg_in_bps,
+                           SUM(max_in_bps) AS max_in_bps,
+                           SUM(p95_in_bps) AS p95_in_bps,
+                           SUM(avg_out_bps) AS avg_out_bps,
+                           SUM(max_out_bps) AS max_out_bps,
+                           SUM(p95_out_bps) AS p95_out_bps,
+                           AVG(avg_cpu_usage) AS avg_cpu_usage
+                    FROM snmp_metrics_daily
+                    WHERE device_ip = $1
+                      {where_time}
+                      AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+                    GROUP BY bucket
+                    ORDER BY bucket ASC
+                    """,
+                    device_ip,
+                )
+                source_table = "snmp_metrics_daily (All Interfaces Combined)"
         else:
-            where_time = "AND bucket > NOW() - INTERVAL '365 days'" if rk == "1y" else ""
-            rows = await conn.fetch(
-                f"""
-                SELECT bucket,
-                       avg_in_bps,
-                       max_in_bps,
-                       p95_in_bps,
-                       avg_out_bps,
-                       max_out_bps,
-                       p95_out_bps,
-                       avg_cpu_usage
-                FROM snmp_metrics_daily
-                WHERE device_ip = $1
-                  AND if_index = $2
-                  {where_time}
-                ORDER BY bucket ASC
-                """,
-                device_ip,
-                if_index,
-            )
-            source_table = "snmp_metrics_daily"
+            if rk in ("1h", "6h", "24h"):
+                sql_interval = interval_map[rk]
+                rows = await conn.fetch(
+                    f"""
+                    SELECT time AS bucket,
+                           in_bps AS avg_in_bps,
+                           in_bps AS max_in_bps,
+                           in_bps AS p95_in_bps,
+                           out_bps AS avg_out_bps,
+                           out_bps AS max_out_bps,
+                           out_bps AS p95_out_bps,
+                           cpu_usage AS avg_cpu_usage
+                    FROM snmp_metrics_raw
+                    WHERE device_ip = $1
+                      AND if_index = $2
+                      AND time > NOW() - INTERVAL '{sql_interval}'
+                    ORDER BY time ASC
+                    """,
+                    device_ip,
+                    if_index,
+                )
+                source_table = "snmp_metrics_raw"
+            elif rk in ("7d", "30d"):
+                sql_interval = interval_map[rk]
+                rows = await conn.fetch(
+                    f"""
+                    SELECT bucket,
+                           avg_in_bps,
+                           max_in_bps,
+                           p95_in_bps,
+                           avg_out_bps,
+                           max_out_bps,
+                           p95_out_bps,
+                           avg_cpu_usage
+                    FROM snmp_metrics_hourly
+                    WHERE device_ip = $1
+                      AND if_index = $2
+                      AND bucket > NOW() - INTERVAL '{sql_interval}'
+                    ORDER BY bucket ASC
+                    """,
+                    device_ip,
+                    if_index,
+                )
+                source_table = "snmp_metrics_hourly"
+            else:
+                where_time = "AND bucket > NOW() - INTERVAL '365 days'" if rk == "1y" else ""
+                rows = await conn.fetch(
+                    f"""
+                    SELECT bucket,
+                           avg_in_bps,
+                           max_in_bps,
+                           p95_in_bps,
+                           avg_out_bps,
+                           max_out_bps,
+                           p95_out_bps,
+                           avg_cpu_usage
+                    FROM snmp_metrics_daily
+                    WHERE device_ip = $1
+                      AND if_index = $2
+                      {where_time}
+                    ORDER BY bucket ASC
+                    """,
+                    device_ip,
+                    if_index,
+                )
+                source_table = "snmp_metrics_daily"
 
     series = [
         {
@@ -1098,6 +1233,8 @@ async def get_all_devices() -> Dict[str, Any]:
                 "hostname": ip_str,
                 "mac_address": None,
                 "vendor": None,
+                "device_category": None,
+                "matched_mibs": [],
                 "subnet_cidr": None,
                 "vlan_id": None,
                 "is_online": False,
@@ -1157,6 +1294,15 @@ async def get_all_devices() -> Dict[str, Any]:
                 if r.get("hardware_model")
                 else r["vendor_name"]
             )
+        item["device_category"] = r.get("device_category") or item["device_category"]
+        raw_mibs = r.get("matched_mibs")
+        if isinstance(raw_mibs, str):
+            try:
+                raw_mibs = json.loads(raw_mibs)
+            except Exception:
+                raw_mibs = []
+        if raw_mibs:
+            item["matched_mibs"] = raw_mibs
         item["sys_descr"] = r["sys_descr"]
         item["sys_location"] = r["sys_location"]
         item["cpu_usage_pct"] = float(r["cpu_usage_pct"] or 0.0)
@@ -1201,6 +1347,19 @@ async def get_all_devices() -> Dict[str, Any]:
         item["log_count_24h"] = int(r["log_count_24h"] or 0)
         if "Syslog" not in item["sources"]:
             item["sources"].append("Syslog")
+
+    # Auto-match vendor MIB profile for any previously discovered device missing matched_mibs
+    for item in by_ip.values():
+        if not item.get("matched_mibs"):
+            matched = match_device_vendor_profile(
+                "",
+                f"{item.get('vendor') or ''} {item.get('sys_descr') or ''}",
+                item.get("hostname") or "",
+            )
+            item["matched_mibs"] = matched["mibs"]
+            item["device_category"] = item.get("device_category") or matched["category"]
+            if not item.get("vendor") and matched["vendor"] != "Generic / Standard RFC":
+                item["vendor"] = matched["vendor"]
 
     def _ip_sort_key(d: Dict[str, Any]):
         try:
@@ -1313,22 +1472,68 @@ async def get_device_detail(device_ip: str) -> Dict[str, Any]:
                     d[json_col] = [] if json_col != "extended_metrics" else {}
         return d
 
+    host_dict = _serialize(host_row)
+    snmp_sys_dict = _serialize(snmp_sys_row)
+    unifi_dev_dict = _serialize(unifi_dev_row)
+    unifi_cli_dict = _serialize(unifi_cli_row)
+
+    # Ensure snmp_system or a fallback vendor MIB match is always populated for previously discovered devices
+    if snmp_sys_dict and not snmp_sys_dict.get("matched_mibs"):
+        matched = match_device_vendor_profile(
+            snmp_sys_dict.get("sys_object_id") or "",
+            snmp_sys_dict.get("sys_descr") or (host_dict or {}).get("vendor") or "",
+            snmp_sys_dict.get("sys_name") or (host_dict or {}).get("hostname") or "",
+        )
+        snmp_sys_dict["vendor_name"] = snmp_sys_dict.get("vendor_name") or matched["vendor"]
+        snmp_sys_dict["device_category"] = snmp_sys_dict.get("device_category") or matched["category"]
+        snmp_sys_dict["matched_mibs"] = matched["mibs"]
+
+    fallback_mib_match = match_device_vendor_profile(
+        (snmp_sys_dict or {}).get("sys_object_id") or "",
+        " ".join(
+            filter(
+                None,
+                [
+                    (snmp_sys_dict or {}).get("sys_descr"),
+                    (host_dict or {}).get("vendor"),
+                    (unifi_dev_dict or {}).get("model"),
+                    (unifi_cli_dict or {}).get("oui_vendor"),
+                ],
+            )
+        ),
+        (snmp_sys_dict or {}).get("sys_name")
+        or (host_dict or {}).get("hostname")
+        or (unifi_dev_dict or {}).get("name")
+        or device_ip,
+    )
+
     return {
         "ip_address": device_ip,
-        "discovered_host": _serialize(host_row),
+        "discovered_host": host_dict,
         "snmp_config": _serialize(snmp_cfg_row),
-        "snmp_system": _serialize(snmp_sys_row),
+        "snmp_system": snmp_sys_dict,
+        "matched_mib_profile": fallback_mib_match,
         "snmp_interfaces": [_serialize(r) for r in snmp_if_rows],
-        "unifi_device": _serialize(unifi_dev_row),
-        "unifi_client": _serialize(unifi_cli_row),
+        "unifi_device": unifi_dev_dict,
+        "unifi_client": unifi_cli_dict,
         "recent_logs": [_serialize(r) for r in log_rows],
+    }
+
+
+@app.post("/api/devices/rematch-mibs")
+async def trigger_rematch_all_device_mibs() -> Dict[str, str]:
+    """Immediately re-matches all previously discovered devices with the MIB catalog and probes SNMP."""
+    await _notify_worker("rematch_mibs")
+    return {
+        "status": "triggered",
+        "message": "Auto-matching MIB profiles and probing SNMP across all discovered devices.",
     }
 
 
 @app.post("/api/devices/{device_ip}/poll")
 async def trigger_device_poll(device_ip: str) -> Dict[str, str]:
-    await _notify_worker("snmp_now")
-    return {"status": "triggered", "message": f"Immediate SNMP poll queued for {device_ip}."}
+    await _notify_worker("rematch_mibs")
+    return {"status": "triggered", "message": f"Immediate SNMP & MIB poll queued for {device_ip}."}
 
 
 @app.get("/api/mibs")
