@@ -5,7 +5,9 @@ import {
   ArrowLeft,
   ArrowUpRight,
   Check,
+  Clock,
   Cpu,
+  Database,
   DownloadCloud,
   Edit3,
   Eye,
@@ -27,7 +29,72 @@ import {
   X,
 } from "lucide-react";
 
-type TabKey = "pulse" | "devices" | "snmp" | "scanner" | "syslog" | "settings";
+type TabKey = "pulse" | "devices" | "snmp" | "scanner" | "syslog" | "targets" | "settings";
+
+interface BackgroundSubService {
+  key: string;
+  name: string;
+  status: string;
+  interval_sec: number | null;
+  last_run: string | null;
+  detail: string;
+}
+
+interface BackgroundServiceInfo {
+  id: string;
+  name: string;
+  container: string;
+  status: "running" | "stopped" | "degraded" | string;
+  version: string;
+  uptime_sec: number | null;
+  latency_ms: number | null;
+  detail: string;
+  sub_services?: BackgroundSubService[];
+}
+
+interface ServerSystemInfo {
+  server: {
+    hostname: string;
+    os_name: string;
+    kernel: string;
+    architecture: string;
+    python_version: string;
+    cpu_cores: number;
+    load_avg: number[] | null;
+    memory: {
+      total_bytes: number | null;
+      used_bytes: number | null;
+      available_bytes: number | null;
+      usage_pct: number | null;
+    };
+    disk: {
+      total_bytes: number | null;
+      used_bytes: number | null;
+      free_bytes: number | null;
+      usage_pct: number | null;
+    };
+    db_size_bytes: number | null;
+    api_uptime_sec: number;
+    server_time_utc: string;
+    git: {
+      current_sha: string;
+      branch: string;
+      last_commit_subject: string;
+      last_commit_date: string | null;
+      remote_url: string;
+    };
+    config: {
+      web_port: number;
+      syslog_port: number;
+      snmp_poll_interval_sec: number;
+      subnet_scan_minutes: number;
+      snmp_raw_retention_days: number;
+      log_retention_days: number;
+      loaded_mib_files: number;
+    };
+  };
+  services: BackgroundServiceInfo[];
+}
 
 interface GitCommitInfo {
   sha: string;
@@ -602,6 +669,10 @@ export const App: React.FC = () => {
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [promptDismissedSha, setPromptDismissedSha] = useState<string | null>(null);
   const updateDialogRef = useRef<HTMLDialogElement | null>(null);
+
+  // Server Information & Background Service Health State
+  const [serverInfo, setServerInfo] = useState<ServerSystemInfo | null>(null);
+  const [loadingServerInfo, setLoadingServerInfo] = useState(false);
 
   // First-Time Setup Onboarding Modal & Dynamic Config State
   const [config, setConfig] = useState<AllConfigPayload | null>(null);
@@ -1206,6 +1277,20 @@ export const App: React.FC = () => {
     }
   };
 
+  const fetchServerInfo = async (showSpinner = false) => {
+    if (showSpinner) setLoadingServerInfo(true);
+    try {
+      const resp = await fetch("/api/system/info");
+      if (resp.ok) {
+        setServerInfo(await resp.json());
+      }
+    } catch {
+      // ignore
+    } finally {
+      if (showSpinner) setLoadingServerInfo(false);
+    }
+  };
+
   const fetchOverview = async () => {
     try {
       const r = await fetch("/api/overview");
@@ -1308,6 +1393,7 @@ export const App: React.FC = () => {
     fetchScanner();
     fetchLogs();
     fetchUpdateStatus(false);
+    fetchServerInfo(false);
 
     const interval = setInterval(() => {
       fetchOverview();
@@ -1318,6 +1404,7 @@ export const App: React.FC = () => {
       if (activeTab === "snmp") fetchInterfaces();
       if (activeTab === "scanner") fetchScanner();
       if (activeTab === "syslog") fetchLogs();
+      if (activeTab === "settings") fetchServerInfo(false);
     }, 10000);
 
     const updateTimer = setInterval(() => {
@@ -1432,12 +1519,12 @@ export const App: React.FC = () => {
           {/* Primary View Switcher */}
           <nav className="flex flex-wrap items-center gap-1 rounded-lg border border-slate-800 bg-[#111827] p-1">
             {[
-              { id: "pulse", label: "Pulse Overview", icon: Activity },
+              { id: "pulse", label: "Overview", icon: Activity },
               { id: "devices", label: `Devices (${allDevices.length})`, icon: Monitor },
               { id: "snmp", label: "SNMP Trends & Ports", icon: Server },
               { id: "scanner", label: "Subnet Scanner Matrix", icon: Network },
               { id: "syslog", label: "Live Syslog Stream", icon: Terminal },
-              { id: "settings", label: "Targets & SNMP Settings", icon: Settings },
+              { id: "targets", label: "Targets & SNMP", icon: KeyRound },
             ].map((tab) => {
               const Icon = tab.icon;
               const active = activeTab === tab.id;
@@ -1461,30 +1548,29 @@ export const App: React.FC = () => {
             })}
           </nav>
 
-          {/* Right Status & Update Controls */}
+          {/* Right Status & Settings Controls */}
           <div className="flex items-center gap-2.5">
-            {updateInfo?.update_available ? (
-              <button
-                onClick={openUpdateModal}
-                className="flex items-center gap-1.5 rounded-md border border-amber-500/50 bg-amber-500/15 px-3 py-1.5 text-xs font-medium text-amber-300 transition hover:bg-amber-500/25"
-              >
-                <DownloadCloud className="h-3.5 w-3.5 animate-bounce" />
-                <span>
-                  Update Available ({updateInfo.commits_behind} new commit
-                  {updateInfo.commits_behind === 1 ? "" : "s"})
-                </span>
-              </button>
-            ) : (
-              <button
-                onClick={() => fetchUpdateStatus(true)}
-                disabled={checkingUpdate}
-                className="flex items-center gap-1.5 rounded-md border border-slate-800 bg-[#111827] px-2.5 py-1.5 text-xs text-slate-300 transition hover:border-slate-700 hover:text-white disabled:opacity-50"
-                title="Check GitHub repository for new commits"
-              >
-                <RefreshCw className={`h-3.5 w-3.5 ${checkingUpdate ? "animate-spin" : ""}`} />
-                <span>{checkingUpdate ? "Checking..." : "Check Updates"}</span>
-              </button>
-            )}
+            <button
+              onClick={() => {
+                setActiveTab("settings");
+                fetchServerInfo(false);
+              }}
+              className={`relative flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition ${
+                activeTab === "settings"
+                  ? "border-emerald-500/40 bg-slate-800 text-white"
+                  : "border-slate-800 bg-[#111827] text-slate-300 hover:border-slate-700 hover:text-white"
+              }`}
+              title="Server Information, Updates & Background Services"
+            >
+              <Settings className="h-3.5 w-3.5" />
+              <span>Settings</span>
+              {updateInfo?.update_available && (
+                <span
+                  className="h-2 w-2 rounded-full bg-amber-400"
+                  title={`${updateInfo.commits_behind} update(s) available`}
+                />
+              )}
+            </button>
 
             <div className="flex items-center gap-1.5 rounded-md border border-slate-800 bg-[#111827] px-2.5 py-1.5 text-xs">
               <span
@@ -1516,7 +1602,7 @@ export const App: React.FC = () => {
               </h2>
               <p className="text-xs text-slate-400">
                 Add initial subnets or SNMP hosts to monitor, or skip and configure them anytime in
-                Targets & SNMP Settings.
+                Targets & SNMP.
               </p>
             </div>
           </div>
@@ -1852,7 +1938,7 @@ export const App: React.FC = () => {
                     <div className="text-xs text-slate-400">Reachable SNMP Targets</div>
                   </div>
                   <button
-                    onClick={() => setActiveTab("settings")}
+                    onClick={() => setActiveTab("targets")}
                     className="rounded border border-slate-700 bg-slate-800/80 px-2 py-1 font-sans text-xs text-emerald-400 hover:bg-slate-700"
                   >
                     + Add Host
@@ -1875,7 +1961,7 @@ export const App: React.FC = () => {
                     </div>
                   </div>
                   <button
-                    onClick={() => setActiveTab("settings")}
+                    onClick={() => setActiveTab("targets")}
                     className="rounded border border-slate-700 bg-slate-800/80 px-2 py-1 font-sans text-xs text-emerald-400 hover:bg-slate-700"
                   >
                     + Add Subnet
@@ -1944,7 +2030,7 @@ export const App: React.FC = () => {
                     Polled SNMP Targets ({overview?.snmp_devices?.length || 0})
                   </h3>
                   <button
-                    onClick={() => setActiveTab("settings")}
+                    onClick={() => setActiveTab("targets")}
                     className="flex items-center gap-1 rounded border border-slate-700 bg-slate-800 px-2.5 py-1 text-xs text-slate-200 hover:bg-slate-700"
                   >
                     <Plus className="h-3.5 w-3.5" /> Manage SNMP Hosts & Secrets
@@ -1967,7 +2053,7 @@ export const App: React.FC = () => {
                           <td colSpan={5} className="py-6 text-center font-sans text-slate-500">
                             No SNMP targets configured yet. Click{" "}
                             <button
-                              onClick={() => setActiveTab("settings")}
+                              onClick={() => setActiveTab("targets")}
                               className="text-emerald-400 underline"
                             >
                               Manage SNMP Hosts & Secrets
@@ -2042,10 +2128,10 @@ export const App: React.FC = () => {
                           <td colSpan={4} className="py-6 text-center font-sans text-slate-500">
                             No devices discovered yet. Add a subnet in{" "}
                             <button
-                              onClick={() => setActiveTab("settings")}
+                              onClick={() => setActiveTab("targets")}
                               className="text-emerald-400 underline"
                             >
-                              Targets & SNMP Settings
+                              Targets & SNMP
                             </button>{" "}
                             to scan your network.
                           </td>
@@ -2155,7 +2241,7 @@ export const App: React.FC = () => {
                   <span>{scanningNow ? "Scanning..." : "Rescan Subnets"}</span>
                 </button>
                 <button
-                  onClick={() => setActiveTab("settings")}
+                  onClick={() => setActiveTab("targets")}
                   className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
                 >
                   <Plus className="h-3.5 w-3.5" /> Add Host or Subnet
@@ -2196,10 +2282,10 @@ export const App: React.FC = () => {
                         <td colSpan={8} className="py-10 text-center font-sans text-slate-500">
                           No devices match your current filter. Add a subnet or SNMP target in{" "}
                           <button
-                            onClick={() => setActiveTab("settings")}
+                            onClick={() => setActiveTab("targets")}
                             className="text-emerald-400 underline"
                           >
-                            Targets & SNMP Settings
+                            Targets & SNMP
                           </button>
                           .
                         </td>
@@ -2999,7 +3085,7 @@ export const App: React.FC = () => {
                 </div>
 
                 <button
-                  onClick={() => setActiveTab("settings")}
+                  onClick={() => setActiveTab("targets")}
                   className="mt-4 flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-emerald-400 hover:bg-slate-700"
                 >
                   <Plus className="h-3.5 w-3.5" /> Add / Edit SNMP Hosts & Secrets
@@ -3135,7 +3221,7 @@ export const App: React.FC = () => {
                   </button>
                 ))}
                 <button
-                  onClick={() => setActiveTab("settings")}
+                  onClick={() => setActiveTab("targets")}
                   className="flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-2.5 py-1.5 text-xs font-medium text-emerald-400 hover:bg-slate-700"
                 >
                   <Plus className="h-3.5 w-3.5" /> Add / Manage Subnets
@@ -3375,8 +3461,8 @@ export const App: React.FC = () => {
           </div>
         )}
 
-        {/* ==================== VIEW 6: TARGETS & SNMP SETTINGS ==================== */}
-        {activeTab === "settings" && (
+        {/* ==================== VIEW 6: TARGETS & SNMP ==================== */}
+        {activeTab === "targets" && (
           <div className="space-y-6">
             {settingsFeedback && (
               <div
@@ -4070,6 +4156,465 @@ export const App: React.FC = () => {
                   </div>
                 </div>
               </div>
+            </div>
+          </div>
+        )}
+
+        {/* ==================== VIEW 7: SERVER SETTINGS, UPDATES & SERVICES ==================== */}
+        {activeTab === "settings" && (
+          <div className="space-y-6">
+            {/* Top Bar */}
+            <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-800 bg-[#111827] p-5">
+              <div className="flex items-center gap-3">
+                <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 bg-[#090D16] text-emerald-400">
+                  <Settings className="h-5 w-5" />
+                </div>
+                <div>
+                  <h2 className="text-sm font-semibold text-white">
+                    Server Settings & System Status
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    Server hardware & runtime information, software updates, and background service
+                    health & versions.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => fetchServerInfo(true)}
+                disabled={loadingServerInfo}
+                className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800 disabled:opacity-50"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${loadingServerInfo ? "animate-spin" : ""}`} />
+                <span>{loadingServerInfo ? "Refreshing..." : "Refresh Status"}</span>
+              </button>
+            </div>
+
+            {/* 1. Software Updates Panel */}
+            <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div>
+                  <div className="flex items-center gap-2.5">
+                    <DownloadCloud className="h-4 w-4 text-emerald-400" />
+                    <h3 className="text-sm font-semibold text-white">Server Software Updates</h3>
+                    {updateInfo?.update_available ? (
+                      <span className="rounded border border-amber-500/40 bg-amber-500/15 px-2 py-0.5 font-mono-tabular text-[11px] font-medium text-amber-300">
+                        Update Available ({updateInfo.commits_behind} commit
+                        {updateInfo.commits_behind === 1 ? "" : "s"})
+                      </span>
+                    ) : (
+                      <span className="rounded border border-emerald-500/30 bg-emerald-500/15 px-2 py-0.5 font-mono-tabular text-[11px] font-medium text-emerald-400">
+                        Up to Date
+                      </span>
+                    )}
+                  </div>
+                  <p className="mt-1 text-xs text-slate-400">
+                    New commits on GitHub are fetched in check-only mode and never auto-installed
+                    until you explicitly choose to install them.
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={() => fetchUpdateStatus(true)}
+                    disabled={checkingUpdate || installingUpdate}
+                    className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800 disabled:opacity-50"
+                  >
+                    <RefreshCw
+                      className={`h-3.5 w-3.5 ${checkingUpdate ? "animate-spin" : ""}`}
+                    />
+                    <span>{checkingUpdate ? "Checking GitHub..." : "Check for Updates"}</span>
+                  </button>
+                  {updateInfo?.update_available && (
+                    <>
+                      <button
+                        onClick={openUpdateModal}
+                        disabled={installingUpdate}
+                        className="rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-700 disabled:opacity-50"
+                      >
+                        Open Update Prompt
+                      </button>
+                      <button
+                        onClick={handleInstallUpdate}
+                        disabled={installingUpdate}
+                        className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
+                      >
+                        <DownloadCloud className="h-3.5 w-3.5" />
+                        <span>
+                          {installingUpdate ? "Installing Update..." : "Download & Install Now"}
+                        </span>
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-4">
+                <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3 text-xs">
+                  <div className="text-slate-400">Installed Commit</div>
+                  <div className="mt-1 font-mono-tabular font-semibold text-white">
+                    {updateInfo?.current_sha || serverInfo?.server?.git?.current_sha || "—"}
+                  </div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3 text-xs">
+                  <div className="text-slate-400">Remote Commit (origin/main)</div>
+                  <div className="mt-1 font-mono-tabular font-semibold text-emerald-400">
+                    {updateInfo?.remote_sha || "—"}
+                  </div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3 text-xs">
+                  <div className="text-slate-400">Git Branch</div>
+                  <div className="mt-1 font-mono-tabular text-slate-200">
+                    {serverInfo?.server?.git?.branch || "main"}
+                  </div>
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3 text-xs">
+                  <div className="text-slate-400">Last Checked</div>
+                  <div className="mt-1 font-mono-tabular text-slate-300">
+                    {updateInfo?.checked_at
+                      ? new Date(updateInfo.checked_at).toLocaleTimeString()
+                      : "—"}
+                  </div>
+                </div>
+              </div>
+
+              {serverInfo?.server?.git?.last_commit_subject && (
+                <div className="mt-3 rounded-lg border border-slate-800 bg-[#090D16] px-3.5 py-2 text-xs text-slate-300">
+                  <span className="text-slate-500">Current Release Note: </span>
+                  <span>{serverInfo.server.git.last_commit_subject}</span>
+                </div>
+              )}
+
+              {installingUpdate && (
+                <div className="mt-4 flex items-center gap-3 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs text-emerald-300">
+                  <RefreshCw className="h-4 w-4 shrink-0 animate-spin" />
+                  <span>
+                    Downloading commits from GitHub and rebuilding containers on host... This page
+                    will reload automatically once complete.
+                  </span>
+                </div>
+              )}
+
+              {updateInfo?.update_available && !installingUpdate && (
+                <div className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-4">
+                  <div className="mb-2 flex items-center justify-between text-xs">
+                    <span className="font-semibold text-amber-300">
+                      Available Update ({updateInfo.current_sha} → {updateInfo.remote_sha}) —
+                      What's New
+                    </span>
+                    <span className="font-mono-tabular text-[11px] text-amber-200/80">
+                      {updateInfo.commits_behind} pending commit(s)
+                    </span>
+                  </div>
+                  <ul className="list-disc space-y-1 pl-4 text-xs text-slate-200">
+                    {(updateInfo.summary_bullets && updateInfo.summary_bullets.length > 0
+                      ? updateInfo.summary_bullets
+                      : (updateInfo.commits || []).map((c) => c.subject)
+                    ).map((bullet, idx) => (
+                      <li key={idx}>{bullet}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+
+            {/* 2. Background Services & Versions */}
+            <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
+                    <Server className="h-4 w-4 text-sky-400" />
+                    Background Services & Versions
+                  </h3>
+                  <p className="mt-0.5 text-xs text-slate-400">
+                    Live health checks, container identifiers, running software versions, and probe
+                    latency across the NetDash stack.
+                  </p>
+                </div>
+                <span className="rounded border border-slate-700 bg-[#090D16] px-2.5 py-1 font-mono-tabular text-xs text-emerald-400">
+                  {serverInfo?.services
+                    ? `${serverInfo.services.filter((s) => s.status === "running").length} / ${
+                        serverInfo.services.length
+                      } Running`
+                    : "Loading..."}
+                </span>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-800 text-slate-400">
+                      <th className="pb-2.5 font-medium">Status</th>
+                      <th className="pb-2.5 font-medium">Service</th>
+                      <th className="pb-2.5 font-medium">Container</th>
+                      <th className="pb-2.5 font-medium">Version</th>
+                      <th className="pb-2.5 font-medium">Uptime</th>
+                      <th className="pb-2.5 font-medium">Latency</th>
+                      <th className="pb-2.5 font-medium">Runtime Details</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60 font-mono-tabular">
+                    {!serverInfo?.services ? (
+                      <tr>
+                        <td colSpan={7} className="py-8 text-center font-sans text-slate-500">
+                          Probing background services...
+                        </td>
+                      </tr>
+                    ) : (
+                      serverInfo.services.map((svc) => {
+                        const badgeCls =
+                          svc.status === "running"
+                            ? "bg-emerald-500/15 text-emerald-400"
+                            : svc.status === "degraded"
+                              ? "bg-amber-500/15 text-amber-400"
+                              : "bg-rose-500/15 text-rose-400";
+                        const dotCls =
+                          svc.status === "running"
+                            ? "bg-emerald-400"
+                            : svc.status === "degraded"
+                              ? "bg-amber-400"
+                              : "bg-rose-400";
+                        return (
+                          <tr key={svc.id} className="hover:bg-slate-800/30">
+                            <td className="py-3 pr-3">
+                              <span
+                                className={`inline-flex items-center gap-1.5 rounded px-2 py-0.5 text-[11px] font-medium uppercase ${badgeCls}`}
+                              >
+                                <span className={`h-1.5 w-1.5 rounded-full ${dotCls}`} />
+                                {svc.status}
+                              </span>
+                            </td>
+                            <td className="py-3 pr-3 font-sans font-semibold text-white">
+                              {svc.name}
+                            </td>
+                            <td className="py-3 pr-3 text-slate-400">{svc.container}</td>
+                            <td className="py-3 pr-3 text-sky-300">{svc.version}</td>
+                            <td className="py-3 pr-3 text-slate-300">
+                              {svc.uptime_sec != null ? formatUptime(svc.uptime_sec) : "—"}
+                            </td>
+                            <td className="py-3 pr-3 text-slate-400">
+                              {svc.latency_ms != null ? `${svc.latency_ms.toFixed(1)} ms` : "—"}
+                            </td>
+                            <td className="py-3 font-sans text-slate-300">{svc.detail}</td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Worker Collector Sub-Loops */}
+              {serverInfo?.services
+                ?.find((s) => s.id === "worker")
+                ?.sub_services?.length ? (
+                <div className="mt-4 border-t border-slate-800 pt-4">
+                  <p className="mb-2.5 text-xs font-semibold uppercase tracking-wider text-slate-400">
+                    Background Worker Collector Loops
+                  </p>
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                    {serverInfo.services
+                      .find((s) => s.id === "worker")!
+                      .sub_services!.map((loop) => {
+                        const isOk = loop.status === "running" || loop.status === "scanning";
+                        return (
+                          <div
+                            key={loop.key}
+                            className="rounded-lg border border-slate-800 bg-[#090D16] p-3 text-xs"
+                          >
+                            <div className="flex items-center justify-between">
+                              <span className="font-semibold text-white">{loop.name}</span>
+                              <span
+                                className={`rounded px-1.5 py-0.5 font-mono-tabular text-[10px] uppercase ${
+                                  isOk
+                                    ? "bg-emerald-500/15 text-emerald-400"
+                                    : loop.status === "error"
+                                      ? "bg-rose-500/15 text-rose-400"
+                                      : "bg-slate-800 text-slate-400"
+                                }`}
+                              >
+                                {loop.status}
+                              </span>
+                            </div>
+                            <div className="mt-1.5 font-mono-tabular text-[11px] text-slate-400">
+                              Interval: {loop.interval_sec ? `${loop.interval_sec}s` : "—"} • Last:{" "}
+                              {loop.last_run
+                                ? new Date(loop.last_run).toLocaleTimeString()
+                                : "Pending"}
+                            </div>
+                            <div className="mt-1 text-[11px] text-slate-300">
+                              {loop.detail || "—"}
+                            </div>
+                          </div>
+                        );
+                      })}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
+            {/* 3. Server Information & Host Footprint */}
+            <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+              <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-white">
+                <Cpu className="h-4 w-4 text-emerald-400" />
+                Server Information & Runtime Environment
+              </h3>
+
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3.5 text-xs">
+                  <div className="text-slate-400">Hostname & Architecture</div>
+                  <div className="mt-1 font-mono-tabular font-semibold text-white">
+                    {serverInfo?.server?.hostname || "—"}
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-slate-400">
+                    {serverInfo?.server?.architecture || "—"} • Python{" "}
+                    {serverInfo?.server?.python_version || "—"}
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3.5 text-xs">
+                  <div className="text-slate-400">Operating System & Kernel</div>
+                  <div className="mt-1 font-semibold text-white">
+                    {serverInfo?.server?.os_name || "—"}
+                  </div>
+                  <div className="mt-0.5 font-mono-tabular text-[11px] text-slate-400">
+                    Kernel {serverInfo?.server?.kernel || "—"}
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3.5 text-xs">
+                  <div className="text-slate-400">CPU & Load Average</div>
+                  <div className="mt-1 font-mono-tabular font-semibold text-white">
+                    {serverInfo?.server?.cpu_cores ?? "—"} vCPU Cores
+                  </div>
+                  <div className="mt-0.5 font-mono-tabular text-[11px] text-slate-400">
+                    Load:{" "}
+                    {serverInfo?.server?.load_avg
+                      ? serverInfo.server.load_avg.join(" / ")
+                      : "—"}
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3.5 text-xs">
+                  <div className="flex items-center justify-between text-slate-400">
+                    <span>API Uptime & DB Storage</span>
+                    <Clock className="h-3.5 w-3.5 text-slate-500" />
+                  </div>
+                  <div className="mt-1 font-mono-tabular font-semibold text-white">
+                    {serverInfo?.server
+                      ? formatUptime(serverInfo.server.api_uptime_sec)
+                      : "—"}
+                  </div>
+                  <div className="mt-0.5 flex items-center gap-1 font-mono-tabular text-[11px] text-sky-400">
+                    <Database className="h-3 w-3" />
+                    <span>
+                      DB:{" "}
+                      {serverInfo?.server?.db_size_bytes != null
+                        ? formatBytes(serverInfo.server.db_size_bytes)
+                        : "—"}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Memory & Disk Bars */}
+              <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+                <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3.5 text-xs">
+                  <div className="mb-1.5 flex items-center justify-between font-mono-tabular">
+                    <span className="font-sans font-medium text-slate-300">Host Memory (RAM)</span>
+                    <span className="text-slate-400">
+                      {serverInfo?.server?.memory?.total_bytes != null
+                        ? `${formatBytes(serverInfo.server.memory.used_bytes)} / ${formatBytes(
+                            serverInfo.server.memory.total_bytes,
+                          )} (${serverInfo.server.memory.usage_pct}%)`
+                        : "Unavailable"}
+                    </span>
+                  </div>
+                  <div className="h-2 w-full overflow-hidden rounded-full bg-slate-800">
+                    <div
+                      style={{
+                        width: `${Math.min(100, serverInfo?.server?.memory?.usage_pct || 0)}%`,
+                      }}
+                      className={`h-full rounded-full ${
+                        (serverInfo?.server?.memory?.usage_pct || 0) >= 90
+                          ? "bg-rose-500"
+                          : (serverInfo?.server?.memory?.usage_pct || 0) >= 75
+                            ? "bg-amber-500"
+                            : "bg-sky-500"
+                      }`}
+                    />
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3.5 text-xs">
+                  <div className="mb-1.5 flex items-center justify-between font-mono-tabular">
+                    <span className="font-sans font-medium text-slate-300">Root Disk Usage</span>
+                    <span className="text-slate-400">
+                      {serverInfo?.server?.disk?.total_bytes != null
+                        ? `${formatBytes(serverInfo.server.disk.used_bytes)} / ${formatBytes(
+                            serverInfo.server.disk.total_bytes,
+                          )} (${serverInfo.server.disk.usage_pct}%)`
+                        : "Unavailable"}
+                    </span>
+                  </div>
+                  <div className="h-2 w-full overflow-hidden rounded-full bg-slate-800">
+                    <div
+                      style={{
+                        width: `${Math.min(100, serverInfo?.server?.disk?.usage_pct || 0)}%`,
+                      }}
+                      className={`h-full rounded-full ${
+                        (serverInfo?.server?.disk?.usage_pct || 0) >= 90
+                          ? "bg-rose-500"
+                          : (serverInfo?.server?.disk?.usage_pct || 0) >= 75
+                            ? "bg-amber-500"
+                            : "bg-emerald-500"
+                      }`}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* Runtime Server Configuration Summary */}
+              {serverInfo?.server?.config && (
+                <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-7">
+                  {[
+                    { label: "Web UI Port", val: `:${serverInfo.server.config.web_port}` },
+                    {
+                      label: "Syslog Port",
+                      val: `:${serverInfo.server.config.syslog_port} (UDP/TCP)`,
+                    },
+                    {
+                      label: "SNMP Interval",
+                      val: `${serverInfo.server.config.snmp_poll_interval_sec}s`,
+                    },
+                    {
+                      label: "Scan Interval",
+                      val: `${serverInfo.server.config.subnet_scan_minutes}m`,
+                    },
+                    {
+                      label: "SNMP Retention",
+                      val: `${serverInfo.server.config.snmp_raw_retention_days}d raw`,
+                    },
+                    {
+                      label: "Syslog Retention",
+                      val: `${serverInfo.server.config.log_retention_days}d`,
+                    },
+                    {
+                      label: "Backend MIBs",
+                      val: `${serverInfo.server.config.loaded_mib_files} files`,
+                    },
+                  ].map((item) => (
+                    <div
+                      key={item.label}
+                      className="rounded-lg border border-slate-800 bg-[#090D16] p-2.5 text-xs"
+                    >
+                      <div className="text-[11px] text-slate-400">{item.label}</div>
+                      <div className="mt-0.5 font-mono-tabular font-semibold text-slate-200">
+                        {item.val}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         )}

@@ -1,14 +1,21 @@
 import asyncio
+import importlib.metadata
 import ipaddress
 import json
 import logging
 import os
+import platform
+import re
+import shutil
+import socket
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import asyncpg
+import httpx
 import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,9 +42,17 @@ DATABASE_URL = os.getenv(
 )
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 REPO_MOUNT_DIR = Path(os.getenv("NETDASH_REPO_DIR", "/opt/netdash-repo"))
+API_START_TIME = datetime.now(timezone.utc)
 
 db_pool: Optional[asyncpg.Pool] = None
 redis_client: Optional[aioredis.Redis] = None
+
+
+def _pkg_version(name: str, default: str = "unknown") -> str:
+    try:
+        return importlib.metadata.version(name)
+    except Exception:
+        return default
 
 
 class SNMPProfilePayload(BaseModel):
@@ -290,6 +305,508 @@ async def install_update() -> Dict[str, Any]:
     return {
         "status": "updating",
         "message": "Update installation triggered on host. Containers will rebuild and restart shortly.",
+    }
+
+
+def _format_bytes_human(num: Optional[int]) -> str:
+    val = float(num or 0)
+    if val <= 0:
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if val < 1024.0 or unit == "TB":
+            return f"{val:.1f} {unit}" if unit != "B" else f"{int(val)} B"
+        val /= 1024.0
+    return f"{int(val)} B"
+
+
+def _read_os_pretty_name() -> str:
+    try:
+        os_release = Path("/etc/os-release")
+        if os_release.exists():
+            for line in os_release.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.startswith("PRETTY_NAME="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return f"{platform.system()} {platform.release()}"
+
+
+def _read_memory_info() -> Dict[str, Any]:
+    try:
+        meminfo_path = Path("/proc/meminfo")
+        if not meminfo_path.exists():
+            return {"total_bytes": None, "used_bytes": None, "available_bytes": None, "usage_pct": None}
+        values: Dict[str, int] = {}
+        for line in meminfo_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if ":" in line:
+                key, rest = line.split(":", 1)
+                parts = rest.strip().split()
+                if parts and parts[0].isdigit():
+                    values[key.strip()] = int(parts[0]) * 1024
+        total = values.get("MemTotal")
+        avail = values.get("MemAvailable", values.get("MemFree"))
+        if total and avail is not None:
+            used = max(0, total - avail)
+            pct = round((used / total) * 100.0, 1) if total > 0 else 0.0
+            return {
+                "total_bytes": total,
+                "used_bytes": used,
+                "available_bytes": avail,
+                "usage_pct": pct,
+            }
+    except Exception:
+        pass
+    return {"total_bytes": None, "used_bytes": None, "available_bytes": None, "usage_pct": None}
+
+
+def _read_disk_info() -> Dict[str, Any]:
+    try:
+        target = str(REPO_MOUNT_DIR) if REPO_MOUNT_DIR.exists() else "/"
+        usage = shutil.disk_usage(target)
+        pct = round((usage.used / usage.total) * 100.0, 1) if usage.total > 0 else 0.0
+        return {
+            "total_bytes": usage.total,
+            "used_bytes": usage.used,
+            "free_bytes": usage.free,
+            "usage_pct": pct,
+        }
+    except Exception:
+        return {"total_bytes": None, "used_bytes": None, "free_bytes": None, "usage_pct": None}
+
+
+def _read_compose_image_tag(service_name: str, default_tag: str) -> str:
+    try:
+        compose_path = REPO_MOUNT_DIR / "docker-compose.yml"
+        if not compose_path.exists():
+            return default_tag
+        in_service = False
+        service_indent: Optional[int] = None
+        for raw_line in compose_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(raw_line) - len(raw_line.lstrip(" "))
+            if stripped == f"{service_name}:":
+                in_service = True
+                service_indent = indent
+                continue
+            if in_service:
+                if service_indent is not None and indent <= service_indent:
+                    break
+                if stripped.startswith("image:"):
+                    img = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+                    if ":" in img:
+                        return img.rsplit(":", 1)[1]
+                    return img
+    except Exception:
+        pass
+    return default_tag
+
+
+def _read_frontend_pkg_versions() -> Dict[str, str]:
+    result = {"react": "19.x", "vite": "6.x"}
+    try:
+        pkg_path = REPO_MOUNT_DIR / "frontend" / "package.json"
+        if pkg_path.exists():
+            data = json.loads(pkg_path.read_text(encoding="utf-8", errors="ignore"))
+            deps = data.get("dependencies", {})
+            dev_deps = data.get("devDependencies", {})
+            if isinstance(deps.get("react"), str):
+                result["react"] = deps["react"].lstrip("^~")
+            if isinstance(dev_deps.get("vite"), str):
+                result["vite"] = dev_deps["vite"].lstrip("^~")
+    except Exception:
+        pass
+    return result
+
+
+async def _run_git_info() -> Dict[str, Any]:
+    if not (REPO_MOUNT_DIR / ".git").exists():
+        return {
+            "current_sha": "local",
+            "branch": "local",
+            "last_commit_subject": "Running without .git metadata",
+            "last_commit_date": None,
+            "remote_url": "",
+        }
+
+    async def _run_git(*args: str) -> str:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "-C",
+                str(REPO_MOUNT_DIR),
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            return out.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            return ""
+
+    sha, branch, subj, dt_str, remote = await asyncio.gather(
+        _run_git("rev-parse", "--short=7", "HEAD"),
+        _run_git("rev-parse", "--abbrev-ref", "HEAD"),
+        _run_git("log", "-1", "--pretty=format:%s"),
+        _run_git("log", "-1", "--pretty=format:%cI"),
+        _run_git("remote", "get-url", "origin"),
+    )
+    return {
+        "current_sha": sha or "unknown",
+        "branch": branch or "main",
+        "last_commit_subject": subj or "—",
+        "last_commit_date": dt_str or None,
+        "remote_url": remote or "",
+    }
+
+
+@app.get("/api/system/info")
+async def get_system_info() -> Dict[str, Any]:
+    """Returns server host information and live status/versions of all background services."""
+    now_utc = datetime.now(timezone.utc)
+    api_uptime_sec = max(0, int((now_utc - API_START_TIME).total_seconds()))
+    mib_count = len(list_backend_mibs())
+
+    try:
+        load_avg: Optional[List[float]] = [round(x, 2) for x in os.getloadavg()]
+    except Exception:
+        load_avg = None
+
+    web_port = int(os.getenv("WEB_PORT", "8080") or 8080)
+    syslog_port = int(os.getenv("SYSLOG_PORT", "514") or 514)
+
+    async def _probe_timescaledb() -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        if db_pool is None:
+            return {
+                "id": "timescaledb",
+                "name": "TimescaleDB / PostgreSQL",
+                "container": "netdash-timescaledb",
+                "status": "stopped",
+                "version": "PostgreSQL 16 • TimescaleDB",
+                "uptime_sec": None,
+                "latency_ms": None,
+                "detail": "Database connection pool not initialized",
+                "db_size_bytes": None,
+            }
+        try:
+            async with db_pool.acquire() as conn:
+                row = await asyncio.wait_for(
+                    conn.fetchrow(
+                        """
+                        SELECT
+                            current_setting('server_version') AS pg_ver,
+                            (SELECT extversion FROM pg_extension WHERE extname = 'timescaledb') AS ts_ver,
+                            pg_database_size(current_database()) AS db_size,
+                            EXTRACT(EPOCH FROM (NOW() - pg_postmaster_start_time()))::bigint AS uptime_sec,
+                            (SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()) AS connections
+                        """
+                    ),
+                    timeout=2.0,
+                )
+            latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+            pg_ver = str(row["pg_ver"] or "16").split(" ")[0]
+            ts_ver = str(row["ts_ver"]) if row["ts_ver"] else "N/A"
+            db_size = int(row["db_size"] or 0)
+            uptime_sec = int(row["uptime_sec"] or 0)
+            conns = int(row["connections"] or 0)
+            return {
+                "id": "timescaledb",
+                "name": "TimescaleDB / PostgreSQL",
+                "container": "netdash-timescaledb",
+                "status": "running",
+                "version": f"PostgreSQL {pg_ver} • TimescaleDB {ts_ver}",
+                "uptime_sec": uptime_sec,
+                "latency_ms": latency_ms,
+                "detail": f"{conns} active conn • DB size {_format_bytes_human(db_size)}",
+                "db_size_bytes": db_size,
+            }
+        except Exception as exc:
+            return {
+                "id": "timescaledb",
+                "name": "TimescaleDB / PostgreSQL",
+                "container": "netdash-timescaledb",
+                "status": "stopped",
+                "version": "PostgreSQL 16 • TimescaleDB",
+                "uptime_sec": None,
+                "latency_ms": None,
+                "detail": f"Probe failed: {str(exc)[:100]}",
+                "db_size_bytes": None,
+            }
+
+    async def _probe_redis() -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        if redis_client is None:
+            return {
+                "id": "redis",
+                "name": "Redis Cache & Pub/Sub",
+                "container": "netdash-redis",
+                "status": "stopped",
+                "version": "Redis 7.x",
+                "uptime_sec": None,
+                "latency_ms": None,
+                "detail": "Redis client not initialized",
+            }
+        try:
+            srv, mem, clients = await asyncio.wait_for(
+                asyncio.gather(
+                    redis_client.info("server"),
+                    redis_client.info("memory"),
+                    redis_client.info("clients"),
+                ),
+                timeout=2.0,
+            )
+            latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+            redis_ver = srv.get("redis_version", "7.x")
+            uptime_sec = int(srv.get("uptime_in_seconds", 0) or 0)
+            mem_human = mem.get("used_memory_human", "?")
+            conn_clients = clients.get("connected_clients", 0)
+            return {
+                "id": "redis",
+                "name": "Redis Cache & Pub/Sub",
+                "container": "netdash-redis",
+                "status": "running",
+                "version": f"Redis {redis_ver}",
+                "uptime_sec": uptime_sec,
+                "latency_ms": latency_ms,
+                "detail": f"Mem {mem_human} • {conn_clients} connected client(s)",
+            }
+        except Exception as exc:
+            return {
+                "id": "redis",
+                "name": "Redis Cache & Pub/Sub",
+                "container": "netdash-redis",
+                "status": "stopped",
+                "version": "Redis 7.x",
+                "uptime_sec": None,
+                "latency_ms": None,
+                "detail": f"Probe failed: {str(exc)[:100]}",
+            }
+
+    async def _probe_worker() -> Dict[str, Any]:
+        default_py = platform.python_version()
+        default_pysnmp = _pkg_version("pysnmp")
+        if redis_client is None:
+            return {
+                "id": "worker",
+                "name": "Background Telemetry Worker",
+                "container": "netdash-worker",
+                "status": "stopped",
+                "version": f"Python {default_py} • PySNMP {default_pysnmp}",
+                "uptime_sec": None,
+                "latency_ms": None,
+                "detail": "Redis unavailable to check worker heartbeat",
+                "sub_services": [],
+            }
+        try:
+            t0 = time.perf_counter()
+            raw = await asyncio.wait_for(redis_client.get("netdash:worker:heartbeat"), timeout=1.5)
+            latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+            if not raw:
+                return {
+                    "id": "worker",
+                    "name": "Background Telemetry Worker",
+                    "container": "netdash-worker",
+                    "status": "stopped",
+                    "version": f"Python {default_py} • PySNMP {default_pysnmp}",
+                    "uptime_sec": None,
+                    "latency_ms": latency_ms,
+                    "detail": "No active worker heartbeat in Redis",
+                    "sub_services": [],
+                }
+            hb = json.loads(raw)
+            py_v = hb.get("python_version") or default_py
+            snmp_v = hb.get("pysnmp_version") or default_pysnmp
+            nmap_v = hb.get("nmap_version") or "unknown"
+            uptime_sec: Optional[int] = None
+            if hb.get("started_at"):
+                try:
+                    started_dt = datetime.fromisoformat(hb["started_at"])
+                    uptime_sec = max(0, int((now_utc - started_dt).total_seconds()))
+                except Exception:
+                    uptime_sec = None
+
+            loops = hb.get("loops") or {}
+            loop_labels = [
+                ("snmp_poller", "SNMP Poller Loop"),
+                ("subnet_scanner", "Nmap Subnet Scanner Loop"),
+                ("unifi_collector", "UniFi Collector Loop"),
+            ]
+            sub_services: List[Dict[str, Any]] = []
+            for key, label in loop_labels:
+                linfo = loops.get(key) or {}
+                sub_services.append(
+                    {
+                        "key": key,
+                        "name": label,
+                        "status": linfo.get("status", "unknown"),
+                        "interval_sec": linfo.get("interval_sec"),
+                        "last_run": linfo.get("last_run"),
+                        "detail": linfo.get("detail") or "",
+                    }
+                )
+
+            return {
+                "id": "worker",
+                "name": "Background Telemetry Worker",
+                "container": "netdash-worker",
+                "status": "running",
+                "version": f"Python {py_v} • PySNMP {snmp_v} • Nmap {nmap_v}",
+                "uptime_sec": uptime_sec,
+                "latency_ms": latency_ms,
+                "detail": f"Heartbeat active • asyncpg {hb.get('asyncpg_version', _pkg_version('asyncpg'))}",
+                "sub_services": sub_services,
+            }
+        except Exception as exc:
+            return {
+                "id": "worker",
+                "name": "Background Telemetry Worker",
+                "container": "netdash-worker",
+                "status": "stopped",
+                "version": f"Python {default_py} • PySNMP {default_pysnmp}",
+                "uptime_sec": None,
+                "latency_ms": None,
+                "detail": f"Heartbeat check failed: {str(exc)[:100]}",
+                "sub_services": [],
+            }
+
+    async def _probe_vector() -> Dict[str, Any]:
+        raw_tag = _read_compose_image_tag("vector", "0.42.0-alpine")
+        clean_tag = raw_tag.replace("-alpine", "")
+        logs_24h = 0
+        if db_pool is not None:
+            try:
+                async with db_pool.acquire() as conn:
+                    cnt = await asyncio.wait_for(
+                        conn.fetchval(
+                            "SELECT COUNT(*) FROM device_logs WHERE time > NOW() - INTERVAL '24 hours'"
+                        ),
+                        timeout=1.5,
+                    )
+                    logs_24h = int(cnt or 0)
+            except Exception:
+                pass
+        try:
+            t0 = time.perf_counter()
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection("vector", 514),
+                timeout=1.5,
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+            return {
+                "id": "vector",
+                "name": "Vector Syslog Receiver",
+                "container": "netdash-vector",
+                "status": "running",
+                "version": f"Vector {clean_tag}",
+                "uptime_sec": None,
+                "latency_ms": latency_ms,
+                "detail": f"UDP/TCP :{syslog_port} listening • {logs_24h} logs ingested (24h)",
+            }
+        except Exception:
+            return {
+                "id": "vector",
+                "name": "Vector Syslog Receiver",
+                "container": "netdash-vector",
+                "status": "stopped",
+                "version": f"Vector {clean_tag}",
+                "uptime_sec": None,
+                "latency_ms": None,
+                "detail": f"Port 514 unreachable • {logs_24h} logs stored (24h)",
+            }
+
+    async def _probe_frontend() -> Dict[str, Any]:
+        fe_pkgs = _read_frontend_pkg_versions()
+        react_ver = fe_pkgs["react"]
+        vite_ver = fe_pkgs["vite"]
+        try:
+            t0 = time.perf_counter()
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                resp = await client.head("http://frontend:80/")
+            latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+            nginx_hdr = resp.headers.get("server", "nginx/1.27")
+            svc_status = "running" if resp.status_code < 500 else "degraded"
+            return {
+                "id": "frontend",
+                "name": "Nginx Web Frontend",
+                "container": "netdash-frontend",
+                "status": svc_status,
+                "version": f"{nginx_hdr} • React {react_ver} • Vite {vite_ver}",
+                "uptime_sec": None,
+                "latency_ms": latency_ms,
+                "detail": f"SPA & Reverse Proxy active on host port :{web_port}",
+            }
+        except Exception:
+            return {
+                "id": "frontend",
+                "name": "Nginx Web Frontend",
+                "container": "netdash-frontend",
+                "status": "stopped",
+                "version": f"nginx/1.27 • React {react_ver} • Vite {vite_ver}",
+                "uptime_sec": None,
+                "latency_ms": None,
+                "detail": "Frontend HTTP check unreachable on internal network",
+            }
+
+    git_info, ts_svc, redis_svc, worker_svc, vector_svc, frontend_svc = await asyncio.gather(
+        _run_git_info(),
+        _probe_timescaledb(),
+        _probe_redis(),
+        _probe_worker(),
+        _probe_vector(),
+        _probe_frontend(),
+    )
+
+    api_svc: Dict[str, Any] = {
+        "id": "api",
+        "name": "NetDash API Server",
+        "container": "netdash-api",
+        "status": "running",
+        "version": (
+            f"FastAPI {_pkg_version('fastapi')} • "
+            f"Uvicorn {_pkg_version('uvicorn')} • "
+            f"Python {platform.python_version()}"
+        ),
+        "uptime_sec": api_uptime_sec,
+        "latency_ms": 0.1,
+        "detail": f"API v{app.version} • {mib_count} backend MIB files loaded",
+    }
+
+    db_size_bytes = ts_svc.pop("db_size_bytes", None)
+    services = [api_svc, worker_svc, ts_svc, redis_svc, vector_svc, frontend_svc]
+
+    return {
+        "server": {
+            "hostname": socket.gethostname(),
+            "os_name": _read_os_pretty_name(),
+            "kernel": platform.release(),
+            "architecture": platform.machine(),
+            "python_version": platform.python_version(),
+            "cpu_cores": os.cpu_count() or 1,
+            "load_avg": load_avg,
+            "memory": _read_memory_info(),
+            "disk": _read_disk_info(),
+            "db_size_bytes": db_size_bytes,
+            "api_uptime_sec": api_uptime_sec,
+            "server_time_utc": now_utc.isoformat(),
+            "git": git_info,
+            "config": {
+                "web_port": web_port,
+                "syslog_port": syslog_port,
+                "snmp_poll_interval_sec": max(15, int(os.getenv("SNMP_POLL_INTERVAL", "60") or 60)),
+                "subnet_scan_minutes": max(1, int(os.getenv("SUBNET_SCAN_MINUTES", "15") or 15)),
+                "snmp_raw_retention_days": int(os.getenv("SNMP_RAW_RETENTION_DAYS", "180") or 180),
+                "log_retention_days": int(os.getenv("LOG_RETENTION_DAYS", "30") or 30),
+                "loaded_mib_files": mib_count,
+            },
+        },
+        "services": services,
     }
 
 
