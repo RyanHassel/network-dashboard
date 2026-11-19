@@ -1,8 +1,11 @@
 import React, { useEffect, useId, useRef, useState } from "react";
 import {
   Activity,
+  ArrowDown,
   ArrowDownRight,
   ArrowLeft,
+  ArrowUp,
+  ArrowUpDown,
   ArrowUpRight,
   Check,
   Clock,
@@ -30,6 +33,17 @@ import {
 } from "lucide-react";
 
 type TabKey = "pulse" | "devices" | "snmp" | "scanner" | "syslog" | "targets" | "settings";
+
+type DeviceSortKey =
+  | "status"
+  | "ip_address"
+  | "hostname"
+  | "mac_address"
+  | "vendor"
+  | "subnet"
+  | "snmp"
+  | "sources";
+type SortDirection = "asc" | "desc";
 
 interface UpdateProgressComponent {
   id: string;
@@ -518,6 +532,18 @@ function formatUptime(sec: number | undefined | null): string {
   if (d > 0) return `${d}d ${h}h`;
   if (h > 0) return `${h}h ${m}m`;
   return `${m}m`;
+}
+
+function ipv4ToSortNumber(ip: string): number {
+  const parts = (ip || "").split(".");
+  if (parts.length !== 4) return Number.MAX_SAFE_INTEGER;
+  let num = 0;
+  for (const p of parts) {
+    const octet = Number(p);
+    if (!Number.isInteger(octet) || octet < 0 || octet > 255) return Number.MAX_SAFE_INTEGER;
+    num = num * 256 + octet;
+  }
+  return num;
 }
 
 function formatChartAxisTimestamp(rawLabel: string, spanMs: number): string {
@@ -1115,6 +1141,8 @@ export const App: React.FC = () => {
   const [allDevices, setAllDevices] = useState<UnifiedDeviceItem[]>([]);
   const [deviceSearch, setDeviceSearch] = useState("");
   const [deviceFilter, setDeviceFilter] = useState<"all" | "online" | "snmp">("all");
+  const [deviceSortKey, setDeviceSortKey] = useState<DeviceSortKey>("ip_address");
+  const [deviceSortDir, setDeviceSortDir] = useState<SortDirection>("asc");
   const [selectedDeviceDetailIp, setSelectedDeviceDetailIp] = useState<string | null>(null);
   const [deviceDetail, setDeviceDetail] = useState<DeviceDetailPayload | null>(null);
   const [loadingDeviceDetail, setLoadingDeviceDetail] = useState(false);
@@ -2135,21 +2163,112 @@ export const App: React.FC = () => {
     ? hosts.filter((h) => h.subnet_cidr === selectedSubnet)
     : hosts;
 
-  const filteredDevices = allDevices.filter((d) => {
-    if (deviceFilter === "online" && !d.is_online) return false;
-    if (deviceFilter === "snmp" && !d.sources.includes("SNMP")) return false;
-    if (deviceSearch.trim()) {
-      const q = deviceSearch.trim().toLowerCase();
-      return (
-        d.ip_address.toLowerCase().includes(q) ||
-        (d.hostname || "").toLowerCase().includes(q) ||
-        (d.mac_address || "").toLowerCase().includes(q) ||
-        (d.vendor || "").toLowerCase().includes(q) ||
-        (d.sys_descr || "").toLowerCase().includes(q)
-      );
+  const handleToggleDeviceSort = (key: DeviceSortKey) => {
+    if (deviceSortKey === key) {
+      setDeviceSortDir((prev) => (prev === "asc" ? "desc" : "asc"));
+    } else {
+      setDeviceSortKey(key);
+      setDeviceSortDir(key === "snmp" || key === "sources" ? "desc" : "asc");
     }
-    return true;
-  });
+  };
+
+  const filteredDevices = allDevices
+    .filter((d) => {
+      if (deviceFilter === "online" && !d.is_online) return false;
+      if (deviceFilter === "snmp" && !d.sources.includes("SNMP")) return false;
+      if (deviceSearch.trim()) {
+        const q = deviceSearch.trim().toLowerCase();
+        return (
+          d.ip_address.toLowerCase().includes(q) ||
+          (d.hostname || "").toLowerCase().includes(q) ||
+          (d.mac_address || "").toLowerCase().includes(q) ||
+          (d.vendor || "").toLowerCase().includes(q) ||
+          (d.sys_descr || "").toLowerCase().includes(q)
+        );
+      }
+      return true;
+    })
+    .slice()
+    .sort((a, b) => {
+      // Keep Online devices pinned above Offline devices when viewing All
+      if (deviceFilter === "all" && a.is_online !== b.is_online) {
+        return a.is_online ? -1 : 1;
+      }
+
+      const dir = deviceSortDir === "asc" ? 1 : -1;
+      const compareOptionalText = (va: string, vb: string) => {
+        if (!va && !vb) return 0;
+        if (!va) return 1;
+        if (!vb) return -1;
+        return va.localeCompare(vb, undefined, { numeric: true, sensitivity: "base" }) * dir;
+      };
+
+      let cmp = 0;
+      switch (deviceSortKey) {
+        case "status":
+          if (a.is_online !== b.is_online) {
+            cmp = (a.is_online ? -1 : 1) * dir;
+          } else {
+            cmp = (ipv4ToSortNumber(a.ip_address) - ipv4ToSortNumber(b.ip_address)) * dir;
+          }
+          break;
+        case "ip_address": {
+          const na = ipv4ToSortNumber(a.ip_address);
+          const nb = ipv4ToSortNumber(b.ip_address);
+          cmp =
+            na !== nb
+              ? (na - nb) * dir
+              : a.ip_address.localeCompare(b.ip_address, undefined, { numeric: true }) * dir;
+          break;
+        }
+        case "hostname":
+          cmp = compareOptionalText(
+            (a.hostname || a.ip_address || "").trim(),
+            (b.hostname || b.ip_address || "").trim(),
+          );
+          break;
+        case "mac_address":
+          cmp = compareOptionalText((a.mac_address || "").trim(), (b.mac_address || "").trim());
+          break;
+        case "vendor":
+          cmp = compareOptionalText(
+            (a.vendor || a.sys_descr || "").trim(),
+            (b.vendor || b.sys_descr || "").trim(),
+          );
+          break;
+        case "subnet": {
+          cmp = compareOptionalText((a.subnet_cidr || "").trim(), (b.subnet_cidr || "").trim());
+          if (cmp === 0) {
+            cmp = ((a.vlan_id ?? 99999) - (b.vlan_id ?? 99999)) * dir;
+          }
+          break;
+        }
+        case "snmp": {
+          const sa = a.sources.includes("SNMP") ? 1 : 0;
+          const sb = b.sources.includes("SNMP") ? 1 : 0;
+          cmp = (sa - sb) * dir;
+          if (cmp === 0) cmp = ((a.interface_count || 0) - (b.interface_count || 0)) * dir;
+          if (cmp === 0) {
+            cmp = compareOptionalText(
+              (a.snmp_profile_name || "").trim(),
+              (b.snmp_profile_name || "").trim(),
+            );
+          }
+          break;
+        }
+        case "sources": {
+          cmp = (a.sources.length - b.sources.length) * dir;
+          if (cmp === 0) {
+            cmp = compareOptionalText(a.sources.join(","), b.sources.join(","));
+          }
+          break;
+        }
+      }
+
+      if (cmp !== 0) return cmp;
+      const ipCmp = ipv4ToSortNumber(a.ip_address) - ipv4ToSortNumber(b.ip_address);
+      return deviceSortKey === "status" ? ipCmp * dir : ipCmp;
+    });
 
   return (
     <div className="min-h-screen bg-[#090D16] text-slate-100">
@@ -3103,30 +3222,77 @@ export const App: React.FC = () => {
             </div>
 
             <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
-              <div className="mb-3 flex items-center justify-between">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <h2 className="text-sm font-semibold text-white">
                     Discovered & Monitored Network Devices ({filteredDevices.length})
                   </h2>
                   <p className="text-xs text-slate-400">
-                    Click any device row to open its full telemetry page (SNMP system info,
-                    interface counters, ARP/MAC details, and syslogs).
+                    Click any column header to sort, or click any device row to open its full
+                    telemetry page.
                   </p>
                 </div>
+                {deviceFilter === "all" && (
+                  <span className="rounded border border-emerald-500/25 bg-emerald-500/10 px-2 py-0.5 text-[11px] text-emerald-400">
+                    Online devices pinned first
+                  </span>
+                )}
               </div>
 
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs">
                   <thead>
                     <tr className="border-b border-slate-800 text-slate-400">
-                      <th className="pb-2.5 font-medium">Status</th>
-                      <th className="pb-2.5 font-medium">IPv4 Address</th>
-                      <th className="pb-2.5 font-medium">Hostname / sysName</th>
-                      <th className="pb-2.5 font-medium">MAC Address</th>
-                      <th className="pb-2.5 font-medium">Vendor / Hardware</th>
-                      <th className="pb-2.5 font-medium">Subnet / VLAN</th>
-                      <th className="pb-2.5 font-medium">SNMP / Interfaces</th>
-                      <th className="pb-2.5 text-right font-medium">Telemetry Sources</th>
+                      {(
+                        [
+                          { key: "status", label: "Status", alignRight: false },
+                          { key: "ip_address", label: "IPv4 Address", alignRight: false },
+                          { key: "hostname", label: "Hostname / sysName", alignRight: false },
+                          { key: "mac_address", label: "MAC Address", alignRight: false },
+                          { key: "vendor", label: "Vendor / Hardware", alignRight: false },
+                          { key: "subnet", label: "Subnet / VLAN", alignRight: false },
+                          { key: "snmp", label: "SNMP / Interfaces", alignRight: false },
+                          { key: "sources", label: "Telemetry Sources", alignRight: true },
+                        ] as Array<{ key: DeviceSortKey; label: string; alignRight: boolean }>
+                      ).map((col) => {
+                        const isActive = deviceSortKey === col.key;
+                        return (
+                          <th
+                            key={col.key}
+                            aria-sort={
+                              isActive
+                                ? deviceSortDir === "asc"
+                                  ? "ascending"
+                                  : "descending"
+                                : "none"
+                            }
+                            className={`pb-2.5 font-medium ${col.alignRight ? "text-right" : ""}`}
+                          >
+                            <button
+                              type="button"
+                              onClick={() => handleToggleDeviceSort(col.key)}
+                              className={`group inline-flex items-center gap-1 rounded px-1 py-0.5 transition ${
+                                col.alignRight ? "ml-auto justify-end" : ""
+                              } ${
+                                isActive
+                                  ? "text-emerald-400"
+                                  : "text-slate-400 hover:text-slate-200"
+                              }`}
+                            >
+                              <span>{col.label}</span>
+                              {isActive ? (
+                                deviceSortDir === "asc" ? (
+                                  <ArrowUp className="h-3 w-3 shrink-0" />
+                                ) : (
+                                  <ArrowDown className="h-3 w-3 shrink-0" />
+                                )
+                              ) : (
+                                <ArrowUpDown className="h-3 w-3 shrink-0 opacity-45 transition-opacity group-hover:opacity-100" />
+                              )}
+                            </button>
+                          </th>
+                        );
+                      })}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800/60 font-mono-tabular">
