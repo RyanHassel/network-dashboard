@@ -1995,15 +1995,16 @@ async def get_all_devices() -> Dict[str, Any]:
         if "SNMP" not in item["sources"]:
             item["sources"].append("SNMP")
 
-    for r in snmp_dev_rows:
+    for r_rec in snmp_dev_rows:
+        r = dict(r_rec)
         ip_str = str(r["device_ip"])
         item = _ensure_ip(ip_str)
-        if r["sys_name"] and (item["hostname"] == ip_str or not item["hostname"]):
+        if r.get("sys_name") and (item["hostname"] == ip_str or not item["hostname"]):
             item["hostname"] = r["sys_name"]
-        item["snmp_reachable"] = bool(r["is_reachable"])
-        if r["is_reachable"]:
+        item["snmp_reachable"] = bool(r.get("is_reachable"))
+        if r.get("is_reachable"):
             item["is_online"] = True
-        if r["vendor_name"] and not item["vendor"]:
+        if r.get("vendor_name") and not item["vendor"]:
             item["vendor"] = (
                 f"{r['vendor_name']} ({r['hardware_model']})"
                 if r.get("hardware_model")
@@ -2018,15 +2019,15 @@ async def get_all_devices() -> Dict[str, Any]:
                 raw_mibs = []
         if raw_mibs:
             item["matched_mibs"] = raw_mibs
-        item["sys_descr"] = r["sys_descr"]
-        item["sys_location"] = r["sys_location"]
-        item["cpu_usage_pct"] = float(r["cpu_usage_pct"] or 0.0)
-        item["interface_count"] = int(r["interface_count"] or 0)
-        if r["sys_uptime_ticks"]:
+        item["sys_descr"] = r.get("sys_descr")
+        item["sys_location"] = r.get("sys_location")
+        item["cpu_usage_pct"] = float(r.get("cpu_usage_pct") or 0.0)
+        item["interface_count"] = int(r.get("interface_count") or 0)
+        if r.get("sys_uptime_ticks"):
             item["uptime_sec"] = int(r["sys_uptime_ticks"]) // 100
         if "SNMP" not in item["sources"]:
             item["sources"].append("SNMP")
-        if r["last_polled"]:
+        if r.get("last_polled"):
             item["last_seen"] = r["last_polled"].isoformat()
 
     for r in unifi_dev_rows:
@@ -2071,10 +2072,15 @@ async def get_all_devices() -> Dict[str, Any]:
                 f"{item.get('vendor') or ''} {item.get('sys_descr') or ''}",
                 item.get("hostname") or "",
             )
-            item["matched_mibs"] = matched["mibs"]
-            item["device_category"] = item.get("device_category") or matched["category"]
-            if not item.get("vendor") and matched["vendor"] != "Generic / Standard RFC":
-                item["vendor"] = matched["vendor"]
+            item["matched_mibs"] = matched.get("mibs") or []
+            item["device_category"] = item.get("device_category") or matched.get("category")
+            matched_vendor = matched.get("vendor_name") or ""
+            if not item.get("vendor") and matched_vendor not in (
+                "",
+                "Standard SNMP Device",
+                "Generic / Standard RFC",
+            ):
+                item["vendor"] = matched_vendor
 
     def _ip_sort_key(d: Dict[str, Any]):
         try:
@@ -2199,9 +2205,9 @@ async def get_device_detail(device_ip: str) -> Dict[str, Any]:
             snmp_sys_dict.get("sys_descr") or (host_dict or {}).get("vendor") or "",
             snmp_sys_dict.get("sys_name") or (host_dict or {}).get("hostname") or "",
         )
-        snmp_sys_dict["vendor_name"] = snmp_sys_dict.get("vendor_name") or matched["vendor"]
-        snmp_sys_dict["device_category"] = snmp_sys_dict.get("device_category") or matched["category"]
-        snmp_sys_dict["matched_mibs"] = matched["mibs"]
+        snmp_sys_dict["vendor_name"] = snmp_sys_dict.get("vendor_name") or matched.get("vendor_name")
+        snmp_sys_dict["device_category"] = snmp_sys_dict.get("device_category") or matched.get("category")
+        snmp_sys_dict["matched_mibs"] = matched.get("mibs") or []
 
     fallback_mib_match = match_device_vendor_profile(
         (snmp_sys_dict or {}).get("sys_object_id") or "",

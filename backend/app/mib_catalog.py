@@ -216,6 +216,7 @@ def match_device_vendor_profile(sys_object_id: str, sys_descr: str, sys_name: st
             if kw in combined_text:
                 return {
                     **entry,
+                    "vendor": entry["vendor_name"],
                     "pen": pen or (entry["pens"][0] if entry["pens"] else None),
                 }
 
@@ -225,6 +226,7 @@ def match_device_vendor_profile(sys_object_id: str, sys_descr: str, sys_name: st
             if pen in entry["pens"]:
                 return {
                     **entry,
+                    "vendor": entry["vendor_name"],
                     "pen": pen,
                 }
 
@@ -234,14 +236,17 @@ def match_device_vendor_profile(sys_object_id: str, sys_descr: str, sys_name: st
             if kw in combined_text:
                 return {
                     **entry,
+                    "vendor": entry["vendor_name"],
                     "pen": pen,
                 }
 
     # 4. Generic Standard SNMP Device
+    generic_vendor = f"Enterprise PEN #{pen}" if pen else "Standard SNMP Device"
     return {
         "key": "generic",
         "pen": pen,
-        "vendor_name": f"Enterprise PEN #{pen}" if pen else "Standard SNMP Device",
+        "vendor": generic_vendor,
+        "vendor_name": generic_vendor,
         "category": "Network Device",
         "mibs": ["SNMPv2-MIB", "IF-MIB", "ENTITY-MIB", "HOST-RESOURCES-MIB", "LLDP-MIB", "IP-MIB"],
     }

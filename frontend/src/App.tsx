@@ -308,7 +308,8 @@ interface DeviceDetailPayload {
     last_polled: string | null;
   } | null;
   matched_mib_profile?: {
-    vendor: string;
+    vendor_name?: string;
+    vendor?: string;
     category: string;
     mibs: string[];
   };
@@ -2154,8 +2155,8 @@ export const App: React.FC = () => {
     <div className="min-h-screen bg-[#090D16] text-slate-100">
       {/* Top Navigation Bar */}
       <header className="sticky top-0 z-30 border-b border-slate-800/90 bg-[#090D16]/95 backdrop-blur-md">
-        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4 px-4 py-3 sm:px-6">
-          <div className="flex items-center gap-3">
+        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-x-4 gap-y-2.5 px-4 py-3 sm:px-6 xl:flex-nowrap">
+          <div className="order-1 flex shrink-0 items-center gap-3">
             <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-emerald-500/30 bg-emerald-500/10 text-emerald-400">
               <Activity className="h-5 w-5" />
             </div>
@@ -2166,46 +2167,14 @@ export const App: React.FC = () => {
                   {updateInfo?.current_sha || "v1.2"}
                 </span>
               </div>
-              <p className="text-xs text-slate-400">
+              <p className="hidden text-xs text-slate-400 2xl:block">
                 Network Observability • Devices • SNMP • Nmap • Syslog
               </p>
             </div>
           </div>
 
-          {/* Primary View Switcher */}
-          <nav className="flex flex-wrap items-center gap-1 rounded-lg border border-slate-800 bg-[#111827] p-1">
-            {[
-              { id: "pulse", label: "Overview", icon: Activity },
-              { id: "devices", label: `Devices (${allDevices.length})`, icon: Monitor },
-              { id: "snmp", label: "SNMP Trends & Ports", icon: Server },
-              { id: "scanner", label: "Subnet Scanner Matrix", icon: Network },
-              { id: "syslog", label: "Live Syslog Stream", icon: Terminal },
-              { id: "targets", label: "Targets & SNMP", icon: KeyRound },
-            ].map((tab) => {
-              const Icon = tab.icon;
-              const active = activeTab === tab.id;
-              return (
-                <button
-                  key={tab.id}
-                  onClick={() => {
-                    if (tab.id === "devices") setSelectedDeviceDetailIp(null);
-                    setActiveTab(tab.id as TabKey);
-                  }}
-                  className={`flex items-center gap-2 rounded-md px-3 py-1.5 text-xs font-medium transition ${
-                    active
-                      ? "bg-slate-800 text-white shadow-xs"
-                      : "text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  <Icon className="h-3.5 w-3.5" />
-                  <span>{tab.label}</span>
-                </button>
-              );
-            })}
-          </nav>
-
-          {/* Right Status & Settings Controls */}
-          <div className="flex items-center gap-2.5">
+          {/* Right Status & Settings Controls (always locked to top-right corner) */}
+          <div className="order-2 flex shrink-0 items-center gap-2 xl:order-3">
             <button
               onClick={() => {
                 setActiveTab("settings");
@@ -2239,6 +2208,48 @@ export const App: React.FC = () => {
               </span>
             </div>
           </div>
+
+          {/* Primary View Switcher (Single-row clean horizontal rail that slides cleanly under brand at <xl) */}
+          <nav
+            aria-label="Primary Navigation"
+            className="order-3 w-full xl:order-2 xl:w-auto xl:min-w-0"
+          >
+            <div className="no-scrollbar flex flex-nowrap items-center gap-1 overflow-x-auto scroll-smooth rounded-lg border border-slate-800 bg-[#111827] p-1 md:justify-between xl:justify-center">
+              {[
+                { id: "pulse", label: "Overview", icon: Activity },
+                { id: "devices", label: `Devices (${allDevices.length})`, icon: Monitor },
+                { id: "snmp", label: "SNMP Trends & Ports", icon: Server },
+                { id: "scanner", label: "Subnet Scanner Matrix", icon: Network },
+                { id: "syslog", label: "Live Syslog Stream", icon: Terminal },
+                { id: "targets", label: "Targets & SNMP", icon: KeyRound },
+              ].map((tab) => {
+                const Icon = tab.icon;
+                const active = activeTab === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    onClick={(e) => {
+                      if (tab.id === "devices") setSelectedDeviceDetailIp(null);
+                      setActiveTab(tab.id as TabKey);
+                      e.currentTarget.scrollIntoView({
+                        behavior: "smooth",
+                        inline: "center",
+                        block: "nearest",
+                      });
+                    }}
+                    className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-medium transition-all duration-200 ease-out ${
+                      active
+                        ? "bg-slate-800 text-white shadow-xs ring-1 ring-slate-700/80"
+                        : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-200"
+                    }`}
+                  >
+                    <Icon className="h-3.5 w-3.5 shrink-0" />
+                    <span>{tab.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </nav>
         </div>
       </header>
 
@@ -3497,8 +3508,10 @@ export const App: React.FC = () => {
                                   Auto-Matched Vendor MIB Profile
                                 </span>
                                 <div className="text-sm font-semibold text-white">
-                                  {deviceDetail.matched_mib_profile.vendor} —{" "}
-                                  {deviceDetail.matched_mib_profile.category}
+                                  {deviceDetail.matched_mib_profile.vendor_name ||
+                                    deviceDetail.matched_mib_profile.vendor ||
+                                    "Standard SNMP Device"}{" "}
+                                  — {deviceDetail.matched_mib_profile.category}
                                 </div>
                               </div>
                             </div>
