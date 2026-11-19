@@ -45,6 +45,7 @@ REPO_MOUNT_DIR = Path(os.getenv("NETDASH_REPO_DIR", "/opt/netdash-repo"))
 _RAW_STATE_DIR = Path(os.getenv("NETDASH_STATE_DIR", "/var/lib/netdash-state"))
 STATE_DIR = _RAW_STATE_DIR if (_RAW_STATE_DIR.exists() or os.access(_RAW_STATE_DIR.parent, os.W_OK)) else (REPO_MOUNT_DIR / ".netdash-state")
 PROGRESS_FILE = STATE_DIR / "update-progress.json"
+LOCK_FILE = STATE_DIR / "updater.lock"
 API_START_TIME = datetime.now(timezone.utc)
 
 db_pool: Optional[asyncpg.Pool] = None
@@ -54,11 +55,14 @@ redis_client: Optional[aioredis.Redis] = None
 def _default_idle_progress() -> Dict[str, Any]:
     return {
         "status": "idle",
+        "update_id": "",
         "overall_pct": 0,
         "phase": "idle",
         "message": "No active update",
         "from_sha": "",
         "target_sha": "",
+        "from_version": "",
+        "target_version": "",
         "started_at": None,
         "updated_at": None,
         "components": [],
@@ -88,10 +92,94 @@ def _read_update_progress() -> Dict[str, Any]:
     return _default_idle_progress()
 
 
+def _extract_commit_bullets(subject: str, body: str = "") -> List[str]:
+    """Extracts clean per-commit bullet points from body or multi-clause subject."""
+    bullets: List[str] = []
+    for bline in (body or "").splitlines():
+        bclean = bline.strip()
+        if bclean.startswith(("- ", "* ", "• ")):
+            btext = bclean[2:].strip()
+            if btext and btext not in bullets:
+                bullets.append(btext)
+    if bullets:
+        return bullets
+
+    raw_clauses = [
+        c.strip().rstrip(".")
+        for c in (subject or "").replace(" and ", ", ").split(",")
+        if c.strip()
+    ]
+    for clause in raw_clauses:
+        formatted = clause[0].upper() + clause[1:] if clause else ""
+        if formatted and formatted not in bullets:
+            bullets.append(formatted)
+    if not bullets and subject.strip():
+        bullets.append(subject.strip())
+    return bullets
+
+
+async def _compute_git_version_map(ref: str = "origin/main") -> Dict[str, str]:
+    """Maps commit short SHAs to [Year.Month.Day.UpdateCount] version strings."""
+    if not (REPO_MOUNT_DIR / ".git").exists():
+        return {}
+
+    async def _git_lines(target_ref: str) -> List[str]:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "-C",
+                str(REPO_MOUNT_DIR),
+                "log",
+                "--first-parent",
+                "--reverse",
+                "--pretty=format:%h|%cs",
+                target_ref,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            return out.decode("utf-8", errors="ignore").splitlines()
+        except Exception:
+            return []
+
+    def _populate(lines: List[str], out_map: Dict[str, str]) -> None:
+        day_counts: Dict[str, int] = {}
+        for line in lines:
+            if "|" not in line:
+                continue
+            sha_s, ds = line.split("|", 1)
+            sha_s = sha_s.strip()
+            ds = ds.strip()
+            if not sha_s or len(ds) != 10:
+                continue
+            day_counts[ds] = day_counts.get(ds, 0) + 1
+            parts = ds.split("-")
+            if len(parts) == 3:
+                out_map[sha_s] = f"{parts[0]}.{parts[1]}.{parts[2]}.{day_counts[ds]}"
+
+    ver_map: Dict[str, str] = {}
+    head_lines = await _git_lines("HEAD")
+    _populate(head_lines, ver_map)
+    if ref and ref != "HEAD":
+        ref_lines = await _git_lines(ref)
+        if ref_lines:
+            _populate(ref_lines, ver_map)
+    return ver_map
+
+
 async def _reconcile_update_progress() -> Dict[str, Any]:
     data = _read_update_progress()
     if data.get("status") != "updating":
         return data
+
+    # Never reconcile while host updater lock is actively held
+    if LOCK_FILE.exists():
+        try:
+            lock_age = time.time() - LOCK_FILE.stat().st_mtime
+            if lock_age < 900:
+                return data
+        except Exception:
+            pass
 
     now = datetime.now(timezone.utc)
     updated_at_str = data.get("updated_at") or data.get("started_at")
@@ -111,7 +199,22 @@ async def _reconcile_update_progress() -> Dict[str, Any]:
 
     trigger_exists = (REPO_MOUNT_DIR / ".trigger-update").exists()
     target_sha = str(data.get("target_sha") or "").strip()
-    if not trigger_exists and target_sha and age_sec > 12 and (REPO_MOUNT_DIR / ".git").exists():
+    started_at_str = data.get("started_at")
+    started_dt: Optional[datetime] = None
+    if isinstance(started_at_str, str) and started_at_str:
+        try:
+            started_dt = datetime.fromisoformat(started_at_str.replace("Z", "+00:00"))
+        except Exception:
+            started_dt = None
+
+    # Only mark complete if trigger file is gone AND this API process actually started AFTER the update began
+    if (
+        not trigger_exists
+        and target_sha
+        and started_dt is not None
+        and API_START_TIME > started_dt
+        and (REPO_MOUNT_DIR / ".git").exists()
+    ):
         try:
             proc = await asyncio.create_subprocess_exec(
                 "git",
@@ -126,12 +229,13 @@ async def _reconcile_update_progress() -> Dict[str, Any]:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
             head_sha = out.decode("utf-8", errors="ignore").strip()
             if head_sha and head_sha == target_sha:
+                target_ver = str(data.get("target_version") or target_sha)
                 completed = {
                     **data,
                     "status": "completed",
                     "overall_pct": 100,
                     "phase": "completed",
-                    "message": f"Update to {target_sha} installed successfully!",
+                    "message": f"Update to {target_ver} installed successfully!",
                     "updated_at": now.isoformat(),
                     "components": [
                         {
@@ -139,7 +243,7 @@ async def _reconcile_update_progress() -> Dict[str, Any]:
                             "name": c.get("name", ""),
                             "status": "completed",
                             "pct": 100,
-                            "detail": f"Updated to {target_sha}",
+                            "detail": f"Updated to {target_ver}",
                         }
                         for c in (data.get("components") or [])
                     ],
@@ -266,8 +370,12 @@ async def _inspect_git_update(do_fetch: bool = False) -> Dict[str, Any]:
             "update_available": False,
             "current_sha": "local",
             "remote_sha": "local",
+            "current_version": "local",
+            "remote_version": "local",
             "commits_behind": 0,
             "commits": [],
+            "updates": [],
+            "summary_bullets": [],
             "status": "idle",
             "checked_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -318,59 +426,63 @@ async def _inspect_git_update(do_fetch: bool = False) -> Dict[str, Any]:
     behind_str = await _run_git("rev-list", "HEAD..origin/main", "--count")
     commits_behind = int(behind_str) if behind_str.isdigit() else 0
 
-    commits: List[Dict[str, str]] = []
+    ver_map = await _compute_git_version_map("origin/main")
+    current_version = ver_map.get(local_sha, local_sha)
+    remote_version = ver_map.get(remote_sha, remote_sha)
+
+    commits: List[Dict[str, Any]] = []
     summary_bullets: List[str] = []
     if commits_behind > 0:
         log_out = await _run_git(
             "log",
             "HEAD..origin/main",
             "-n",
-            "15",
-            "--pretty=format:%h|%s|%an|%ar",
+            "20",
+            "--pretty=format:%h%x1f%s%x1f%an%x1f%ar%x1f%cs%x1f%b%x1e",
         )
-        for line in log_out.splitlines():
-            parts = line.split("|", 3)
-            if len(parts) == 4:
-                sha_val, subj_val, auth_val, date_val = parts[0], parts[1].strip(), parts[2], parts[3]
+        for rec in log_out.split("\x1e"):
+            rec = rec.strip()
+            if not rec:
+                continue
+            parts = rec.split("\x1f", 5)
+            if len(parts) >= 5:
+                sha_val = parts[0].strip()
+                subj_val = parts[1].strip()
+                auth_val = parts[2].strip()
+                date_val = parts[3].strip()
+                commit_date_val = parts[4].strip()
+                body_val = parts[5].strip() if len(parts) > 5 else ""
+
+                per_bullets = _extract_commit_bullets(subj_val, body_val)
                 commits.append(
                     {
+                        "version": ver_map.get(sha_val, sha_val),
                         "sha": sha_val,
                         "subject": subj_val,
+                        "summary_bullets": per_bullets,
                         "author": auth_val,
                         "date": date_val,
+                        "commit_date": commit_date_val,
                     }
                 )
-                # Split multi-feature commit subjects into clean individual bullet points
-                raw_clauses = [
-                    c.strip().rstrip(".")
-                    for c in subj_val.replace(" and ", ", ").split(",")
-                    if c.strip()
-                ]
-                for clause in raw_clauses:
-                    formatted = clause[0].upper() + clause[1:] if clause else ""
-                    if formatted and formatted not in summary_bullets:
-                        summary_bullets.append(formatted)
-
-        # Also extract any explicit markdown bullet lines from commit bodies
-        body_out = await _run_git("log", "HEAD..origin/main", "-n", "15", "--pretty=format:%b")
-        for bline in body_out.splitlines():
-            bclean = bline.strip()
-            if bclean.startswith(("- ", "* ", "• ")):
-                btext = bclean[2:].strip()
-                if btext and btext not in summary_bullets:
-                    summary_bullets.append(btext)
+                for b in per_bullets:
+                    if b and b not in summary_bullets:
+                        summary_bullets.append(b)
 
     trigger_file = REPO_MOUNT_DIR / ".trigger-update"
     status_file = REPO_MOUNT_DIR / ".update-status.json"
-    is_updating = trigger_file.exists()
+    is_updating = trigger_file.exists() or LOCK_FILE.exists()
 
     payload = {
         "update_available": commits_behind > 0,
         "current_sha": local_sha,
         "remote_sha": remote_sha,
+        "current_version": current_version,
+        "remote_version": remote_version,
         "commits_behind": commits_behind,
         "commits": commits,
-        "summary_bullets": summary_bullets[:15],
+        "updates": commits,
+        "summary_bullets": summary_bullets[:25],
         "status": "updating" if is_updating else "idle",
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -409,15 +521,21 @@ async def install_update() -> Dict[str, Any]:
     git_state = await _inspect_git_update(do_fetch=False)
     from_sha = str(git_state.get("current_sha") or "unknown")
     target_sha = str(git_state.get("remote_sha") or from_sha)
-    now_iso = datetime.now(timezone.utc).isoformat()
+    from_version = str(git_state.get("current_version") or from_sha)
+    target_version = str(git_state.get("remote_version") or target_sha)
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
 
     initial_progress: Dict[str, Any] = {
         "status": "updating",
-        "overall_pct": 5,
+        "update_id": f"{int(now_dt.timestamp())}-{target_sha}",
+        "overall_pct": 1,
         "phase": "queued",
-        "message": f"Preparing update ({from_sha} -> {target_sha})...",
+        "message": f"Queued update ({from_version} -> {target_version})...",
         "from_sha": from_sha,
         "target_sha": target_sha,
+        "from_version": from_version,
+        "target_version": target_version,
         "started_at": now_iso,
         "updated_at": now_iso,
         "components": [
@@ -597,6 +715,7 @@ async def _run_git_info() -> Dict[str, Any]:
     if not (REPO_MOUNT_DIR / ".git").exists():
         return {
             "current_sha": "local",
+            "current_version": "local",
             "branch": "local",
             "last_commit_subject": "Running without .git metadata",
             "last_commit_date": None,
@@ -618,15 +737,18 @@ async def _run_git_info() -> Dict[str, Any]:
         except Exception:
             return ""
 
-    sha, branch, subj, dt_str, remote = await asyncio.gather(
+    sha, branch, subj, dt_str, remote, ver_map = await asyncio.gather(
         _run_git("rev-parse", "--short=7", "HEAD"),
         _run_git("rev-parse", "--abbrev-ref", "HEAD"),
         _run_git("log", "-1", "--pretty=format:%s"),
         _run_git("log", "-1", "--pretty=format:%cI"),
         _run_git("remote", "get-url", "origin"),
+        _compute_git_version_map("HEAD"),
     )
+    sha_clean = sha or "unknown"
     return {
-        "current_sha": sha or "unknown",
+        "current_sha": sha_clean,
+        "current_version": ver_map.get(sha_clean, sha_clean),
         "branch": branch or "main",
         "last_commit_subject": subj or "—",
         "last_commit_date": dt_str or None,

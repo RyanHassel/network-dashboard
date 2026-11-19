@@ -105,7 +105,7 @@
       }
       .bar-fill {
         height: 100%;
-        width: 10%;
+        width: 0%;
         border-radius: 999px;
         background: linear-gradient(90deg, #10b981, #38bdf8);
         transition: width 400ms ease-out;
@@ -225,6 +225,9 @@
             .replace(/>/g, "&gt;");
         }
 
+        var maxPctSeen = 0;
+        var lastUpdateId = "";
+
         function pollProgress() {
           fetch("/update-progress.json?t=" + Date.now(), { cache: "no-store" })
             .then(function (r) {
@@ -232,12 +235,22 @@
             })
             .then(function (data) {
               if (!data || data.status === "idle") return;
-              var pct = typeof data.overall_pct === "number" ? data.overall_pct : 15;
+              var updId = data.update_id || data.target_sha || "";
+              if (updId && updId !== lastUpdateId) {
+                lastUpdateId = updId;
+                maxPctSeen = 0;
+              }
+              var rawPct = typeof data.overall_pct === "number" ? data.overall_pct : 0;
+              if (data.status === "completed") rawPct = 100;
+              if (rawPct > maxPctSeen) maxPctSeen = rawPct;
+              var pct = maxPctSeen;
               overallPctEl.textContent = pct + "%";
-              overallBarEl.style.width = Math.max(5, Math.min(100, pct)) + "%";
+              overallBarEl.style.width = Math.max(0, Math.min(100, pct)) + "%";
               if (data.message) phaseMsgEl.textContent = data.message;
-              if (data.from_sha && data.target_sha) {
-                commitInfoEl.textContent = "Update: " + data.from_sha + " -> " + data.target_sha;
+              var fromVer = data.from_version || data.from_sha;
+              var targetVer = data.target_version || data.target_sha;
+              if (fromVer && targetVer) {
+                commitInfoEl.textContent = "Update: " + fromVer + " -> " + targetVer;
               }
               if (Array.isArray(data.components)) {
                 var html = "";
