@@ -456,6 +456,9 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 INSTALL_DIR="/opt/netdash"
+if [[ -f "${INSTALL_DIR}/scripts/run-update.sh" ]]; then
+  exec bash "${INSTALL_DIR}/scripts/run-update.sh" "$@"
+fi
 cd "${INSTALL_DIR}"
 rm -f "${INSTALL_DIR}/.trigger-update"
 [[ -d .git ]] || exit 0
@@ -972,6 +975,9 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 INSTALL_DIR="/opt/netdash"
+if [[ -f "${INSTALL_DIR}/scripts/run-update.sh" ]]; then
+  exec bash "${INSTALL_DIR}/scripts/run-update.sh" "$@"
+fi
 cd "${INSTALL_DIR}"
 rm -f "${INSTALL_DIR}/.trigger-update"
 [[ -d .git ]] || exit 0

@@ -22,3 +22,9 @@ frontend/dist/
 .idea/
 .vscode/
 *.swp
+
+# Runtime Update State
+.netdash-state/*.json
+.netdash-state/*.tmp
+.trigger-update
+.update-status.json

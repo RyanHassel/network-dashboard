@@ -10,9 +10,40 @@
       href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
       rel="stylesheet"
     />
+    <style>
+      @keyframes nd-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .nd-boot-loader {
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        background: #090d16;
+        color: #e2e8f0;
+        font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+      }
+      .nd-boot-wheel {
+        width: 34px;
+        height: 34px;
+        border: 3px solid rgba(16, 185, 129, 0.2);
+        border-top-color: #10b981;
+        border-radius: 50%;
+        animation: nd-spin 0.85s linear infinite;
+      }
+    </style>
   </head>
   <body class="bg-[#090D16] text-slate-100 antialiased selection:bg-emerald-500/30 selection:text-emerald-200">
-    <div id="root"></div>
+    <div id="root">
+      <div class="nd-boot-loader">
+        <div class="nd-boot-wheel" aria-hidden="true"></div>
+        <div style="font-size: 13px; font-weight: 500; color: #cbd5e1">Loading NetDash...</div>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

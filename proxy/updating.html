@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
+    <title>NetDash — Application is Updating</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        background: #090d16;
+        color: #f1f5f9;
+        font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      .card {
+        width: 100%;
+        max-width: 560px;
+        background: #111827;
+        border: 1px solid #1e293b;
+        border-radius: 14px;
+        padding: 28px;
+        box-shadow: 0 24px 50px rgba(0, 0, 0, 0.45);
+      }
+      .header {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+      }
+      .spinner-wrap {
+        width: 44px;
+        height: 44px;
+        border-radius: 10px;
+        border: 1px solid rgba(16, 185, 129, 0.35);
+        background: rgba(16, 185, 129, 0.1);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+      }
+      .spinner {
+        width: 22px;
+        height: 22px;
+        border: 2.5px solid rgba(16, 185, 129, 0.25);
+        border-top-color: #10b981;
+        border-radius: 50%;
+        animation: spin 0.9s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      h1 {
+        margin: 0;
+        font-size: 18px;
+        font-weight: 600;
+        color: #ffffff;
+      }
+      .subtitle {
+        margin: 4px 0 0 0;
+        font-size: 13px;
+        color: #94a3b8;
+        line-height: 1.45;
+      }
+      .progress-section {
+        margin-top: 22px;
+        padding: 14px 16px;
+        border-radius: 10px;
+        border: 1px solid #1e293b;
+        background: #090d16;
+      }
+      .progress-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 12px;
+        margin-bottom: 8px;
+      }
+      .phase-msg {
+        color: #cbd5e1;
+      }
+      .pct {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-variant-numeric: tabular-nums;
+        font-weight: 600;
+        color: #10b981;
+      }
+      .bar-track {
+        width: 100%;
+        height: 8px;
+        border-radius: 999px;
+        background: #1e293b;
+        overflow: hidden;
+      }
+      .bar-fill {
+        height: 100%;
+        width: 10%;
+        border-radius: 999px;
+        background: linear-gradient(90deg, #10b981, #38bdf8);
+        transition: width 400ms ease-out;
+      }
+      .components {
+        margin-top: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .comp-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 9px 12px;
+        border-radius: 8px;
+        border: 1px solid #1e293b;
+        background: #0b101b;
+        font-size: 12px;
+      }
+      .comp-name {
+        font-weight: 500;
+        color: #e2e8f0;
+      }
+      .comp-detail {
+        color: #94a3b8;
+        font-size: 11px;
+        margin-top: 2px;
+      }
+      .comp-right {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-shrink: 0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-variant-numeric: tabular-nums;
+      }
+      .badge {
+        border-radius: 4px;
+        padding: 2px 6px;
+        font-size: 10px;
+        text-transform: uppercase;
+        font-weight: 600;
+      }
+      .badge-pending {
+        background: #1e293b;
+        color: #94a3b8;
+      }
+      .badge-running {
+        background: rgba(56, 189, 248, 0.15);
+        color: #38bdf8;
+      }
+      .badge-completed {
+        background: rgba(16, 185, 129, 0.15);
+        color: #10b981;
+      }
+      .badge-error {
+        background: rgba(244, 63, 94, 0.15);
+        color: #f43f5e;
+      }
+      .footer {
+        margin-top: 16px;
+        font-size: 11px;
+        color: #64748b;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="header">
+        <div class="spinner-wrap" aria-hidden="true">
+          <div class="spinner"></div>
+        </div>
+        <div>
+          <h1>Application is Updating</h1>
+          <p class="subtitle">
+            Waiting for the NetDash web frontend to finish reloading. The dashboard will appear
+            automatically as soon as it is ready.
+          </p>
+        </div>
+      </div>
+
+      <div class="progress-section">
+        <div class="progress-top">
+          <span id="phase-msg" class="phase-msg">Rebuilding NetDash containers...</span>
+          <span id="overall-pct" class="pct">...</span>
+        </div>
+        <div class="bar-track">
+          <div id="overall-bar" class="bar-fill"></div>
+        </div>
+      </div>
+
+      <div id="components-list" class="components"></div>
+
+      <div class="footer">
+        <span id="commit-info">Edge proxy active (no downtime)</span>
+        <span>Checking frontend readiness...</span>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        var phaseMsgEl = document.getElementById("phase-msg");
+        var overallPctEl = document.getElementById("overall-pct");
+        var overallBarEl = document.getElementById("overall-bar");
+        var listEl = document.getElementById("components-list");
+        var commitInfoEl = document.getElementById("commit-info");
+
+        function escapeHtml(str) {
+          return String(str || "")
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;");
+        }
+
+        function pollProgress() {
+          fetch("/update-progress.json?t=" + Date.now(), { cache: "no-store" })
+            .then(function (r) {
+              return r.ok ? r.json() : null;
+            })
+            .then(function (data) {
+              if (!data || data.status === "idle") return;
+              var pct = typeof data.overall_pct === "number" ? data.overall_pct : 15;
+              overallPctEl.textContent = pct + "%";
+              overallBarEl.style.width = Math.max(5, Math.min(100, pct)) + "%";
+              if (data.message) phaseMsgEl.textContent = data.message;
+              if (data.from_sha && data.target_sha) {
+                commitInfoEl.textContent = "Update: " + data.from_sha + " -> " + data.target_sha;
+              }
+              if (Array.isArray(data.components)) {
+                var html = "";
+                for (var i = 0; i < data.components.length; i++) {
+                  var c = data.components[i];
+                  var st = c.status || "pending";
+                  var badgeCls =
+                    st === "completed"
+                      ? "badge-completed"
+                      : st === "running"
+                        ? "badge-running"
+                        : st === "error"
+                          ? "badge-error"
+                          : "badge-pending";
+                  html +=
+                    '<div class="comp-row">' +
+                    '<div><div class="comp-name">' +
+                    escapeHtml(c.name) +
+                    '</div><div class="comp-detail">' +
+                    escapeHtml(c.detail || "") +
+                    "</div></div>" +
+                    '<div class="comp-right"><span class="badge ' +
+                    badgeCls +
+                    '">' +
+                    escapeHtml(st) +
+                    "</span><span>" +
+                    (typeof c.pct === "number" ? c.pct : 0) +
+                    "%</span></div></div>";
+                }
+                listEl.innerHTML = html;
+              }
+            })
+            .catch(function () {});
+        }
+
+        function checkFrontendReady() {
+          fetch("/?t=" + Date.now(), { method: "HEAD", cache: "no-store" })
+            .then(function (res) {
+              if (res.ok && res.headers.get("X-NetDash-Frontend") === "1") {
+                window.location.reload();
+              }
+            })
+            .catch(function () {});
+        }
+
+        pollProgress();
+        setInterval(pollProgress, 1200);
+        setInterval(checkFrontendReady, 1500);
+      })();
+    </script>
+  </body>
+</html>

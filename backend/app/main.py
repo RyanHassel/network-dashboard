@@ -42,10 +42,114 @@ DATABASE_URL = os.getenv(
 )
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 REPO_MOUNT_DIR = Path(os.getenv("NETDASH_REPO_DIR", "/opt/netdash-repo"))
+_RAW_STATE_DIR = Path(os.getenv("NETDASH_STATE_DIR", "/var/lib/netdash-state"))
+STATE_DIR = _RAW_STATE_DIR if (_RAW_STATE_DIR.exists() or os.access(_RAW_STATE_DIR.parent, os.W_OK)) else (REPO_MOUNT_DIR / ".netdash-state")
+PROGRESS_FILE = STATE_DIR / "update-progress.json"
 API_START_TIME = datetime.now(timezone.utc)
 
 db_pool: Optional[asyncpg.Pool] = None
 redis_client: Optional[aioredis.Redis] = None
+
+
+def _default_idle_progress() -> Dict[str, Any]:
+    return {
+        "status": "idle",
+        "overall_pct": 0,
+        "phase": "idle",
+        "message": "No active update",
+        "from_sha": "",
+        "target_sha": "",
+        "started_at": None,
+        "updated_at": None,
+        "components": [],
+    }
+
+
+def _write_update_progress(payload: Dict[str, Any]) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(STATE_DIR, 0o755)
+        tmp = PROGRESS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, PROGRESS_FILE)
+    except Exception as exc:
+        logger.debug("Unable to write update progress: %s", exc)
+
+
+def _read_update_progress() -> Dict[str, Any]:
+    try:
+        if PROGRESS_FILE.exists():
+            data = json.loads(PROGRESS_FILE.read_text(encoding="utf-8", errors="ignore"))
+            if isinstance(data, dict) and data.get("status"):
+                return data
+    except Exception:
+        pass
+    return _default_idle_progress()
+
+
+async def _reconcile_update_progress() -> Dict[str, Any]:
+    data = _read_update_progress()
+    if data.get("status") != "updating":
+        return data
+
+    now = datetime.now(timezone.utc)
+    updated_at_str = data.get("updated_at") or data.get("started_at")
+    age_sec = 0.0
+    if isinstance(updated_at_str, str) and updated_at_str:
+        try:
+            dt = datetime.fromisoformat(updated_at_str.replace("Z", "+00:00"))
+            age_sec = max(0.0, (now - dt).total_seconds())
+        except Exception:
+            age_sec = 0.0
+
+    # Clear stale locks older than 15 minutes
+    if age_sec > 900:
+        idle = _default_idle_progress()
+        _write_update_progress(idle)
+        return idle
+
+    trigger_exists = (REPO_MOUNT_DIR / ".trigger-update").exists()
+    target_sha = str(data.get("target_sha") or "").strip()
+    if not trigger_exists and target_sha and age_sec > 12 and (REPO_MOUNT_DIR / ".git").exists():
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "-C",
+                str(REPO_MOUNT_DIR),
+                "rev-parse",
+                "--short=7",
+                "HEAD",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
+            head_sha = out.decode("utf-8", errors="ignore").strip()
+            if head_sha and head_sha == target_sha:
+                completed = {
+                    **data,
+                    "status": "completed",
+                    "overall_pct": 100,
+                    "phase": "completed",
+                    "message": f"Update to {target_sha} installed successfully!",
+                    "updated_at": now.isoformat(),
+                    "components": [
+                        {
+                            "id": c.get("id", ""),
+                            "name": c.get("name", ""),
+                            "status": "completed",
+                            "pct": 100,
+                            "detail": f"Updated to {target_sha}",
+                        }
+                        for c in (data.get("components") or [])
+                    ],
+                }
+                _write_update_progress(completed)
+                return completed
+        except Exception:
+            pass
+
+    return data
 
 
 def _pkg_version(name: str, default: str = "unknown") -> str:
@@ -118,6 +222,7 @@ async def lifespan(app: FastAPI):
     if db_pool is not None:
         await ensure_dynamic_config_tables(db_pool)
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    await _reconcile_update_progress()
     yield
     if redis_client:
         await redis_client.aclose()
@@ -300,12 +405,80 @@ async def check_for_updates() -> Dict[str, Any]:
 async def install_update() -> Dict[str, Any]:
     if not REPO_MOUNT_DIR.exists():
         raise HTTPException(status_code=400, detail="Repository mount /opt/netdash-repo not available.")
+
+    git_state = await _inspect_git_update(do_fetch=False)
+    from_sha = str(git_state.get("current_sha") or "unknown")
+    target_sha = str(git_state.get("remote_sha") or from_sha)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    initial_progress: Dict[str, Any] = {
+        "status": "updating",
+        "overall_pct": 5,
+        "phase": "queued",
+        "message": f"Preparing update ({from_sha} -> {target_sha})...",
+        "from_sha": from_sha,
+        "target_sha": target_sha,
+        "started_at": now_iso,
+        "updated_at": now_iso,
+        "components": [
+            {
+                "id": "git",
+                "name": "Source Code (GitHub)",
+                "status": "running",
+                "pct": 10,
+                "detail": "Queued host updater...",
+            },
+            {
+                "id": "frontend",
+                "name": "Web Frontend (React + Nginx)",
+                "status": "pending",
+                "pct": 0,
+                "detail": "Waiting for source update...",
+            },
+            {
+                "id": "api",
+                "name": "Backend API (FastAPI)",
+                "status": "pending",
+                "pct": 0,
+                "detail": "Waiting for frontend...",
+            },
+            {
+                "id": "worker",
+                "name": "Telemetry Worker (SNMP / Nmap)",
+                "status": "pending",
+                "pct": 0,
+                "detail": "Waiting for backend build...",
+            },
+            {
+                "id": "services",
+                "name": "Core Services & Health Check",
+                "status": "pending",
+                "pct": 0,
+                "detail": "Waiting for services...",
+            },
+        ],
+    }
+    _write_update_progress(initial_progress)
+
     trigger_file = REPO_MOUNT_DIR / ".trigger-update"
-    trigger_file.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+    trigger_file.write_text(now_iso, encoding="utf-8")
     return {
         "status": "updating",
-        "message": "Update installation triggered on host. Containers will rebuild and restart shortly.",
+        "progress": initial_progress,
+        "message": "Update installation triggered on host.",
     }
+
+
+@app.get("/api/system/update/progress")
+async def get_update_progress() -> Dict[str, Any]:
+    return await _reconcile_update_progress()
+
+
+@app.post("/api/system/update/dismiss")
+async def dismiss_update_progress() -> Dict[str, Any]:
+    idle = _default_idle_progress()
+    _write_update_progress(idle)
+    return idle
 
 
 def _format_bytes_human(num: Optional[int]) -> str:
@@ -754,13 +927,36 @@ async def get_system_info() -> Dict[str, Any]:
                 "detail": "Frontend HTTP check unreachable on internal network",
             }
 
-    git_info, ts_svc, redis_svc, worker_svc, vector_svc, frontend_svc = await asyncio.gather(
-        _run_git_info(),
-        _probe_timescaledb(),
-        _probe_redis(),
-        _probe_worker(),
-        _probe_vector(),
-        _probe_frontend(),
+    async def _probe_proxy() -> Optional[Dict[str, Any]]:
+        try:
+            t0 = time.perf_counter()
+            async with httpx.AsyncClient(timeout=1.5) as client:
+                resp = await client.head("http://proxy:80/_updating.html")
+            latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+            nginx_hdr = resp.headers.get("server", "nginx/1.27")
+            return {
+                "id": "proxy",
+                "name": "Web Edge Proxy",
+                "container": "netdash-proxy",
+                "status": "running" if resp.status_code < 500 else "degraded",
+                "version": nginx_hdr,
+                "uptime_sec": None,
+                "latency_ms": latency_ms,
+                "detail": f"Always-on entrypoint & updating fallback on :{web_port}",
+            }
+        except Exception:
+            return None
+
+    git_info, ts_svc, redis_svc, worker_svc, vector_svc, frontend_svc, proxy_svc = (
+        await asyncio.gather(
+            _run_git_info(),
+            _probe_timescaledb(),
+            _probe_redis(),
+            _probe_worker(),
+            _probe_vector(),
+            _probe_frontend(),
+            _probe_proxy(),
+        )
     )
 
     api_svc: Dict[str, Any] = {
@@ -780,6 +976,8 @@ async def get_system_info() -> Dict[str, Any]:
 
     db_size_bytes = ts_svc.pop("db_size_bytes", None)
     services = [api_svc, worker_svc, ts_svc, redis_svc, vector_svc, frontend_svc]
+    if proxy_svc is not None:
+        services.append(proxy_svc)
 
     return {
         "server": {

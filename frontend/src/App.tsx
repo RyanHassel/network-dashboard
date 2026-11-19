@@ -31,6 +31,26 @@ import {
 
 type TabKey = "pulse" | "devices" | "snmp" | "scanner" | "syslog" | "targets" | "settings";
 
+interface UpdateProgressComponent {
+  id: string;
+  name: string;
+  status: "pending" | "running" | "completed" | "error" | string;
+  pct: number;
+  detail: string;
+}
+
+interface UpdateProgressState {
+  status: "idle" | "updating" | "completed" | "error";
+  overall_pct: number;
+  phase: string;
+  message: string;
+  from_sha?: string;
+  target_sha?: string;
+  started_at?: string;
+  updated_at?: string;
+  components: UpdateProgressComponent[];
+}
+
 interface BackgroundSubService {
   key: string;
   name: string;
@@ -1004,12 +1024,15 @@ export const App: React.FC = () => {
     text: string;
   } | null>(null);
 
-  // Update Notification & Manual Install Prompt State
+  // Update Notification, Staged Install Progress & Manual Install Prompt State
   const [updateInfo, setUpdateInfo] = useState<SystemUpdateStatus | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgressState | null>(null);
+  const [updateMinimized, setUpdateMinimized] = useState(false);
   const [promptDismissedSha, setPromptDismissedSha] = useState<string | null>(null);
   const updateDialogRef = useRef<HTMLDialogElement | null>(null);
+  const updateStartTimeRef = useRef<number>(0);
 
   // Server Information & Background Service Health State
   const [serverInfo, setServerInfo] = useState<ServerSystemInfo | null>(null);
@@ -1592,29 +1615,118 @@ export const App: React.FC = () => {
     }
   };
 
+  const fetchUpdateProgress = async (): Promise<UpdateProgressState | null> => {
+    try {
+      const r = await fetch(`/update-progress.json?t=${Date.now()}`, { cache: "no-store" });
+      if (r.ok) {
+        const d: UpdateProgressState = await r.json();
+        if (d && d.status) {
+          if (d.status === "updating" && d.updated_at) {
+            const ageMs = Date.now() - new Date(d.updated_at).getTime();
+            if (!Number.isNaN(ageMs) && ageMs > 15 * 60 * 1000) {
+              return { ...d, status: "idle", overall_pct: 0 };
+            }
+          }
+          return d;
+        }
+      }
+    } catch {
+      // fall through to API fallback
+    }
+    try {
+      const r2 = await fetch("/api/system/update/progress", { cache: "no-store" });
+      if (r2.ok) {
+        const d2: UpdateProgressState = await r2.json();
+        if (d2 && d2.status) return d2;
+      }
+    } catch {
+      // ignore while API is restarting
+    }
+    return null;
+  };
+
+  const handleDismissUpdateProgress = async () => {
+    setInstallingUpdate(false);
+    setUpdateProgress(null);
+    setUpdateMinimized(false);
+    try {
+      await fetch("/api/system/update/dismiss", { method: "POST" });
+    } catch {
+      // ignore
+    }
+  };
+
   const handleInstallUpdate = async () => {
+    const dlg = updateDialogRef.current;
+    if (dlg && dlg.open) dlg.close();
+    const fromSha = updateInfo?.current_sha || serverInfo?.server?.git?.current_sha || "current";
+    const targetSha = updateInfo?.remote_sha || "latest";
+    updateStartTimeRef.current = Date.now();
+    try {
+      sessionStorage.setItem("netdash_update_target", targetSha);
+      sessionStorage.removeItem("netdash_fe_reloaded_sha");
+    } catch {
+      // ignore
+    }
+
+    setUpdateMinimized(false);
     setInstallingUpdate(true);
+    setUpdateProgress({
+      status: "updating",
+      overall_pct: 5,
+      phase: "queued",
+      message: `Preparing update (${fromSha} → ${targetSha})...`,
+      from_sha: fromSha,
+      target_sha: targetSha,
+      components: [
+        {
+          id: "git",
+          name: "Source Code (GitHub)",
+          status: "running",
+          pct: 10,
+          detail: "Queuing update on host...",
+        },
+        {
+          id: "frontend",
+          name: "Web Frontend (React + Nginx)",
+          status: "pending",
+          pct: 0,
+          detail: "Waiting for source update...",
+        },
+        {
+          id: "api",
+          name: "Backend API (FastAPI)",
+          status: "pending",
+          pct: 0,
+          detail: "Waiting for frontend...",
+        },
+        {
+          id: "worker",
+          name: "Telemetry Worker (SNMP / Nmap)",
+          status: "pending",
+          pct: 0,
+          detail: "Waiting for backend build...",
+        },
+        {
+          id: "services",
+          name: "Core Services & Health Check",
+          status: "pending",
+          pct: 0,
+          detail: "Waiting for services...",
+        },
+      ],
+    });
+
     try {
       const resp = await fetch("/api/system/update/install", { method: "POST" });
       if (resp.ok) {
-        const targetSha = updateInfo?.remote_sha;
-        const pollTimer = setInterval(async () => {
-          try {
-            const r = await fetch("/api/system/update");
-            if (r.ok) {
-              const d: SystemUpdateStatus = await r.json();
-              if (!d.update_available || (targetSha && d.current_sha === targetSha)) {
-                clearInterval(pollTimer);
-                window.location.reload();
-              }
-            }
-          } catch {
-            // restarting
-          }
-        }, 4000);
+        const body = await resp.json().catch(() => null);
+        if (body?.progress) {
+          setUpdateProgress(body.progress);
+        }
       }
     } catch {
-      setInstallingUpdate(false);
+      // Even if POST response drops during swap, progress poller watches /update-progress.json
     }
   };
 
@@ -1771,6 +1883,191 @@ export const App: React.FC = () => {
   }, [selectedDeviceDetailIp, detailIfIndex, detailTrendRange]);
 
   useEffect(() => {
+    fetchUpdateProgress().then((p) => {
+      if (!p) return;
+      if (p.status === "updating") {
+        setUpdateProgress(p);
+        setInstallingUpdate(true);
+        try {
+          if (sessionStorage.getItem("netdash_update_minimized") === "1") {
+            setUpdateMinimized(true);
+          }
+        } catch {
+          // ignore
+        }
+      } else if (p.status === "completed") {
+        const ageMs = p.updated_at ? Date.now() - new Date(p.updated_at).getTime() : 999999;
+        if (Number.isNaN(ageMs) || ageMs > 20000) {
+          fetch("/api/system/update/dismiss", { method: "POST" }).catch(() => {});
+        } else {
+          setUpdateProgress(p);
+        }
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    const activeUpdating = installingUpdate || updateProgress?.status === "updating";
+    if (!activeUpdating) return;
+
+    let cancelled = false;
+    const startedAt = updateStartTimeRef.current || Date.now();
+
+    const finishSuccess = async (completedState: UpdateProgressState) => {
+      if (cancelled) return;
+      setUpdateProgress(completedState);
+
+      const targetSha =
+        completedState.target_sha ||
+        (() => {
+          try {
+            return sessionStorage.getItem("netdash_update_target") || "";
+          } catch {
+            return "";
+          }
+        })();
+
+      let feReady = false;
+      let apiReady = false;
+      try {
+        const [feResp, apiResp] = await Promise.all([
+          fetch(`/?t=${Date.now()}`, { method: "HEAD", cache: "no-store" }),
+          fetch(`/api/health?t=${Date.now()}`, { cache: "no-store" }),
+        ]);
+        feReady = feResp.ok && feResp.headers.get("X-NetDash-Updating-Page") !== "1";
+        apiReady = apiResp.ok;
+      } catch {
+        // still warming
+      }
+
+      if (!feReady || !apiReady) return;
+
+      let alreadyReloaded = false;
+      try {
+        alreadyReloaded =
+          Boolean(targetSha) &&
+          targetSha !== "latest" &&
+          sessionStorage.getItem("netdash_fe_reloaded_sha") === targetSha;
+      } catch {
+        alreadyReloaded = true;
+      }
+
+      if (targetSha && targetSha !== "latest" && !alreadyReloaded) {
+        try {
+          sessionStorage.setItem("netdash_fe_reloaded_sha", targetSha);
+        } catch {
+          // ignore
+        }
+        window.location.reload();
+        return;
+      }
+
+      fetchUpdateStatus(false);
+      fetchServerInfo(false);
+      fetchOverview();
+      fetchAllDevices();
+      fetchConfig();
+      fetchInterfaces();
+      fetchScanner();
+
+      setTimeout(() => {
+        if (cancelled) return;
+        handleDismissUpdateProgress();
+      }, 2200);
+    };
+
+    const tick = async () => {
+      if (cancelled) return;
+      const p = await fetchUpdateProgress();
+      if (cancelled) return;
+
+      if (p && p.status === "updating") {
+        const elapsedSec = Math.max(0, (Date.now() - startedAt) / 1000);
+        // Check if frontend finished early so we can load the new UI immediately while backend finishes
+        const feComp = p.components?.find((c) => c.id === "frontend");
+        const targetSha = p.target_sha || "";
+        if (feComp?.status === "completed" && targetSha && targetSha !== "unknown") {
+          let alreadyReloaded = false;
+          try {
+            alreadyReloaded = sessionStorage.getItem("netdash_fe_reloaded_sha") === targetSha;
+          } catch {
+            alreadyReloaded = true;
+          }
+          if (!alreadyReloaded) {
+            try {
+              const feHead = await fetch(`/?t=${Date.now()}`, { method: "HEAD", cache: "no-store" });
+              if (feHead.ok && feHead.headers.get("X-NetDash-Frontend") === "1") {
+                sessionStorage.setItem("netdash_fe_reloaded_sha", targetSha);
+                window.location.reload();
+                return;
+              }
+            } catch {
+              // continue showing progress
+            }
+          }
+        }
+
+        // Transition fallback if existing VM runs old updater without granular progress writes
+        if (p.overall_pct <= 5 && elapsedSec > 6) {
+          try {
+            const updResp = await fetch(`/api/system/update?t=${Date.now()}`, {
+              cache: "no-store",
+            });
+            if (updResp.ok) {
+              const d: SystemUpdateStatus = await updResp.json();
+              if (!d.update_available || (targetSha && d.current_sha === targetSha)) {
+                await finishSuccess({
+                  ...p,
+                  status: "completed",
+                  overall_pct: 100,
+                  phase: "completed",
+                  message: `Update to ${d.current_sha} installed successfully!`,
+                  components: (p.components || []).map((c) => ({
+                    ...c,
+                    status: "completed",
+                    pct: 100,
+                    detail: "Completed",
+                  })),
+                });
+                return;
+              }
+            }
+          } catch {
+            // ignore while containers restart
+          }
+          const estPct = Math.min(85, Math.round(8 + elapsedSec * 1.3));
+          setUpdateProgress({
+            ...p,
+            overall_pct: Math.max(p.overall_pct, estPct),
+            message: p.message || "Downloading & rebuilding NetDash containers...",
+          });
+          return;
+        }
+
+        setUpdateProgress(p);
+        return;
+      }
+
+      if (p && p.status === "completed") {
+        await finishSuccess(p);
+        return;
+      }
+
+      if (p && p.status === "error") {
+        setUpdateProgress(p);
+        setInstallingUpdate(false);
+      }
+    };
+
+    tick();
+    const timer = setInterval(tick, 1200);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [installingUpdate, updateProgress?.status]);
+
+  useEffect(() => {
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
     const wsUrl = `${proto}://${window.location.host}/ws/live`;
     let ws: WebSocket | null = null;
@@ -1813,6 +2110,24 @@ export const App: React.FC = () => {
       if (ws) ws.close();
     };
   }, []);
+
+  const isUpdateActive = Boolean(
+    installingUpdate ||
+      (updateProgress &&
+        (updateProgress.status === "updating" ||
+          updateProgress.status === "completed" ||
+          updateProgress.status === "error")),
+  );
+  const showFullUpdatePage = isUpdateActive && !updateMinimized;
+
+  const setMinimizedPreference = (val: boolean) => {
+    setUpdateMinimized(val);
+    try {
+      sessionStorage.setItem("netdash_update_minimized", val ? "1" : "0");
+    } catch {
+      // ignore
+    }
+  };
 
   const gw = overview?.gateway;
   const filteredHosts = selectedSubnet
@@ -2233,9 +2548,195 @@ export const App: React.FC = () => {
         </div>
       </dialog>
 
+      {/* Persistent Live Update Banner when viewing Dashboard during Background Service Updates */}
+      {isUpdateActive && updateMinimized && (
+        <div className="border-b border-sky-500/30 bg-[#0D1424]">
+          <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-2.5 sm:px-6">
+            <div className="flex min-w-0 flex-1 items-center gap-3">
+              {updateProgress?.status === "completed" ? (
+                <Check className="h-4 w-4 shrink-0 text-emerald-400" />
+              ) : (
+                <RefreshCw className="h-4 w-4 shrink-0 animate-spin text-sky-400" />
+              )}
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center justify-between gap-3 text-xs">
+                  <span className="truncate font-medium text-slate-200">
+                    {updateProgress?.message || "Application is updating in the background..."}
+                  </span>
+                  <span className="shrink-0 font-mono-tabular font-semibold text-emerald-400">
+                    {updateProgress?.overall_pct ?? 5}%
+                  </span>
+                </div>
+                <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+                  <div
+                    style={{
+                      width: `${Math.max(5, Math.min(100, updateProgress?.overall_pct ?? 5))}%`,
+                    }}
+                    className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-sky-400 transition-[width] duration-500 ease-out"
+                  />
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setMinimizedPreference(false)}
+                className="rounded-md border border-slate-700 bg-slate-800 px-2.5 py-1 text-xs font-medium text-slate-200 hover:bg-slate-700"
+              >
+                View Full Progress
+              </button>
+              {updateProgress?.status !== "updating" && (
+                <button
+                  onClick={handleDismissUpdateProgress}
+                  className="rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-white"
+                  title="Dismiss"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Main Content Container */}
       <main className="mx-auto max-w-7xl space-y-6 px-4 py-6 sm:px-6">
-        {/* ==================== VIEW 1: PULSE OVERVIEW ==================== */}
+        {showFullUpdatePage ? (
+          <div className="mx-auto max-w-3xl space-y-6 py-6">
+            <div className="rounded-xl border border-slate-800 bg-[#111827] p-6 shadow-2xl">
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div className="flex items-center gap-3.5">
+                  <div
+                    className={`flex h-11 w-11 items-center justify-center rounded-xl border ${
+                      updateProgress?.status === "error"
+                        ? "border-rose-500/40 bg-rose-500/10 text-rose-400"
+                        : updateProgress?.status === "completed"
+                          ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
+                          : "border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
+                    }`}
+                  >
+                    {updateProgress?.status === "completed" ? (
+                      <Check className="h-5 w-5" />
+                    ) : updateProgress?.status === "error" ? (
+                      <X className="h-5 w-5" />
+                    ) : (
+                      <RefreshCw className="h-5 w-5 animate-spin" />
+                    )}
+                  </div>
+                  <div>
+                    <h2 className="text-base font-semibold text-white">
+                      {updateProgress?.status === "completed"
+                        ? "Update Complete"
+                        : updateProgress?.status === "error"
+                          ? "Update Encountered an Error"
+                          : "Application is Updating"}
+                    </h2>
+                    <p className="mt-0.5 text-xs text-slate-400">
+                      {updateProgress?.from_sha && updateProgress?.target_sha
+                        ? `Installing update ${updateProgress.from_sha} → ${updateProgress.target_sha}. You can continue browsing the frontend while backend services reload.`
+                        : "Installing NetDash update and verifying container health."}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  {updateProgress?.status !== "error" && (
+                    <button
+                      onClick={() => setMinimizedPreference(true)}
+                      className="rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800"
+                    >
+                      Show Dashboard While Updating
+                    </button>
+                  )}
+                  {(updateProgress?.status === "completed" ||
+                    updateProgress?.status === "error") && (
+                    <button
+                      onClick={handleDismissUpdateProgress}
+                      className="rounded-md bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
+                    >
+                      Return to Dashboard
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Overall Install Progress Bar */}
+              <div className="mt-6 rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                <div className="mb-2 flex items-center justify-between text-xs">
+                  <span className="font-medium text-slate-200">
+                    {updateProgress?.message || "Preparing update..."}
+                  </span>
+                  <span className="font-mono-tabular text-sm font-semibold text-emerald-400">
+                    {updateProgress?.overall_pct ?? 5}%
+                  </span>
+                </div>
+                <div className="h-2.5 w-full overflow-hidden rounded-full bg-slate-800">
+                  <div
+                    style={{
+                      width: `${Math.max(5, Math.min(100, updateProgress?.overall_pct ?? 5))}%`,
+                    }}
+                    className={`h-full rounded-full transition-[width] duration-500 ease-out ${
+                      updateProgress?.status === "error"
+                        ? "bg-rose-500"
+                        : "bg-gradient-to-r from-emerald-500 to-sky-400"
+                    }`}
+                  />
+                </div>
+              </div>
+
+              {/* Per-Component Progress Breakdown */}
+              <div className="mt-5 space-y-2.5">
+                <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                  System Component Progress
+                </p>
+                {(updateProgress?.components || []).map((comp) => {
+                  const badgeCls =
+                    comp.status === "completed"
+                      ? "bg-emerald-500/15 text-emerald-400"
+                      : comp.status === "running"
+                        ? "bg-sky-500/15 text-sky-300"
+                        : comp.status === "error"
+                          ? "bg-rose-500/15 text-rose-400"
+                          : "bg-slate-800 text-slate-400";
+                  const barCls =
+                    comp.status === "completed"
+                      ? "bg-emerald-500"
+                      : comp.status === "error"
+                        ? "bg-rose-500"
+                        : "bg-sky-400";
+                  return (
+                    <div
+                      key={comp.id}
+                      className="rounded-lg border border-slate-800 bg-[#090D16] p-3 text-xs"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className="font-semibold text-white">{comp.name}</span>
+                          <span
+                            className={`rounded px-1.5 py-0.5 font-mono-tabular text-[10px] uppercase ${badgeCls}`}
+                          >
+                            {comp.status === "running" ? "updating" : comp.status}
+                          </span>
+                        </div>
+                        <span className="font-mono-tabular font-semibold text-slate-200">
+                          {comp.pct}%
+                        </span>
+                      </div>
+                      <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+                        <div
+                          style={{ width: `${Math.max(0, Math.min(100, comp.pct))}%` }}
+                          className={`h-full rounded-full transition-[width] duration-400 ease-out ${barCls}`}
+                        />
+                      </div>
+                      <div className="mt-1.5 text-[11px] text-slate-400">{comp.detail || "—"}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <>
+        {/* ==================== VIEW 1: OVERVIEW ==================== */}
         {activeTab === "pulse" && (
           <>
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -4958,6 +5459,8 @@ export const App: React.FC = () => {
               )}
             </div>
           </div>
+        )}
+          </>
         )}
       </main>
     </div>
