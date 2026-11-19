@@ -1353,7 +1353,7 @@ export const App: React.FC = () => {
                         );
                       })
                     )}
-                  </body>
+                  </tbody>
                 </table>
               </div>
             </div>
