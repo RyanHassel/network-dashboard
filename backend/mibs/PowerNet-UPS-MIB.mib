@@ -1,0 +1,57 @@
+PowerNet-UPS-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, Gauge32, Integer32, TimeTicks, enterprises
+        FROM SNMPv2-SMI
+    DisplayString
+        FROM SNMPv2-TC;
+
+apc MODULE-IDENTITY
+    LAST-UPDATED "202201010000Z"
+    ORGANIZATION "American Power Conversion Corp. (Schneider Electric)"
+    CONTACT-INFO "support@apc.com"
+    DESCRIPTION  "APC Smart-UPS & PDU Battery, Load, and Input/Output Voltage MIB."
+    ::= { enterprises 318 }
+
+upsBasicIdentModel OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "APC UPS Model Name"
+    ::= { apc 1 1 1 1 1 1 }
+
+upsAdvBatteryCapacity OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Remaining UPS Battery Capacity (%)"
+    ::= { apc 1 1 1 2 2 1 }
+
+upsAdvBatteryTemperature OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "UPS Internal Battery Temperature (Celsius)"
+    ::= { apc 1 1 1 2 2 2 }
+
+upsAdvBatteryRunTimeRemaining OBJECT-TYPE
+    SYNTAX      TimeTicks
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "UPS Remaining Battery Runtime"
+    ::= { apc 1 1 1 2 2 3 }
+
+upsAdvInputLineVoltage OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "UPS Input Utility Line Voltage (VAC)"
+    ::= { apc 1 1 1 3 2 1 }
+
+upsAdvOutputLoad OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "UPS Output Load (% of rated capacity)"
+    ::= { apc 1 1 1 4 2 3 }
+
+END

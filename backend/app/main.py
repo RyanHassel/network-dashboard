@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.db_schema import ensure_dynamic_config_tables
+from app.mib_catalog import MIBS_DIR, VENDOR_CATALOG, list_backend_mibs, parse_mib_text
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,6 +77,11 @@ class OnboardingPayload(BaseModel):
     snmp_profiles: List[SNMPProfilePayload] = []
     snmp_targets: List[SNMPTargetPayload] = []
     unifi_controllers: List[UniFiControllerPayload] = []
+
+
+class CustomMIBUploadPayload(BaseModel):
+    filename: str
+    content: str
 
 
 @asynccontextmanager
@@ -1047,9 +1053,10 @@ async def get_all_devices() -> Dict[str, Any]:
 
         snmp_dev_rows = await conn.fetch(
             """
-            SELECT device_ip, sys_name, sys_descr, sys_object_id, sys_location,
-                   sys_uptime_ticks, cpu_usage_pct, mem_usage_pct, interface_count,
-                   is_reachable, last_poll_duration_ms, last_polled
+            SELECT device_ip, sys_name, sys_descr, sys_object_id, sys_location, sys_contact,
+                   sys_uptime_ticks, cpu_usage_pct, mem_usage_pct, temp_celsius, interface_count,
+                   vendor_name, device_category, matched_mibs, hardware_model, serial_number,
+                   firmware_version, is_reachable, last_poll_duration_ms, last_polled
             FROM snmp_devices
             """
         )
@@ -1144,6 +1151,12 @@ async def get_all_devices() -> Dict[str, Any]:
         item["snmp_reachable"] = bool(r["is_reachable"])
         if r["is_reachable"]:
             item["is_online"] = True
+        if r["vendor_name"] and not item["vendor"]:
+            item["vendor"] = (
+                f"{r['vendor_name']} ({r['hardware_model']})"
+                if r.get("hardware_model")
+                else r["vendor_name"]
+            )
         item["sys_descr"] = r["sys_descr"]
         item["sys_location"] = r["sys_location"]
         item["cpu_usage_pct"] = float(r["cpu_usage_pct"] or 0.0)
@@ -1228,9 +1241,10 @@ async def get_device_detail(device_ip: str) -> Dict[str, Any]:
 
         snmp_sys_row = await conn.fetchrow(
             """
-            SELECT device_ip, sys_name, sys_descr, sys_object_id, sys_location,
-                   sys_uptime_ticks, cpu_usage_pct, mem_usage_pct, interface_count,
-                   is_reachable, last_poll_duration_ms, last_polled
+            SELECT device_ip, sys_name, sys_descr, sys_object_id, sys_location, sys_contact,
+                   sys_uptime_ticks, cpu_usage_pct, mem_usage_pct, temp_celsius, interface_count,
+                   vendor_name, device_category, matched_mibs, hardware_model, serial_number,
+                   firmware_version, extended_metrics, is_reachable, last_poll_duration_ms, last_polled
             FROM snmp_devices
             WHERE device_ip = $1
             """,
@@ -1291,11 +1305,12 @@ async def get_device_detail(device_ip: str) -> Dict[str, Any]:
         for k, v in list(d.items()):
             if hasattr(v, "isoformat"):
                 d[k] = v.isoformat()
-        if isinstance(d.get("port_table"), str):
-            try:
-                d["port_table"] = json.loads(d["port_table"])
-            except Exception:
-                d["port_table"] = []
+        for json_col in ("port_table", "matched_mibs", "extended_metrics"):
+            if isinstance(d.get(json_col), str):
+                try:
+                    d[json_col] = json.loads(d[json_col])
+                except Exception:
+                    d[json_col] = [] if json_col != "extended_metrics" else {}
         return d
 
     return {
@@ -1314,6 +1329,59 @@ async def get_device_detail(device_ip: str) -> Dict[str, Any]:
 async def trigger_device_poll(device_ip: str) -> Dict[str, str]:
     await _notify_worker("snmp_now")
     return {"status": "triggered", "message": f"Immediate SNMP poll queued for {device_ip}."}
+
+
+@app.get("/api/mibs")
+async def get_mib_catalog() -> Dict[str, Any]:
+    """Returns all MIB files stored on the backend server (/app/mibs) and the Vendor Fingerprint Catalog."""
+    return {
+        "stored_mibs": list_backend_mibs(),
+        "vendor_catalog": VENDOR_CATALOG,
+    }
+
+
+@app.post("/api/mibs")
+async def upload_custom_mib(payload: CustomMIBUploadPayload) -> Dict[str, Any]:
+    """Saves a custom .mib file to /app/mibs on the server backend and indexes its OIDs."""
+    raw_name = Path(payload.filename.strip() or "custom.mib").name
+    if not (raw_name.endswith(".mib") or raw_name.endswith(".txt")):
+        raw_name = f"{raw_name}.mib"
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="MIB content cannot be empty.")
+
+    MIBS_DIR.mkdir(parents=True, exist_ok=True)
+    target_path = MIBS_DIR / raw_name
+    target_path.write_text(content, encoding="utf-8")
+
+    parsed = parse_mib_text(content, raw_name)
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO custom_mibs (
+                module_name, filename, organization, description, enterprise_pen, object_count, objects
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+            ON CONFLICT (module_name) DO UPDATE SET
+                filename = EXCLUDED.filename,
+                organization = EXCLUDED.organization,
+                description = EXCLUDED.description,
+                enterprise_pen = EXCLUDED.enterprise_pen,
+                object_count = EXCLUDED.object_count,
+                objects = EXCLUDED.objects,
+                uploaded_at = NOW()
+            """,
+            parsed["module_name"],
+            raw_name,
+            parsed["organization"],
+            parsed["description"],
+            parsed["enterprise_pen"],
+            parsed["object_count"],
+            json.dumps(parsed["objects"]),
+        )
+
+    await _notify_worker("snmp_now")
+    return await get_mib_catalog()
 
 
 @app.get("/api/logs")

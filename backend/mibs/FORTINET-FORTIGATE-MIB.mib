@@ -1,0 +1,46 @@
+FORTINET-FORTIGATE-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, Gauge32, Counter64, enterprises
+        FROM SNMPv2-SMI
+    DisplayString
+        FROM SNMPv2-TC;
+
+fnFortiGateMib MODULE-IDENTITY
+    LAST-UPDATED "202201010000Z"
+    ORGANIZATION "Fortinet Technologies, Inc."
+    CONTACT-INFO "support@fortinet.com"
+    DESCRIPTION  "Fortinet FortiGate Firewall System, CPU, Memory, and Session MIB."
+    ::= { enterprises 12356 101 }
+
+fgSystem          OBJECT IDENTIFIER ::= { fnFortiGateMib 4 }
+fgSystemInfo      OBJECT IDENTIFIER ::= { fgSystem 1 }
+
+fgSysVersion OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "FortiOS Firmware Version"
+    ::= { fgSystemInfo 1 }
+
+fgSysCpuUsage OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "FortiGate Current CPU Usage (%)"
+    ::= { fgSystemInfo 3 }
+
+fgSysMemUsage OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "FortiGate Current Memory Usage (%)"
+    ::= { fgSystemInfo 4 }
+
+fgSysSesCount OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Active Firewall Session Count"
+    ::= { fgSystemInfo 8 }
+
+END

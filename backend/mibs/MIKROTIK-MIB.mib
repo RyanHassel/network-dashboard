@@ -1,0 +1,62 @@
+MIKROTIK-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, Integer32, Gauge32, enterprises
+        FROM SNMPv2-SMI
+    DisplayString
+        FROM SNMPv2-TC;
+
+mikrotikExperimentalModule MODULE-IDENTITY
+    LAST-UPDATED "202301010000Z"
+    ORGANIZATION "MikroTikls SIA"
+    CONTACT-INFO "support@mikrotik.com"
+    DESCRIPTION  "MikroTik RouterOS Enterprise Health, System, and Wireless MIB."
+    ::= { enterprises 14988 1 }
+
+mtXRouterOs       OBJECT IDENTIFIER ::= { mikrotikExperimentalModule 1 }
+mtxrHealth        OBJECT IDENTIFIER ::= { mtXRouterOs 3 }
+mtxrLic           OBJECT IDENTIFIER ::= { mtXRouterOs 4 }
+mtxrSystem        OBJECT IDENTIFIER ::= { mtXRouterOs 7 }
+
+mtxrHlVoltage OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Core / Input Voltage (0.1V units)"
+    ::= { mtxrHealth 8 }
+
+mtxrHlTemperature OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Board Temperature (0.1C units)"
+    ::= { mtxrHealth 10 }
+
+mtxrHlProcessorTemperature OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "CPU Temperature (0.1C units)"
+    ::= { mtxrHealth 11 }
+
+mtxrHlPower OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Power Consumption (0.1W units)"
+    ::= { mtxrHealth 12 }
+
+mtxrLicVersion OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "RouterOS Software Version"
+    ::= { mtxrLic 4 }
+
+mtxrSerialNumber OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Hardware Serial Number"
+    ::= { mtxrSystem 3 }
+
+END

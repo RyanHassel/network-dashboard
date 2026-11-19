@@ -89,6 +89,7 @@ services:
       - .env
     volumes:
       - .:/opt/netdash-repo
+      - ./backend/mibs:/app/mibs
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
@@ -115,6 +116,8 @@ services:
       - "redis:127.0.0.1"
     env_file:
       - .env
+    volumes:
+      - ./backend/mibs:/app/mibs
     depends_on:
       timescaledb:
         condition: service_healthy

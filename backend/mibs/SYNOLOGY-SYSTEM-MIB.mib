@@ -1,0 +1,59 @@
+SYNOLOGY-SYSTEM-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, Integer32, enterprises
+        FROM SNMPv2-SMI
+    DisplayString
+        FROM SNMPv2-TC;
+
+synoSystem MODULE-IDENTITY
+    LAST-UPDATED "202201010000Z"
+    ORGANIZATION "Synology Inc."
+    CONTACT-INFO "support@synology.com"
+    DESCRIPTION  "Synology DSM System, Thermal, Disk, and RAID Status MIB."
+    ::= { enterprises 6574 1 }
+
+systemStatus OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Synology System Health Status (1=Normal, 2=Failed)"
+    ::= { synoSystem 1 }
+
+temperature OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Synology System Temperature (Celsius)"
+    ::= { synoSystem 2 }
+
+powerStatus OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Synology Power Status (1=Normal, 2=Failed)"
+    ::= { synoSystem 3 }
+
+dsmInfo           OBJECT IDENTIFIER ::= { synoSystem 5 }
+
+modelName OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Synology NAS Model Name"
+    ::= { dsmInfo 1 }
+
+serialNumber OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Synology NAS Serial Number"
+    ::= { dsmInfo 2 }
+
+version OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Synology DSM Firmware Version"
+    ::= { dsmInfo 3 }
+
+END

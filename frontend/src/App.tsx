@@ -155,10 +155,64 @@ interface DeviceDetailPayload {
     sys_descr: string | null;
     sys_object_id: string | null;
     sys_location: string | null;
+    sys_contact: string | null;
     sys_uptime_ticks: number | null;
     cpu_usage_pct: number | null;
     mem_usage_pct: number | null;
+    temp_celsius: number | null;
     interface_count: number;
+    vendor_name: string | null;
+    device_category: string | null;
+    matched_mibs: string[] | null;
+    hardware_model: string | null;
+    serial_number: string | null;
+    firmware_version: string | null;
+    extended_metrics: {
+      cpu_details?: {
+        core_count?: number;
+        load_1m?: number;
+        load_5m?: number;
+        load_15m?: number;
+        user_pct?: number;
+        system_pct?: number;
+        idle_pct?: number;
+      };
+      memory_details?: {
+        total_bytes?: number;
+        used_bytes?: number;
+        avail_bytes?: number;
+        cached_bytes?: number;
+        swap_total_bytes?: number;
+        swap_used_bytes?: number;
+        usage_pct?: number;
+      };
+      storage_volumes?: Array<{
+        mount: string;
+        total_bytes: number;
+        used_bytes: number;
+        usage_pct: number;
+      }>;
+      sensors?: Array<{
+        name: string;
+        category: string;
+        value: string;
+        status: string;
+      }>;
+      lldp_neighbors?: Array<{
+        local_port: string;
+        neighbor_name: string;
+        neighbor_port: string;
+        neighbor_descr: string;
+      }>;
+      wireless_radios?: Array<{
+        ssid: string;
+        radio: string;
+        channel: string;
+        stations: number;
+        tx_power: string;
+      }>;
+      vendor_scalars?: Record<string, string | number>;
+    } | null;
     is_reachable: boolean;
     last_poll_duration_ms: number;
     last_polled: string | null;
@@ -528,6 +582,29 @@ export const App: React.FC = () => {
   const [newUnifiSite, setNewUnifiSite] = useState("default");
   const [showUnifiKey, setShowUnifiKey] = useState(false);
 
+  // Server Backend MIB Catalog & Custom MIB Upload State
+  const [storedMibs, setStoredMibs] = useState<
+    Array<{
+      module_name: string;
+      filename: string;
+      organization: string;
+      description: string;
+      enterprise_pen: string;
+      object_count: number;
+    }>
+  >([]);
+  const [vendorCatalog, setVendorCatalog] = useState<
+    Array<{
+      key: string;
+      pens: string[];
+      vendor_name: string;
+      category: string;
+      mibs: string[];
+    }>
+  >([]);
+  const [customMibFilename, setCustomMibFilename] = useState("");
+  const [customMibContent, setCustomMibContent] = useState("");
+
   // Devices Inventory & Per-Device Detail Page State
   const [allDevices, setAllDevices] = useState<UnifiedDeviceItem[]>([]);
   const [deviceSearch, setDeviceSearch] = useState("");
@@ -623,6 +700,41 @@ export const App: React.FC = () => {
       }
     } catch {
       // ignore
+    }
+  };
+
+  const fetchMibs = async () => {
+    try {
+      const r = await fetch("/api/mibs");
+      if (r.ok) {
+        const data = await r.json();
+        setStoredMibs(data.stored_mibs || []);
+        setVendorCatalog(data.vendor_catalog || []);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleUploadMib = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!customMibContent.trim()) return;
+    const r = await fetch("/api/mibs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename: customMibFilename.trim() || "custom.mib",
+        content: customMibContent,
+      }),
+    });
+    if (r.ok) {
+      const data = await r.json();
+      setStoredMibs(data.stored_mibs || []);
+      setCustomMibFilename("");
+      setCustomMibContent("");
+      flashFeedback("ok", "Saved MIB file to server backend (/app/mibs) and indexed OIDs.");
+    } else {
+      flashFeedback("err", "Failed to save custom MIB file.");
     }
   };
 
@@ -1098,6 +1210,7 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     fetchConfig();
+    fetchMibs();
     fetchOverview();
     fetchAllDevices();
     fetchInterfaces();
@@ -2154,65 +2267,126 @@ export const App: React.FC = () => {
                     </dl>
                   </div>
 
-                  {/* Card 2: Polled SNMP System Information */}
+                  {/* Card 2: Polled SNMP System & Matched Vendor MIB Information */}
                   <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
                     <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold text-white">
                       <Server className="h-4 w-4 text-sky-400" />
-                      Polled SNMP System Information (SNMPv2-MIB / HOST-RESOURCES-MIB)
+                      Matched Vendor Profile & Polled SNMP System Info
                     </h3>
                     {deviceDetail?.snmp_system ? (
-                      <dl className="grid grid-cols-2 gap-y-3 text-xs">
-                        <div>
-                          <dt className="text-slate-400">SNMP sysName</dt>
-                          <dd className="mt-0.5 font-semibold text-white">
-                            {deviceDetail.snmp_system.sys_name || "—"}
-                          </dd>
+                      <div className="space-y-3 text-xs">
+                        {/* Matched Vendor & Active MIBs Banner */}
+                        <div className="rounded-lg border border-sky-500/30 bg-sky-500/10 p-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <span className="text-[11px] uppercase tracking-wider text-sky-300">
+                                Matched Vendor Profile
+                              </span>
+                              <div className="text-sm font-semibold text-white">
+                                {deviceDetail.snmp_system.vendor_name || "Standard SNMP Device"}{" "}
+                                {deviceDetail.snmp_system.device_category
+                                  ? `— ${deviceDetail.snmp_system.device_category}`
+                                  : ""}
+                              </div>
+                            </div>
+                            <span className="font-mono-tabular text-[11px] text-slate-300">
+                              OID: {deviceDetail.snmp_system.sys_object_id || "SNMPv2-MIB"}
+                            </span>
+                          </div>
+                          {deviceDetail.snmp_system.matched_mibs &&
+                            deviceDetail.snmp_system.matched_mibs.length > 0 && (
+                              <div className="mt-2 flex flex-wrap gap-1.5">
+                                {deviceDetail.snmp_system.matched_mibs.map((mib) => (
+                                  <span
+                                    key={mib}
+                                    className="rounded border border-sky-400/30 bg-[#090D16] px-2 py-0.5 font-mono-tabular text-[10px] text-sky-300"
+                                  >
+                                    {mib}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
                         </div>
-                        <div>
-                          <dt className="text-slate-400">Assigned SNMP Profile</dt>
-                          <dd className="mt-0.5 text-sky-400">
-                            {deviceDetail.snmp_config?.profile_name || "Default"} (
-                            {deviceDetail.snmp_config?.profile_version || "v2c"} :{" "}
-                            {deviceDetail.snmp_config?.profile_port || 161})
-                          </dd>
-                        </div>
-                        <div className="col-span-2">
-                          <dt className="text-slate-400">System Description (sysDescr)</dt>
-                          <dd className="mt-0.5 rounded border border-slate-800 bg-[#090D16] p-2 font-mono-tabular text-[11px] text-slate-300">
-                            {deviceDetail.snmp_system.sys_descr ||
-                              "Waiting for SNMP response from device..."}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className="text-slate-400">System Uptime (sysUpTime)</dt>
-                          <dd className="mt-0.5 font-mono-tabular text-slate-200">
-                            {deviceDetail.snmp_system.sys_uptime_ticks
-                              ? formatUptime(Math.floor(deviceDetail.snmp_system.sys_uptime_ticks / 100))
-                              : "—"}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className="text-slate-400">CPU Load & Poll Latency</dt>
-                          <dd className="mt-0.5 font-mono-tabular text-slate-200">
-                            CPU {deviceDetail.snmp_system.cpu_usage_pct?.toFixed(1) || "0.0"}% •{" "}
-                            {deviceDetail.snmp_system.last_poll_duration_ms.toFixed(0)} ms
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className="text-slate-400">Location (sysLocation)</dt>
-                          <dd className="mt-0.5 text-slate-300">
-                            {deviceDetail.snmp_system.sys_location || "—"}
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className="text-slate-400">Last Polled</dt>
-                          <dd className="mt-0.5 font-mono-tabular text-slate-300">
-                            {deviceDetail.snmp_system.last_polled
-                              ? new Date(deviceDetail.snmp_system.last_polled).toLocaleString()
-                              : "—"}
-                          </dd>
-                        </div>
-                      </dl>
+
+                        <dl className="grid grid-cols-2 gap-y-2.5">
+                          <div>
+                            <dt className="text-slate-400">SNMP sysName</dt>
+                            <dd className="mt-0.5 font-semibold text-white">
+                              {deviceDetail.snmp_system.sys_name || "—"}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-400">Assigned SNMP Profile</dt>
+                            <dd className="mt-0.5 text-sky-400">
+                              {deviceDetail.snmp_config?.profile_name || "Default"} (
+                              {deviceDetail.snmp_config?.profile_version || "v2c"} :{" "}
+                              {deviceDetail.snmp_config?.profile_port || 161})
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-400">Hardware Model (ENTITY-MIB)</dt>
+                            <dd className="mt-0.5 font-mono-tabular text-slate-200">
+                              {deviceDetail.snmp_system.hardware_model || "—"}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-400">Serial Number & Firmware</dt>
+                            <dd className="mt-0.5 font-mono-tabular text-slate-200">
+                              {deviceDetail.snmp_system.serial_number || "—"}
+                              {deviceDetail.snmp_system.firmware_version
+                                ? ` (${deviceDetail.snmp_system.firmware_version})`
+                                : ""}
+                            </dd>
+                          </div>
+                          <div className="col-span-2">
+                            <dt className="text-slate-400">System Description (sysDescr)</dt>
+                            <dd className="mt-0.5 rounded border border-slate-800 bg-[#090D16] p-2 font-mono-tabular text-[11px] text-slate-300">
+                              {deviceDetail.snmp_system.sys_descr ||
+                                "Waiting for SNMP response from device..."}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-400">System Uptime (sysUpTime)</dt>
+                            <dd className="mt-0.5 font-mono-tabular text-slate-200">
+                              {deviceDetail.snmp_system.sys_uptime_ticks
+                                ? formatUptime(
+                                    Math.floor(deviceDetail.snmp_system.sys_uptime_ticks / 100),
+                                  )
+                                : "—"}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-400">CPU, RAM & Temperature</dt>
+                            <dd className="mt-0.5 font-mono-tabular text-slate-200">
+                              CPU {deviceDetail.snmp_system.cpu_usage_pct?.toFixed(1) || "0.0"}% •
+                              RAM {deviceDetail.snmp_system.mem_usage_pct?.toFixed(1) || "0.0"}%
+                              {deviceDetail.snmp_system.temp_celsius != null
+                                ? ` • ${deviceDetail.snmp_system.temp_celsius}°C`
+                                : ""}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-400">Location & Contact</dt>
+                            <dd className="mt-0.5 text-slate-300">
+                              {deviceDetail.snmp_system.sys_location || "—"}
+                              {deviceDetail.snmp_system.sys_contact
+                                ? ` (${deviceDetail.snmp_system.sys_contact})`
+                                : ""}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-400">Last Polled & Latency</dt>
+                            <dd className="mt-0.5 font-mono-tabular text-slate-300">
+                              {deviceDetail.snmp_system.last_poll_duration_ms.toFixed(0)} ms •{" "}
+                              {deviceDetail.snmp_system.last_polled
+                                ? new Date(
+                                    deviceDetail.snmp_system.last_polled,
+                                  ).toLocaleTimeString()
+                                : "—"}
+                            </dd>
+                          </div>
+                        </dl>
+                      </div>
                     ) : (
                       <div className="py-8 text-center text-xs text-slate-500">
                         SNMP polling is not enabled on this host yet. Click{" "}
@@ -2221,6 +2395,198 @@ export const App: React.FC = () => {
                     )}
                   </div>
                 </div>
+
+                {/* Extended Vendor MIB Telemetry: Sensors, CPU/RAM/Storage, Wireless VAPs, and LLDP Neighbors */}
+                {deviceDetail?.snmp_system?.extended_metrics && (
+                  <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+                    {/* Hardware Sensors & Vendor Scalars */}
+                    {((deviceDetail.snmp_system.extended_metrics.sensors &&
+                      deviceDetail.snmp_system.extended_metrics.sensors.length > 0) ||
+                      (deviceDetail.snmp_system.extended_metrics.vendor_scalars &&
+                        Object.keys(deviceDetail.snmp_system.extended_metrics.vendor_scalars)
+                          .length > 0) ||
+                      deviceDetail.snmp_system.extended_metrics.cpu_details?.load_1m != null) && (
+                      <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+                        <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold text-white">
+                          <Cpu className="h-4 w-4 text-amber-400" />
+                          Vendor MIB Sensors, Load & Hardware Metrics
+                        </h3>
+                        <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3">
+                          {deviceDetail.snmp_system.extended_metrics.cpu_details?.load_1m !=
+                            null && (
+                            <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                              <div className="text-[11px] text-slate-400">Load Avg (1/5/15m)</div>
+                              <div className="mt-1 font-mono-tabular text-xs font-semibold text-white">
+                                {deviceDetail.snmp_system.extended_metrics.cpu_details.load_1m} /{" "}
+                                {deviceDetail.snmp_system.extended_metrics.cpu_details.load_5m} /{" "}
+                                {deviceDetail.snmp_system.extended_metrics.cpu_details.load_15m}
+                              </div>
+                            </div>
+                          )}
+                          {deviceDetail.snmp_system.extended_metrics.memory_details?.total_bytes !=
+                            null && (
+                            <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                              <div className="text-[11px] text-slate-400">Physical RAM</div>
+                              <div className="mt-1 font-mono-tabular text-xs font-semibold text-sky-400">
+                                {formatBytes(
+                                  deviceDetail.snmp_system.extended_metrics.memory_details
+                                    .used_bytes,
+                                )}{" "}
+                                /{" "}
+                                {formatBytes(
+                                  deviceDetail.snmp_system.extended_metrics.memory_details
+                                    .total_bytes,
+                                )}
+                              </div>
+                            </div>
+                          )}
+                          {Object.entries(
+                            deviceDetail.snmp_system.extended_metrics.vendor_scalars || {},
+                          ).map(([k, v]) => (
+                            <div
+                              key={k}
+                              className="rounded-lg border border-slate-800 bg-[#090D16] p-3"
+                            >
+                              <div className="text-[11px] text-slate-400">{k}</div>
+                              <div className="mt-1 font-mono-tabular text-xs font-semibold text-emerald-400">
+                                {String(v)}
+                              </div>
+                            </div>
+                          ))}
+                          {(deviceDetail.snmp_system.extended_metrics.sensors || []).map(
+                            (s, idx) => (
+                              <div
+                                key={idx}
+                                className="rounded-lg border border-slate-800 bg-[#090D16] p-3"
+                              >
+                                <div className="text-[11px] text-slate-400">
+                                  {s.name} ({s.category})
+                                </div>
+                                <div className="mt-1 font-mono-tabular text-xs font-semibold text-amber-300">
+                                  {s.value}
+                                </div>
+                              </div>
+                            ),
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Storage Volumes & Filesystems (HOST-RESOURCES-MIB) */}
+                    {deviceDetail.snmp_system.extended_metrics.storage_volumes &&
+                      deviceDetail.snmp_system.extended_metrics.storage_volumes.length > 0 && (
+                        <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+                          <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold text-white">
+                            <HardDrive className="h-4 w-4 text-emerald-400" />
+                            Polled Storage Volumes & Disks (HOST-RESOURCES-MIB)
+                          </h3>
+                          <div className="space-y-3">
+                            {deviceDetail.snmp_system.extended_metrics.storage_volumes.map(
+                              (vol, idx) => (
+                                <div key={idx} className="text-xs">
+                                  <div className="mb-1 flex items-center justify-between font-mono-tabular">
+                                    <span className="font-semibold text-slate-200">
+                                      {vol.mount}
+                                    </span>
+                                    <span className="text-slate-400">
+                                      {formatBytes(vol.used_bytes)} /{" "}
+                                      {formatBytes(vol.total_bytes)} ({vol.usage_pct}%)
+                                    </span>
+                                  </div>
+                                  <div className="h-2 w-full overflow-hidden rounded-full bg-[#090D16]">
+                                    <div
+                                      style={{ width: `${Math.min(100, vol.usage_pct)}%` }}
+                                      className={`h-full rounded-full ${
+                                        vol.usage_pct >= 90
+                                          ? "bg-rose-500"
+                                          : vol.usage_pct >= 75
+                                            ? "bg-amber-500"
+                                            : "bg-emerald-500"
+                                      }`}
+                                    />
+                                  </div>
+                                </div>
+                              ),
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                    {/* Wireless VAPs (UBNT-UniFi-MIB) */}
+                    {deviceDetail.snmp_system.extended_metrics.wireless_radios &&
+                      deviceDetail.snmp_system.extended_metrics.wireless_radios.length > 0 && (
+                        <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+                          <h3 className="mb-3 text-sm font-semibold text-white">
+                            Polled Wireless Access Point SSIDs (UBNT-UniFi-MIB)
+                          </h3>
+                          <table className="w-full text-left font-mono-tabular text-xs">
+                            <thead>
+                              <tr className="border-b border-slate-800 text-slate-400">
+                                <th className="pb-2">SSID</th>
+                                <th className="pb-2">Radio</th>
+                                <th className="pb-2">Channel</th>
+                                <th className="pb-2">TX Power</th>
+                                <th className="pb-2 text-right">Clients</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-800/50">
+                              {deviceDetail.snmp_system.extended_metrics.wireless_radios.map(
+                                (w, idx) => (
+                                  <tr key={idx}>
+                                    <td className="py-2 font-sans font-semibold text-white">
+                                      {w.ssid}
+                                    </td>
+                                    <td className="py-2 text-slate-300">{w.radio}</td>
+                                    <td className="py-2 text-sky-400">Ch {w.channel}</td>
+                                    <td className="py-2 text-slate-400">{w.tx_power}</td>
+                                    <td className="py-2 text-right text-emerald-400">
+                                      {w.stations}
+                                    </td>
+                                  </tr>
+                                ),
+                              )}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+
+                    {/* LLDP Connected Neighbors (LLDP-MIB) */}
+                    {deviceDetail.snmp_system.extended_metrics.lldp_neighbors &&
+                      deviceDetail.snmp_system.extended_metrics.lldp_neighbors.length > 0 && (
+                        <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+                          <h3 className="mb-3 text-sm font-semibold text-white">
+                            LLDP Connected Neighbors (LLDP-MIB)
+                          </h3>
+                          <table className="w-full text-left font-mono-tabular text-xs">
+                            <thead>
+                              <tr className="border-b border-slate-800 text-slate-400">
+                                <th className="pb-2">Local Port</th>
+                                <th className="pb-2">Neighbor Device</th>
+                                <th className="pb-2">Remote Port</th>
+                                <th className="pb-2">Description</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-800/50">
+                              {deviceDetail.snmp_system.extended_metrics.lldp_neighbors.map(
+                                (nb, idx) => (
+                                  <tr key={idx}>
+                                    <td className="py-2 text-emerald-400">Port #{nb.local_port}</td>
+                                    <td className="py-2 font-sans font-semibold text-white">
+                                      {nb.neighbor_name}
+                                    </td>
+                                    <td className="py-2 text-sky-400">{nb.neighbor_port}</td>
+                                    <td className="py-2 font-sans text-slate-400">
+                                      {nb.neighbor_descr}
+                                    </td>
+                                  </tr>
+                                ),
+                              )}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                  </div>
+                )}
 
                 {/* Device SNMP Interfaces & Bandwidth Chart */}
                 {deviceDetail?.snmp_interfaces && deviceDetail.snmp_interfaces.length > 0 && (
@@ -3362,6 +3728,120 @@ export const App: React.FC = () => {
                   </table>
                 </div>
               )}
+            </div>
+
+            {/* 5. Backend Server MIB Library & Custom MIB Upload (/app/mibs) */}
+            <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+              <h2 className="text-sm font-semibold text-white">
+                Server Backend MIB Library & Custom MIB Storage (<code>/app/mibs</code>)
+              </h2>
+              <p className="mt-0.5 text-xs text-slate-400">
+                When any device is polled, NetDash fingerprints its <code>sysObjectID</code>{" "}
+                (Enterprise PEN) and <code>sysDescr</code> against the backend MIB library to pull
+                vendor-specific sensors, hardware serials, storage, wireless VAPs, and LLDP
+                neighbors automatically.
+              </p>
+
+              <div className="mt-4 grid grid-cols-1 gap-6 lg:grid-cols-2">
+                <div>
+                  <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-sky-400">
+                    Stored Backend MIB Files ({storedMibs.length})
+                  </h3>
+                  <div className="space-y-2">
+                    {storedMibs.map((m) => (
+                      <div
+                        key={m.filename}
+                        className="rounded-lg border border-slate-800 bg-[#090D16] p-3 text-xs"
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="font-mono-tabular font-semibold text-emerald-400">
+                            {m.module_name}
+                          </span>
+                          <span className="font-mono-tabular text-[11px] text-slate-400">
+                            {m.filename} • {m.object_count} OIDs
+                            {m.enterprise_pen ? ` • PEN #${m.enterprise_pen}` : ""}
+                          </span>
+                        </div>
+                        <p className="mt-1 text-[11px] text-slate-400">
+                          {m.organization ? `${m.organization} — ` : ""}
+                          {m.description}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-emerald-400">
+                    Upload or Paste Additional Vendor MIB File (.mib)
+                  </h3>
+                  <form
+                    onSubmit={handleUploadMib}
+                    className="space-y-2.5 rounded-lg border border-slate-800 bg-[#090D16] p-3.5 text-xs"
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <input
+                        type="text"
+                        placeholder="Filename (e.g. VENDOR-CUSTOM-MIB.mib)"
+                        value={customMibFilename}
+                        onChange={(e) => setCustomMibFilename(e.target.value)}
+                        className="flex-1 rounded-md border border-slate-700 bg-[#111827] px-3 py-1.5 font-mono-tabular text-xs text-white"
+                        required
+                      />
+                      <label className="cursor-pointer rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-700">
+                        Load .mib File
+                        <input
+                          type="file"
+                          accept=".mib,.txt"
+                          className="hidden"
+                          onChange={(e) => {
+                            const file = e.target.files?.[0];
+                            if (!file) return;
+                            setCustomMibFilename(file.name);
+                            file.text().then((txt) => setCustomMibContent(txt));
+                          }}
+                        />
+                      </label>
+                    </div>
+                    <textarea
+                      rows={5}
+                      placeholder="Paste SMIv2 MIB definition text (MY-MIB DEFINITIONS ::= BEGIN ... END)..."
+                      value={customMibContent}
+                      onChange={(e) => setCustomMibContent(e.target.value)}
+                      className="w-full rounded-md border border-slate-700 bg-[#111827] p-2.5 font-mono-tabular text-xs text-white"
+                      required
+                    />
+                    <div className="flex justify-end">
+                      <button
+                        type="submit"
+                        className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
+                      >
+                        <Plus className="h-3.5 w-3.5" /> Store MIB on Backend Server
+                      </button>
+                    </div>
+                  </form>
+
+                  <h3 className="mt-4 mb-2 text-xs font-semibold uppercase tracking-wider text-slate-400">
+                    Auto-Matched Device Vendor Profiles ({vendorCatalog.length})
+                  </h3>
+                  <div className="max-h-48 space-y-1.5 overflow-y-auto rounded-lg border border-slate-800 bg-[#090D16] p-2.5 text-xs">
+                    {vendorCatalog.map((vc) => (
+                      <div
+                        key={vc.key}
+                        className="flex items-center justify-between border-b border-slate-800/60 pb-1.5 last:border-b-0 last:pb-0"
+                      >
+                        <div>
+                          <span className="font-semibold text-white">{vc.vendor_name}</span>{" "}
+                          <span className="text-slate-400">({vc.category})</span>
+                        </div>
+                        <span className="font-mono-tabular text-[11px] text-sky-400">
+                          {vc.mibs.slice(0, 3).join(", ")}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         )}

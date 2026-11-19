@@ -55,6 +55,29 @@ CREATE TABLE IF NOT EXISTS unifi_controllers_config (
     enabled       BOOLEAN NOT NULL DEFAULT TRUE,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Extend snmp_devices with Vendor MIB matching & hardware telemetry columns
+ALTER TABLE snmp_devices ADD COLUMN IF NOT EXISTS vendor_name TEXT;
+ALTER TABLE snmp_devices ADD COLUMN IF NOT EXISTS device_category TEXT;
+ALTER TABLE snmp_devices ADD COLUMN IF NOT EXISTS matched_mibs JSONB DEFAULT '[]'::jsonb;
+ALTER TABLE snmp_devices ADD COLUMN IF NOT EXISTS hardware_model TEXT;
+ALTER TABLE snmp_devices ADD COLUMN IF NOT EXISTS serial_number TEXT;
+ALTER TABLE snmp_devices ADD COLUMN IF NOT EXISTS firmware_version TEXT;
+ALTER TABLE snmp_devices ADD COLUMN IF NOT EXISTS sys_contact TEXT;
+ALTER TABLE snmp_devices ADD COLUMN IF NOT EXISTS temp_celsius DOUBLE PRECISION;
+ALTER TABLE snmp_devices ADD COLUMN IF NOT EXISTS extended_metrics JSONB DEFAULT '{}'::jsonb;
+
+CREATE TABLE IF NOT EXISTS custom_mibs (
+    id             SERIAL PRIMARY KEY,
+    module_name    TEXT NOT NULL UNIQUE,
+    filename       TEXT NOT NULL,
+    organization   TEXT DEFAULT '',
+    description    TEXT DEFAULT '',
+    enterprise_pen TEXT DEFAULT '',
+    object_count   INT DEFAULT 0,
+    objects        JSONB DEFAULT '[]'::jsonb,
+    uploaded_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 """
 
 
@@ -63,7 +86,6 @@ async def ensure_dynamic_config_tables(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
         await conn.execute(DYNAMIC_CONFIG_DDL)
 
-        # Ensure default onboarding setting exists
         await conn.execute(
             """
             INSERT INTO app_settings (key, value)
@@ -73,7 +95,6 @@ async def ensure_dynamic_config_tables(pool: asyncpg.Pool) -> None:
             json.dumps({"completed": False, "skipped": False}),
         )
 
-        # Seed a default 'Default v2c (public)' SNMP profile if table is empty
         count = await conn.fetchval("SELECT COUNT(*) FROM snmp_profiles")
         if not count:
             await conn.execute(

@@ -1,0 +1,36 @@
+CISCO-PROCESS-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, Gauge32, Unsigned32, enterprises
+        FROM SNMPv2-SMI;
+
+ciscoProcessMIB MODULE-IDENTITY
+    LAST-UPDATED "202001010000Z"
+    ORGANIZATION "Cisco Systems, Inc."
+    CONTACT-INFO "cs-snmp@cisco.com"
+    DESCRIPTION  "Cisco IOS / IOS-XE / NX-OS CPU Utilization and Process MIB."
+    ::= { enterprises 9 9 109 }
+
+cpmCPU            OBJECT IDENTIFIER ::= { ciscoProcessMIB 1 1 }
+
+cpmCPUTotal5secRev OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Overall 5-second CPU busy percentage"
+    ::= { cpmCPU 1 1 6 }
+
+cpmCPUTotal1minRev OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Overall 1-minute CPU busy percentage"
+    ::= { cpmCPU 1 1 7 }
+
+cpmCPUTotal5minRev OBJECT-TYPE
+    SYNTAX      Gauge32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Overall 5-minute CPU busy percentage"
+    ::= { cpmCPU 1 1 8 }
+
+END

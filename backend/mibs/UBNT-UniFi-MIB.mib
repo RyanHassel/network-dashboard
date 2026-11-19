@@ -1,0 +1,127 @@
+UBNT-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, Integer32, Unsigned32, Counter64, enterprises
+        FROM SNMPv2-SMI
+    DisplayString, MacAddress
+        FROM SNMPv2-TC;
+
+ubntMIB MODULE-IDENTITY
+    LAST-UPDATED "202001010000Z"
+    ORGANIZATION "Ubiquiti Networks, Inc."
+    CONTACT-INFO "support@ui.com"
+    DESCRIPTION  "Ubiquiti Networks Enterprise MIB for UniFi, EdgeMAX, and airMAX devices."
+    ::= { enterprises 41112 }
+
+ubntORTable          OBJECT IDENTIFIER ::= { ubntMIB 1 }
+ubntWlStat           OBJECT IDENTIFIER ::= { ubntMIB 1 2 }
+ubntAirFiber         OBJECT IDENTIFIER ::= { ubntMIB 1 3 }
+ubntEdgeMax          OBJECT IDENTIFIER ::= { ubntMIB 1 5 }
+ubntUniFi            OBJECT IDENTIFIER ::= { ubntMIB 1 6 }
+
+unifiApWireless      OBJECT IDENTIFIER ::= { ubntUniFi 1 }
+unifiApIf            OBJECT IDENTIFIER ::= { ubntUniFi 2 }
+unifiApSystem        OBJECT IDENTIFIER ::= { ubntUniFi 3 }
+
+unifiApSystemIp OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "UniFi Device Management IPv4 Address"
+    ::= { unifiApSystem 1 }
+
+unifiApSystemIsolated OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "UniFi Mesh Isolation State"
+    ::= { unifiApSystem 2 }
+
+unifiApSystemModel OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "UniFi Hardware Model Name"
+    ::= { unifiApSystem 3 }
+
+unifiApSystemUptime OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "UniFi System Uptime Seconds"
+    ::= { unifiApSystem 5 }
+
+unifiApSystemVersion OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "UniFi Firmware Version"
+    ::= { unifiApSystem 6 }
+
+unifiVapTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF UnifiVapEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "UniFi Virtual Access Point (SSID) Table"
+    ::= { unifiApWireless 2 }
+
+unifiVapEntry OBJECT-TYPE
+    SYNTAX      UnifiVapEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    INDEX       { unifiVapIndex }
+    ::= { unifiVapTable 1 }
+
+UnifiVapEntry ::= SEQUENCE {
+    unifiVapIndex       Integer32,
+    unifiVapBss         MacAddress,
+    unifiVapChannel     Integer32,
+    unifiVapEssId       DisplayString,
+    unifiVapName        DisplayString,
+    unifiVapNumStations Integer32,
+    unifiVapRadio       DisplayString,
+    unifiVapTxPower     Integer32
+}
+
+unifiVapChannel OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Wireless Channel"
+    ::= { unifiVapEntry 4 }
+
+unifiVapEssId OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Wireless SSID Name"
+    ::= { unifiVapEntry 6 }
+
+unifiVapName OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Wireless Interface Name"
+    ::= { unifiVapEntry 7 }
+
+unifiVapNumStations OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Connected Wireless Clients on VAP"
+    ::= { unifiVapEntry 8 }
+
+unifiVapRadio OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Wireless Band / Radio"
+    ::= { unifiVapEntry 9 }
+
+unifiVapTxPower OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Transmit Power (dBm)"
+    ::= { unifiVapEntry 21 }
+
+END
