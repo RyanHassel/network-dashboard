@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useId, useRef, useState } from "react";
 import {
   Activity,
   ArrowDownRight,
@@ -518,10 +518,168 @@ function formatChartAxisTimestamp(rawLabel: string, spanMs: number): string {
   return dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+function formatChartTooltipTimestamp(tsMs: number, fallbackLabel: string, spanMs: number): string {
+  if (Number.isNaN(tsMs)) return fallbackLabel || "—";
+  const dt = new Date(tsMs);
+  if (spanMs > 36 * 3600 * 1000) {
+    return dt.toLocaleString([], {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+  if (spanMs <= 2 * 3600 * 1000) {
+    return dt.toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  }
+  return dt.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+interface SplineSegment {
+  x0: number;
+  y0: number;
+  cp1x: number;
+  cp1y: number;
+  cp2x: number;
+  cp2y: number;
+  x1: number;
+  y1: number;
+}
+
+interface SplineResult {
+  linePath: string;
+  areaPath: string;
+  segments: SplineSegment[];
+}
+
+function buildMonotoneSpline(
+  pts: Array<{ x: number; y: number }>,
+  topY: number,
+  baselineY: number,
+): SplineResult {
+  const n = pts.length;
+  if (n === 0) return { linePath: "", areaPath: "", segments: [] };
+  if (n === 1) {
+    return {
+      linePath: `M ${pts[0].x.toFixed(2)},${pts[0].y.toFixed(2)}`,
+      areaPath: "",
+      segments: [],
+    };
+  }
+
+  const dx: number[] = [];
+  const d: number[] = [];
+  for (let i = 0; i < n - 1; i++) {
+    const deltaX = pts[i + 1].x - pts[i].x;
+    dx.push(deltaX);
+    d.push(deltaX !== 0 ? (pts[i + 1].y - pts[i].y) / deltaX : 0);
+  }
+
+  const m: number[] = new Array(n).fill(0);
+  m[0] = d[0];
+  m[n - 1] = d[n - 2];
+  for (let i = 1; i < n - 1; i++) {
+    if (d[i - 1] * d[i] <= 0) {
+      m[i] = 0;
+    } else {
+      const w1 = 2 * dx[i] + dx[i - 1];
+      const w2 = dx[i] + 2 * dx[i - 1];
+      m[i] = (w1 + w2) / (w1 / d[i - 1] + w2 / d[i]);
+    }
+  }
+
+  for (let i = 0; i < n - 1; i++) {
+    if (Math.abs(d[i]) < 1e-9) {
+      m[i] = 0;
+      m[i + 1] = 0;
+    } else {
+      const a = m[i] / d[i];
+      const b = m[i + 1] / d[i];
+      const h = Math.hypot(a, b);
+      if (h > 3) {
+        const tau = 3 / h;
+        m[i] = tau * a * d[i];
+        m[i + 1] = tau * b * d[i];
+      }
+    }
+  }
+
+  const clampY = (val: number) => Math.min(baselineY, Math.max(topY, val));
+  const segments: SplineSegment[] = [];
+  let linePath = `M ${pts[0].x.toFixed(2)},${pts[0].y.toFixed(2)}`;
+
+  for (let i = 0; i < n - 1; i++) {
+    const hdx = (pts[i + 1].x - pts[i].x) / 3;
+    const seg: SplineSegment = {
+      x0: pts[i].x,
+      y0: pts[i].y,
+      cp1x: pts[i].x + hdx,
+      cp1y: clampY(pts[i].y + m[i] * hdx),
+      cp2x: pts[i + 1].x - hdx,
+      cp2y: clampY(pts[i + 1].y - m[i + 1] * hdx),
+      x1: pts[i + 1].x,
+      y1: pts[i + 1].y,
+    };
+    segments.push(seg);
+    linePath += ` C ${seg.cp1x.toFixed(2)},${seg.cp1y.toFixed(2)} ${seg.cp2x.toFixed(2)},${seg.cp2y.toFixed(2)} ${seg.x1.toFixed(2)},${seg.y1.toFixed(2)}`;
+  }
+
+  const areaPath = `${linePath} L ${pts[n - 1].x.toFixed(2)},${baselineY.toFixed(2)} L ${pts[0].x.toFixed(2)},${baselineY.toFixed(2)} Z`;
+  return { linePath, areaPath, segments };
+}
+
+function evalSplineY(
+  segments: SplineSegment[],
+  pts: Array<{ x: number; y: number }>,
+  ratio: number,
+): number {
+  if (pts.length === 0) return 0;
+  if (pts.length === 1 || segments.length === 0) return pts[0].y;
+  const exactIdx = Math.min(pts.length - 1, Math.max(0, ratio * (pts.length - 1)));
+  const segIdx = Math.min(segments.length - 1, Math.max(0, Math.floor(exactIdx)));
+  const t = Math.min(1, Math.max(0, exactIdx - segIdx));
+  const mt = 1 - t;
+  const s = segments[segIdx];
+  return (
+    mt * mt * mt * s.y0 +
+    3 * mt * mt * t * s.cp1y +
+    3 * mt * t * t * s.cp2y +
+    t * t * t * s.y1
+  );
+}
+
 const DualAreaSparkChart: React.FC<{
   points: Array<{ label: string; inVal: number; outVal: number; p95In?: number }>;
   height?: number;
 }> = ({ points, height = 210 }) => {
+  const rawId = useId();
+  const gradPrefix = rawId.replace(/[^a-zA-Z0-9_-]/g, "");
+  const rxGradId = `rxGrad-${gradPrefix}`;
+  const txGradId = `txGrad-${gradPrefix}`;
+  const plotRef = useRef<HTMLDivElement | null>(null);
+  const enteredAtRef = useRef<number>(0);
+  const [isHovering, setIsHovering] = useState(false);
+  const [animateMove, setAnimateMove] = useState(false);
+  const [hoverData, setHoverData] = useState<{
+    ratio: number;
+    inYFrac: number;
+    outYFrac: number;
+    inVal: number;
+    outVal: number;
+    timeText: string;
+    boxX: number;
+    boxY: number;
+  } | null>(null);
+
   if (!points.length) {
     return (
       <div
@@ -534,6 +692,9 @@ const DualAreaSparkChart: React.FC<{
   }
 
   const width = 800;
+  const topPad = 12;
+  const baselineY = height - 18;
+  const plotSpanY = Math.max(1, baselineY - topPad);
   const maxVal = Math.max(
     1000,
     ...points.map((p) => Math.max(p.inVal, p.outVal, p.p95In || 0)),
@@ -555,97 +716,277 @@ const DualAreaSparkChart: React.FC<{
     }
   }
 
-  const toCoords = (vals: number[]) =>
-    vals
-      .map((v, i) => {
-        const x = points.length === 1 ? width / 2 : (i / (points.length - 1)) * width;
-        const y = height - 20 - (Math.min(v, maxVal) / maxVal) * (height - 40);
-        return `${x.toFixed(1)},${y.toFixed(1)}`;
-      })
-      .join(" ");
+  const toPts = (vals: number[]) =>
+    vals.map((v, i) => ({
+      x: points.length === 1 ? width / 2 : (i / (points.length - 1)) * width,
+      y: baselineY - (Math.min(Math.max(0, v), maxVal) / maxVal) * plotSpanY,
+    }));
 
-  const inLine = toCoords(points.map((p) => p.inVal));
-  const outLine = toCoords(points.map((p) => p.outVal));
-  const inArea = `0,${height - 20} ${inLine} ${width},${height - 20}`;
-  const outArea = `0,${height - 20} ${outLine} ${width},${height - 20}`;
+  const inPts = toPts(points.map((p) => p.inVal));
+  const outPts = toPts(points.map((p) => p.outVal));
+  const inSpline = buildMonotoneSpline(inPts, topPad, baselineY);
+  const outSpline = buildMonotoneSpline(outPts, topPad, baselineY);
+
+  const updateHoverFromEvent = (e: React.PointerEvent<HTMLDivElement>, isEntry: boolean) => {
+    const rect = plotRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0) return;
+
+    const px = Math.min(rect.width, Math.max(0, e.clientX - rect.left));
+    const ratio = points.length === 1 ? 0.5 : px / rect.width;
+
+    const inY = evalSplineY(inSpline.segments, inPts, ratio);
+    const outY = evalSplineY(outSpline.segments, outPts, ratio);
+    const inVal = Math.max(0, ((baselineY - inY) / plotSpanY) * maxVal);
+    const outVal = Math.max(0, ((baselineY - outY) / plotSpanY) * maxVal);
+
+    let timeText = "—";
+    if (points.length === 1) {
+      timeText = formatChartTooltipTimestamp(
+        new Date(points[0].label).getTime(),
+        points[0].label,
+        spanMs,
+      );
+    } else {
+      const exactIdx = ratio * (points.length - 1);
+      const i0 = Math.min(points.length - 2, Math.max(0, Math.floor(exactIdx)));
+      const t = exactIdx - i0;
+      const ts0 = new Date(points[i0].label).getTime();
+      const ts1 = new Date(points[i0 + 1].label).getTime();
+      if (!Number.isNaN(ts0) && !Number.isNaN(ts1)) {
+        timeText = formatChartTooltipTimestamp(
+          ts0 + t * (ts1 - ts0),
+          points[i0].label,
+          spanMs,
+        );
+      } else {
+        const nearest = points[Math.min(points.length - 1, Math.max(0, Math.round(exactIdx)))];
+        timeText = formatChartTooltipTimestamp(
+          new Date(nearest.label).getTime(),
+          nearest.label,
+          spanMs,
+        );
+      }
+    }
+
+    const tooltipW = 204;
+    const tooltipH = 82;
+    const cursorX = ratio * rect.width;
+    const rightX = cursorX + 14;
+    const leftX = cursorX - tooltipW - 14;
+    const rawBoxX = rightX + tooltipW <= rect.width - 4 ? rightX : leftX;
+    const boxX = Math.min(Math.max(4, rawBoxX), Math.max(4, rect.width - tooltipW - 4));
+    const topDotY = (Math.min(inY, outY) / height) * rect.height;
+    const boxY = Math.min(Math.max(4, topDotY - 20), Math.max(4, rect.height - tooltipH - 4));
+
+    if (isEntry) {
+      enteredAtRef.current = performance.now();
+      setAnimateMove(false);
+      setIsHovering(true);
+    } else {
+      if (!isHovering) setIsHovering(true);
+      if (performance.now() - enteredAtRef.current > 24) {
+        setAnimateMove(true);
+      }
+    }
+
+    setHoverData({
+      ratio,
+      inYFrac: inY / height,
+      outYFrac: outY / height,
+      inVal,
+      outVal,
+      timeText,
+      boxX,
+      boxY,
+    });
+  };
+
+  const handlePointerLeave = () => {
+    setIsHovering(false);
+  };
 
   return (
-    <div className="relative w-full overflow-hidden rounded-lg border border-slate-800/80 bg-[#0B101B] p-3">
+    <div className="relative w-full overflow-visible rounded-lg border border-slate-800/80 bg-[#0B101B] p-3">
       <div className="mb-2 flex items-center justify-between text-xs text-slate-400">
         <div className="flex items-center gap-4">
           <span className="flex items-center gap-1.5">
             <span className="h-2 w-2 rounded-full bg-emerald-400" />
-            RX / Inbound
+            Download (RX)
           </span>
           <span className="flex items-center gap-1.5">
             <span className="h-2 w-2 rounded-full bg-sky-400" />
-            TX / Outbound
+            Upload (TX)
           </span>
         </div>
         <span className="font-mono-tabular text-slate-300">Peak: {formatBps(maxVal)}</span>
       </div>
-      <svg viewBox={`0 0 ${width} ${height}`} className="h-44 w-full overflow-visible">
-        <defs>
-          <linearGradient id="rxGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#10B981" stopOpacity="0.32" />
-            <stop offset="100%" stopColor="#10B981" stopOpacity="0.0" />
-          </linearGradient>
-          <linearGradient id="txGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#38BDF8" stopOpacity="0.26" />
-            <stop offset="100%" stopColor="#38BDF8" stopOpacity="0.0" />
-          </linearGradient>
-        </defs>
-        {[0.25, 0.5, 0.75].map((r) => (
-          <line
-            key={r}
-            x1={0}
-            y1={(height - 20) * r}
-            x2={width}
-            y2={(height - 20) * r}
-            stroke="#1E293B"
-            strokeDasharray="4 4"
-            strokeWidth="1"
-          />
-        ))}
-        <line
-          x1={0}
-          y1={height - 20}
-          x2={width}
-          y2={height - 20}
-          stroke="#1E293B"
-          strokeWidth="1"
-        />
-        {tickIndices.map((idx) => {
-          const x = points.length === 1 ? width / 2 : (idx / (points.length - 1)) * width;
-          return (
+
+      <div
+        ref={plotRef}
+        onPointerEnter={(e) => updateHoverFromEvent(e, true)}
+        onPointerMove={(e) => updateHoverFromEvent(e, false)}
+        onPointerLeave={handlePointerLeave}
+        className="relative h-44 w-full cursor-crosshair select-none touch-none"
+      >
+        <svg
+          viewBox={`0 0 ${width} ${height}`}
+          preserveAspectRatio="none"
+          className="block h-full w-full overflow-visible"
+        >
+          <defs>
+            <linearGradient id={rxGradId} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#10B981" stopOpacity="0.32" />
+              <stop offset="100%" stopColor="#10B981" stopOpacity="0.0" />
+            </linearGradient>
+            <linearGradient id={txGradId} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#38BDF8" stopOpacity="0.26" />
+              <stop offset="100%" stopColor="#38BDF8" stopOpacity="0.0" />
+            </linearGradient>
+          </defs>
+          {[0.25, 0.5, 0.75].map((r) => (
             <line
-              key={idx}
-              x1={x}
-              y1={height - 20}
-              x2={x}
-              y2={height - 13}
-              stroke="#334155"
+              key={r}
+              x1={0}
+              y1={topPad + plotSpanY * r}
+              x2={width}
+              y2={topPad + plotSpanY * r}
+              stroke="#1E293B"
+              strokeDasharray="4 4"
               strokeWidth="1"
             />
-          );
-        })}
-        <polygon points={inArea} fill="url(#rxGrad)" />
-        <polygon points={outArea} fill="url(#txGrad)" />
-        <polyline
-          fill="none"
-          stroke="#10B981"
-          strokeWidth="2"
-          points={inLine}
-          vectorEffect="non-scaling-stroke"
-        />
-        <polyline
-          fill="none"
-          stroke="#38BDF8"
-          strokeWidth="1.8"
-          points={outLine}
-          vectorEffect="non-scaling-stroke"
-        />
-      </svg>
+          ))}
+          <line
+            x1={0}
+            y1={baselineY}
+            x2={width}
+            y2={baselineY}
+            stroke="#1E293B"
+            strokeWidth="1"
+          />
+          {tickIndices.map((idx) => {
+            const x = points.length === 1 ? width / 2 : (idx / (points.length - 1)) * width;
+            return (
+              <line
+                key={idx}
+                x1={x}
+                y1={baselineY}
+                x2={x}
+                y2={baselineY + 7}
+                stroke="#334155"
+                strokeWidth="1"
+              />
+            );
+          })}
+          {inSpline.areaPath && <path d={inSpline.areaPath} fill={`url(#${rxGradId})`} />}
+          {outSpline.areaPath && <path d={outSpline.areaPath} fill={`url(#${txGradId})`} />}
+          {inSpline.linePath && (
+            <path
+              d={inSpline.linePath}
+              fill="none"
+              stroke="#10B981"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+          {outSpline.linePath && (
+            <path
+              d={outSpline.linePath}
+              fill="none"
+              stroke="#38BDF8"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+        </svg>
+
+        {hoverData && (
+          <>
+            {/* Vertical crosshair line */}
+            <div
+              className="pointer-events-none absolute top-0 bottom-4 w-px bg-slate-400/55 motion-reduce:transition-none"
+              style={{
+                left: `${(hoverData.ratio * 100).toFixed(3)}%`,
+                opacity: isHovering ? 1 : 0,
+                transition: animateMove
+                  ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
+                  : "opacity 180ms ease-out",
+              }}
+            />
+
+            {/* Active point markers on Download & Upload curves */}
+            <div
+              className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-emerald-400 ring-2 ring-[#0B101B] shadow-[0_0_8px_rgba(16,185,129,0.85)] motion-reduce:transition-none"
+              style={{
+                left: `${(hoverData.ratio * 100).toFixed(3)}%`,
+                top: `${(hoverData.inYFrac * 100).toFixed(3)}%`,
+                opacity: isHovering ? 1 : 0,
+                transition: animateMove
+                  ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
+                  : "opacity 180ms ease-out",
+              }}
+            />
+            <div
+              className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-sky-400 ring-2 ring-[#0B101B] shadow-[0_0_8px_rgba(56,189,248,0.85)] motion-reduce:transition-none"
+              style={{
+                left: `${(hoverData.ratio * 100).toFixed(3)}%`,
+                top: `${(hoverData.outYFrac * 100).toFixed(3)}%`,
+                opacity: isHovering ? 1 : 0,
+                transition: animateMove
+                  ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
+                  : "opacity 180ms ease-out",
+              }}
+            />
+
+            {/* Smooth floating Download / Upload tooltip box */}
+            <div
+              className="pointer-events-none absolute top-0 left-0 z-20 w-[204px] will-change-transform motion-reduce:transition-none"
+              style={{
+                transform: `translate3d(${hoverData.boxX.toFixed(1)}px, ${hoverData.boxY.toFixed(1)}px, 0)`,
+                transition: animateMove
+                  ? "transform 95ms cubic-bezier(0.22, 1, 0.36, 1)"
+                  : "none",
+              }}
+            >
+              <div
+                className={`rounded-lg border border-slate-700/90 bg-[#090D16]/95 px-3 py-2 text-xs shadow-xl shadow-black/50 backdrop-blur-md transition-[opacity,transform] duration-200 ease-out motion-reduce:transition-none ${
+                  isHovering
+                    ? "translate-y-0 scale-100 opacity-100"
+                    : "translate-y-1 scale-95 opacity-0"
+                }`}
+              >
+                <div className="mb-1.5 border-b border-slate-800/80 pb-1 font-mono-tabular text-[11px] text-slate-400">
+                  {hoverData.timeText}
+                </div>
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="flex items-center gap-1.5 text-slate-300">
+                      <span className="h-2 w-2 rounded-full bg-emerald-400" />
+                      Download
+                    </span>
+                    <span className="font-mono-tabular font-semibold text-emerald-400">
+                      {formatBps(hoverData.inVal)}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="flex items-center gap-1.5 text-slate-300">
+                      <span className="h-2 w-2 rounded-full bg-sky-400" />
+                      Upload
+                    </span>
+                    <span className="font-mono-tabular font-semibold text-sky-400">
+                      {formatBps(hoverData.outVal)}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+
       <div className="mt-1 flex items-center justify-between border-t border-slate-800/70 pt-1.5 font-mono-tabular text-[11px] text-slate-400">
         {tickIndices.map((idx) => (
           <span key={idx}>{formatChartAxisTimestamp(points[idx].label, spanMs)}</span>
