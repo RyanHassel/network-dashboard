@@ -139,8 +139,8 @@ on_error() {
     git) GIT_STATUS="error" ;;
     frontend) FE_STATUS="error" ;;
     backend)
-      [[ "${API_STATUS}" == "running" ]] && API_STATUS="error"
-      [[ "${WORKER_STATUS}" == "running" ]] && WORKER_STATUS="error"
+      if [[ "${API_STATUS}" == "running" ]]; then API_STATUS="error"; fi
+      if [[ "${WORKER_STATUS}" == "running" ]]; then WORKER_STATUS="error"; fi
       ;;
     services) SVC_STATUS="error" ;;
   esac
@@ -332,11 +332,13 @@ if [[ -f backend/Dockerfile && -f frontend/Dockerfile ]]; then
   MESSAGE="Verifying Backend API & service health..."
   write_progress
 
-  local web_port="${WEB_PORT:-}"
+  web_port="${WEB_PORT:-}"
   if [[ -z "${web_port}" && -f "${INSTALL_DIR}/.env" ]]; then
-    web_port="$(awk -F'=' '$1=="WEB_PORT"{sub(/^[^=]*=/,"");print;exit}' "${INSTALL_DIR}/.env" 2>/dev/null || true)"
+    web_port="$(awk -F'=' '$1=="WEB_PORT"{sub(/^[^=]*=/,""); gsub(/["'\''[:space:]]/, ""); val=$0} END{print val}' "${INSTALL_DIR}/.env" 2>/dev/null || true)"
   fi
-  web_port="${web_port:-8080}"
+  if [[ ! "${web_port}" =~ ^[0-9]+$ ]]; then
+    web_port="8080"
+  fi
 
   api_healthy=0
   for i in $(seq 1 35); do
