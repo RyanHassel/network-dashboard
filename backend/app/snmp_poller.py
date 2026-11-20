@@ -150,9 +150,9 @@ def _normalize_mac(raw: Optional[str]) -> Optional[str]:
 
 
 def _parse_sys_descr_metadata(sys_descr: str, vendor_key: str) -> Dict[str, str]:
-    """Extracts hardware model, firmware version, and OS/kernel fallback info from sysDescr."""
+    """Extracts hardware model, firmware version, serial, and OS/kernel fallback info from sysDescr."""
     descr = (sys_descr or "").strip()
-    out = {"hardware_model": "", "firmware_version": "", "os_kernel": ""}
+    out = {"hardware_model": "", "firmware_version": "", "serial_number": "", "os_kernel": ""}
     if not descr:
         return out
 
@@ -185,6 +185,23 @@ def _parse_sys_descr_metadata(sys_descr: str, vendor_key: str) -> Dict[str, str]
         m_cs = re.search(r"\bVersion\s+([0-9A-Za-z()._-]+)", descr, re.I)
         if m_cs:
             out["firmware_version"] = m_cs.group(1).rstrip(",")
+
+    elif vendor_key in ("apc", "cyberpower", "eaton", "ups") or any(
+        kw in descr.lower() for kw in ("apc ", "smart-ups", "back-ups", "ap96")
+    ):
+        m_mn = re.search(r"\bMN:([^\s)]+)", descr)
+        m_pf = re.search(r"\bPF:([^\s)]+)", descr)
+        m_sn = re.search(r"\bSN:([^\s)]+)", descr)
+        if m_mn:
+            out["hardware_model"] = m_mn.group(1).strip()
+        else:
+            m_ups = re.search(r"\b((?:Smart|Back)-UPS(?:\s+[A-Za-z0-9-]+){0,3})", descr, re.I)
+            if m_ups:
+                out["hardware_model"] = m_ups.group(1).strip()
+        if m_pf:
+            out["firmware_version"] = m_pf.group(1).strip()
+        if m_sn:
+            out["serial_number"] = m_sn.group(1).strip()
 
     # Extract Linux kernel + architecture from sysDescr regardless of vendor
     m_linux = re.search(
@@ -371,6 +388,282 @@ def _parse_lm_sensors(lm_data: Dict[str, str]) -> Tuple[Optional[float], List[Di
     return (temp_celsius, sensors)
 
 
+_APC_OUTPUT_STATUS_MAP: Dict[int, str] = {
+    1: "Unknown",
+    2: "On Line",
+    3: "On Battery",
+    4: "On Smart Boost",
+    5: "Timed Sleeping",
+    6: "Software Bypass",
+    7: "Off",
+    8: "Rebooting",
+    9: "Switched Bypass",
+    10: "Hardware Failure Bypass",
+    11: "Sleeping Until Power Return",
+    12: "On Smart Trim",
+    13: "Eco Mode",
+    14: "Hot Standby",
+    15: "On Battery Test",
+}
+
+_RFC_OUTPUT_SOURCE_MAP: Dict[int, str] = {
+    1: "Other",
+    2: "None (Off)",
+    3: "On Line",
+    4: "Bypass",
+    5: "On Battery",
+    6: "On Smart Boost",
+    7: "On Smart Trim",
+}
+
+_APC_BATT_STATUS_MAP: Dict[int, str] = {
+    1: "Unknown",
+    2: "Normal",
+    3: "Low",
+    4: "Fault",
+}
+
+_RFC_BATT_STATUS_MAP: Dict[int, str] = {
+    1: "Unknown",
+    2: "Normal",
+    3: "Low",
+    4: "Depleted",
+}
+
+_APC_TRANSFER_REASON_MAP: Dict[int, str] = {
+    1: "No Transfer",
+    2: "High Line Voltage",
+    3: "Brownout",
+    4: "Blackout",
+    5: "Small Momentary Sag",
+    6: "Deep Momentary Sag",
+    7: "Small Momentary Spike",
+    8: "Large Momentary Spike",
+    9: "Self-Test",
+    10: "Rate of Voltage Change",
+}
+
+_APC_TEST_RESULT_MAP: Dict[int, str] = {
+    1: "Passed",
+    2: "Failed",
+    3: "Invalid",
+    4: "In Progress",
+}
+
+_APC_CALIBRATION_RESULT_MAP: Dict[int, str] = {
+    1: "Passed",
+    2: "Invalid",
+    3: "In Progress",
+}
+
+
+def _parse_ups_telemetry(
+    apc_ident: Dict[str, str],
+    apc_batt: Dict[str, str],
+    apc_in: Dict[str, str],
+    apc_out: Dict[str, str],
+    apc_test: Dict[str, str],
+    std_ups: Dict[str, str],
+) -> Dict[str, Any]:
+    """Parses APC PowerNet-UPS-MIB (.318.1.1.1.{1,2,3,4,7}) and RFC 1628 UPS-MIB (.33.1) telemetry."""
+
+    def _first_valid(candidates: List[Tuple[Optional[str], float]], min_val: float = 0.0) -> Optional[float]:
+        for raw, scale in candidates:
+            if raw is None or str(raw).strip() == "":
+                continue
+            val = _to_float(raw, -99999.0)
+            if val >= min_val:
+                return round(val * scale, 1)
+        return None
+
+    def _first_str(*vals: Optional[str]) -> str:
+        for v in vals:
+            s = str(v or "").strip()
+            if s and "No Such" not in s:
+                return s
+        return ""
+
+    hardware_model = _first_str(apc_ident.get("1.1.0"), std_ups.get("1.2.0"))
+    firmware_version = _first_str(
+        apc_ident.get("2.1.0"), std_ups.get("1.3.0"), std_ups.get("1.4.0")
+    )
+    serial_number = _first_str(apc_ident.get("2.3.0"))
+    sku = _first_str(apc_ident.get("2.5.0"))
+    manufacture_date = _first_str(apc_ident.get("2.2.0"))
+
+    # Operating status
+    out_status_code = _to_int(apc_out.get("1.1.0"), 0)
+    output_status = ""
+    on_battery = False
+    if out_status_code > 0:
+        output_status = _APC_OUTPUT_STATUS_MAP.get(out_status_code, f"Status #{out_status_code}")
+        on_battery = out_status_code in (3, 15)
+    elif std_ups.get("4.1.0"):
+        rfc_code = _to_int(std_ups.get("4.1.0"), 0)
+        output_status = _RFC_OUTPUT_SOURCE_MAP.get(rfc_code, f"Source #{rfc_code}")
+        on_battery = rfc_code == 5
+
+    # Battery metrics
+    batt_status_code = _to_int(apc_batt.get("1.1.0"), 0)
+    battery_status = ""
+    if batt_status_code > 0:
+        battery_status = _APC_BATT_STATUS_MAP.get(batt_status_code, f"Status #{batt_status_code}")
+    elif std_ups.get("2.1.0"):
+        rfc_batt = _to_int(std_ups.get("2.1.0"), 0)
+        battery_status = _RFC_BATT_STATUS_MAP.get(rfc_batt, f"Status #{rfc_batt}")
+
+    replace_code = _to_int(apc_batt.get("2.4.0"), 0)
+    battery_replace_needed = replace_code == 2
+
+    battery_charge_pct = _first_valid(
+        [(apc_batt.get("3.1.0"), 0.1), (apc_batt.get("2.1.0"), 1.0), (std_ups.get("2.4.0"), 1.0)]
+    )
+    battery_temp_c = _first_valid(
+        [(apc_batt.get("3.2.0"), 0.1), (apc_batt.get("2.2.0"), 1.0), (std_ups.get("2.7.0"), 1.0)],
+        min_val=0.1,
+    )
+
+    runtime_remaining_sec: Optional[int] = None
+    if apc_batt.get("2.3.0") is not None:
+        ticks = _parse_timeticks(apc_batt.get("2.3.0"))
+        if ticks > 0 or str(apc_batt.get("2.3.0")).strip().isdigit():
+            runtime_remaining_sec = ticks // 100
+    if runtime_remaining_sec is None and std_ups.get("2.3.0") is not None:
+        mins = _to_int(std_ups.get("2.3.0"), -1)
+        if mins >= 0:
+            runtime_remaining_sec = mins * 60
+
+    time_on_battery_sec = 0
+    if apc_batt.get("1.2.0") is not None:
+        time_on_battery_sec = _parse_timeticks(apc_batt.get("1.2.0")) // 100
+    elif std_ups.get("2.2.0") is not None:
+        time_on_battery_sec = max(0, _to_int(std_ups.get("2.2.0"), 0))
+
+    battery_voltage_v = _first_valid(
+        [(apc_batt.get("3.4.0"), 0.1), (apc_batt.get("2.8.0"), 1.0), (std_ups.get("2.5.0"), 0.1)]
+    )
+    battery_nominal_voltage_v = _first_valid([(apc_batt.get("2.7.0"), 1.0)], min_val=1.0)
+    last_replace_date = _first_str(apc_batt.get("1.3.0"))
+    external_battery_packs = (
+        _to_int(apc_batt.get("2.5.0"), 0) if apc_batt.get("2.5.0") is not None else None
+    )
+    bad_battery_packs = (
+        _to_int(apc_batt.get("2.6.0"), 0) if apc_batt.get("2.6.0") is not None else None
+    )
+
+    # Utility input
+    input_voltage_v = _first_valid(
+        [(apc_in.get("3.1.0"), 0.1), (apc_in.get("2.1.0"), 1.0), (std_ups.get("3.3.1.3.1"), 1.0)]
+    )
+    input_max_voltage_v = _first_valid([(apc_in.get("3.2.0"), 0.1), (apc_in.get("2.2.0"), 1.0)])
+    input_min_voltage_v = _first_valid([(apc_in.get("3.3.0"), 0.1), (apc_in.get("2.3.0"), 1.0)])
+    input_frequency_hz = _first_valid(
+        [(apc_in.get("3.4.0"), 0.1), (apc_in.get("2.4.0"), 1.0), (std_ups.get("3.3.1.2.1"), 0.1)]
+    )
+    transfer_code = _to_int(apc_in.get("2.5.0"), 0)
+    last_transfer_reason = (
+        _APC_TRANSFER_REASON_MAP.get(transfer_code, f"Cause #{transfer_code}")
+        if transfer_code > 0
+        else ""
+    )
+
+    # Output power & load
+    output_voltage_v = _first_valid(
+        [(apc_out.get("3.1.0"), 0.1), (apc_out.get("2.1.0"), 1.0), (std_ups.get("4.4.1.2.1"), 1.0)]
+    )
+    output_frequency_hz = _first_valid(
+        [(apc_out.get("3.2.0"), 0.1), (apc_out.get("2.2.0"), 1.0), (std_ups.get("4.2.0"), 0.1)]
+    )
+    output_load_pct = _first_valid(
+        [(apc_out.get("3.3.0"), 0.1), (apc_out.get("2.3.0"), 1.0), (std_ups.get("4.4.1.5.1"), 1.0)]
+    )
+    output_current_a = _first_valid(
+        [(apc_out.get("3.4.0"), 0.1), (apc_out.get("2.4.0"), 1.0), (std_ups.get("4.4.1.3.1"), 0.1)]
+    )
+    output_watts = _first_valid([(apc_out.get("2.8.0"), 1.0), (std_ups.get("4.4.1.4.1"), 1.0)])
+    output_va = _first_valid([(apc_out.get("2.9.0"), 1.0)])
+    raw_energy = _first_valid([(apc_out.get("2.10.0"), 1.0)], min_val=0.1)
+    energy_kwh = raw_energy if raw_energy is not None and raw_energy > 0 else None
+
+    # Diagnostics & alarms
+    test_code = _to_int(apc_test.get("2.3.0"), 0)
+    self_test_result = _APC_TEST_RESULT_MAP.get(test_code, "") if test_code > 0 else ""
+    self_test_date = _first_str(apc_test.get("2.4.0"))
+    cal_code = _to_int(apc_test.get("2.6.0"), 0)
+    calibration_result = _APC_CALIBRATION_RESULT_MAP.get(cal_code, "") if cal_code > 0 else ""
+    calibration_date = _first_str(apc_test.get("2.7.0"))
+    alarms_present = _to_int(std_ups.get("6.1.0"), 0) if std_ups.get("6.1.0") is not None else 0
+
+    return {
+        "hardware_model": hardware_model,
+        "firmware_version": firmware_version,
+        "serial_number": serial_number,
+        "sku": sku,
+        "manufacture_date": manufacture_date,
+        "output_status": output_status,
+        "output_status_code": out_status_code,
+        "on_battery": on_battery,
+        "battery_status": battery_status,
+        "battery_replace_needed": battery_replace_needed,
+        "battery_charge_pct": battery_charge_pct,
+        "battery_temp_c": battery_temp_c,
+        "runtime_remaining_sec": runtime_remaining_sec,
+        "time_on_battery_sec": time_on_battery_sec,
+        "battery_voltage_v": battery_voltage_v,
+        "battery_nominal_voltage_v": battery_nominal_voltage_v,
+        "last_replace_date": last_replace_date,
+        "external_battery_packs": external_battery_packs,
+        "bad_battery_packs": bad_battery_packs,
+        "input_voltage_v": input_voltage_v,
+        "input_max_voltage_v": input_max_voltage_v,
+        "input_min_voltage_v": input_min_voltage_v,
+        "input_frequency_hz": input_frequency_hz,
+        "last_transfer_reason": last_transfer_reason,
+        "output_voltage_v": output_voltage_v,
+        "output_frequency_hz": output_frequency_hz,
+        "output_load_pct": output_load_pct,
+        "output_current_a": output_current_a,
+        "output_watts": output_watts,
+        "output_va": output_va,
+        "energy_kwh": energy_kwh,
+        "self_test_result": self_test_result,
+        "self_test_date": self_test_date,
+        "calibration_result": calibration_result,
+        "calibration_date": calibration_date,
+        "alarms_present": alarms_present,
+    }
+
+
+def _parse_printer_supplies(prt_mib: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Extracts toner/drum/ink supply levels from Printer-MIB::prtMarkerSuppliesTable (11.1.1.*)."""
+    supplies: List[Dict[str, Any]] = []
+    if not prt_mib:
+        return supplies
+    indices = {
+        k[len("11.1.1.6.") :]
+        for k in prt_mib.keys()
+        if k.startswith("11.1.1.6.") and k[len("11.1.1.6.") :]
+    }
+    for s_idx in sorted(indices):
+        descr = (prt_mib.get(f"11.1.1.6.{s_idx}") or "").strip()
+        if not descr:
+            continue
+        max_cap = _to_int(prt_mib.get(f"11.1.1.8.{s_idx}"), 0)
+        level = _to_int(prt_mib.get(f"11.1.1.9.{s_idx}"), -1)
+        pct: Optional[float] = None
+        if max_cap > 0 and level >= 0:
+            pct = round(min(100.0, max(0.0, (level / max_cap) * 100.0)), 1)
+        supplies.append(
+            {
+                "name": descr,
+                "level": level,
+                "max_capacity": max_cap,
+                "pct": pct,
+            }
+        )
+    return supplies[:16]
+
+
 class SNMPPoller:
     """Asynchronous SNMPv2c/v3 GETBULK collector with Vendor MIB fingerprinting & enrichment."""
 
@@ -431,6 +724,7 @@ class SNMPPoller:
         snmp_timeout: int = 2,
         retries: int = 1,
         sem: Optional[asyncio.Semaphore] = None,
+        stats: Optional[Dict[str, int]] = None,
     ) -> Dict[str, str]:
         clean_base = base_oid.strip().lstrip(".")
         walker = "snmpwalk" if auth_args and auth_args[0] == "-v1" else "snmpbulkwalk"
@@ -452,6 +746,8 @@ class SNMPPoller:
         ]
 
         async def _exec() -> Dict[str, str]:
+            if stats is not None:
+                stats["walks"] = stats.get("walks", 0) + 1
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -476,6 +772,8 @@ class SNMPPoller:
                         result[idx] = val_str
                     elif oid_str == f".{clean_base}":
                         result["0"] = val_str
+                if stats is not None and result:
+                    stats["oids"] = stats.get("oids", 0) + len(result)
                 return result
             except Exception as exc:
                 logger.debug("SNMP walk failed on %s (%s): %s", target, clean_base, exc)
@@ -494,8 +792,10 @@ class SNMPPoller:
         vendor_key: str,
         matched_mibs: List[str],
         sys_descr: str = "",
+        sys_name: str = "",
         redis_client: Optional[aioredis.Redis] = None,
         sem: Optional[asyncio.Semaphore] = None,
+        poll_stats: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         """Walks universal & vendor-matched MIB trees to extract hardware/OS/sensor/LLDP details."""
         (
@@ -511,17 +811,17 @@ class SNMPPoller:
             lldp_loc_chassis,
             bridge_mac,
         ) = await asyncio.gather(
-            self._snmp_walk_oid(target, port, auth_args, OID_ENT_PHYSICAL, timeout=5.0, sem=sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_HR_STORAGE, timeout=5.0, sem=sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_HR_SYSTEM, timeout=4.0, sem=sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_UCD_MEMORY, timeout=4.0, sem=sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_UCD_LOAD, timeout=4.0, sem=sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_UCD_CPU, timeout=4.0, sem=sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_UCD_DISK, timeout=4.0, sem=sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_LM_SENSORS, timeout=4.0, sem=sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_LLDP_REM, timeout=5.0, sem=sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_LLDP_LOC_CHASSIS, timeout=3.0, sem=sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_BRIDGE_MAC, timeout=3.0, sem=sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_ENT_PHYSICAL, timeout=5.0, sem=sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_HR_STORAGE, timeout=5.0, sem=sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_HR_SYSTEM, timeout=4.0, sem=sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_UCD_MEMORY, timeout=4.0, sem=sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_UCD_LOAD, timeout=4.0, sem=sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_UCD_CPU, timeout=4.0, sem=sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_UCD_DISK, timeout=4.0, sem=sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_LM_SENSORS, timeout=4.0, sem=sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_LLDP_REM, timeout=5.0, sem=sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_LLDP_LOC_CHASSIS, timeout=3.0, sem=sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_BRIDGE_MAC, timeout=3.0, sem=sem, stats=poll_stats),
         )
 
         active_mibs = list(matched_mibs)
@@ -543,6 +843,8 @@ class SNMPPoller:
         lldp_neighbors: List[Dict[str, Any]] = []
         wireless_radios: List[Dict[str, Any]] = []
         vendor_scalars: Dict[str, Any] = {}
+        ups_telemetry: Optional[Dict[str, Any]] = None
+        printer_supplies: List[Dict[str, Any]] = []
         temp_celsius: Optional[float] = None
         cpu_pct: Optional[float] = None
         mem_pct: Optional[float] = None
@@ -765,11 +1067,13 @@ class SNMPPoller:
                     )
 
         # 6. Vendor-Specific Enterprise MIB Walks
+        is_ups_hint = vendor_key in ("apc", "cyberpower", "eaton", "ups") or "ups" in f"{sys_descr} {sys_name}".lower()
+
         if vendor_key == "ubiquiti":
             ubnt_sys, ubnt_vap, frog_mem = await asyncio.gather(
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.6.3", timeout=3.0, sem=sem),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.6.1.2.1", timeout=3.0, sem=sem),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.10002.1.1.1.1", timeout=3.0, sem=sem),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.6.3", timeout=3.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.6.1.2.1", timeout=3.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.10002.1.1.1.1", timeout=3.0, sem=sem, stats=poll_stats),
             )
             if ubnt_sys or ubnt_vap:
                 _mark_mib("UBNT-UniFi-MIB")
@@ -815,9 +1119,9 @@ class SNMPPoller:
 
         elif vendor_key == "mikrotik":
             mt_hl, mt_lic, mt_sys = await asyncio.gather(
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.3", timeout=3.0, sem=sem),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.4", timeout=3.0, sem=sem),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.7", timeout=3.0, sem=sem),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.3", timeout=3.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.4", timeout=3.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.7", timeout=3.0, sem=sem, stats=poll_stats),
             )
             if mt_hl or mt_lic or mt_sys:
                 _mark_mib("MIKROTIK-MIB")
@@ -853,9 +1157,9 @@ class SNMPPoller:
 
         elif vendor_key == "synology":
             syno_sys, syno_disk, syno_raid = await asyncio.gather(
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.6574.1", timeout=3.0, sem=sem),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.6574.2.1.1", timeout=3.0, sem=sem),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.6574.3.1.1", timeout=3.0, sem=sem),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.6574.1", timeout=3.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.6574.2.1.1", timeout=3.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.6574.3.1.1", timeout=3.0, sem=sem, stats=poll_stats),
             )
             if syno_sys:
                 _mark_mib("SYNOLOGY-SYSTEM-MIB")
@@ -900,8 +1204,8 @@ class SNMPPoller:
 
         elif vendor_key == "cisco":
             c_cpu, c_env = await asyncio.gather(
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.109.1.1.1.1", timeout=3.0, sem=sem),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.13.1.3.1", timeout=3.0, sem=sem),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.109.1.1.1.1", timeout=3.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.13.1.3.1", timeout=3.0, sem=sem, stats=poll_stats),
             )
             if c_cpu:
                 _mark_mib("CISCO-PROCESS-MIB")
@@ -924,7 +1228,7 @@ class SNMPPoller:
 
         elif vendor_key == "fortinet":
             fg_sys = await self._snmp_walk_oid(
-                target, port, auth_args, "1.3.6.1.4.1.12356.101.4.1", timeout=3.0, sem=sem
+                target, port, auth_args, "1.3.6.1.4.1.12356.101.4.1", timeout=3.0, sem=sem, stats=poll_stats
             )
             if fg_sys:
                 _mark_mib("FORTINET-FORTIGATE-MIB")
@@ -935,53 +1239,104 @@ class SNMPPoller:
                 if ses > 0:
                     vendor_scalars["Active Firewall Sessions"] = ses
 
-        elif vendor_key in ("apc", "cyberpower", "eaton"):
-            apc_ups, std_ups = await asyncio.gather(
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.318.1.1.1", timeout=3.0, sem=sem),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.2.1.33.1", timeout=3.0, sem=sem),
+        elif is_ups_hint:
+            apc_ident, apc_batt, apc_in, apc_out, apc_test, std_ups = await asyncio.gather(
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.318.1.1.1.1", timeout=6.0, snmp_timeout=3, retries=2, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.318.1.1.1.2", timeout=6.0, snmp_timeout=3, retries=2, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.318.1.1.1.3", timeout=6.0, snmp_timeout=3, retries=2, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.318.1.1.1.4", timeout=6.0, snmp_timeout=3, retries=2, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.318.1.1.1.7", timeout=6.0, snmp_timeout=3, retries=2, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.2.1.33.1", timeout=6.0, snmp_timeout=3, retries=2, sem=sem, stats=poll_stats),
             )
-            if apc_ups:
+            if apc_ident or apc_batt or apc_in or apc_out or apc_test:
                 _mark_mib("PowerNet-UPS-MIB")
-                hardware_model = apc_ups.get("1.1.1.0") or hardware_model
-                b_cap = _to_float(apc_ups.get("2.2.1.0"))
-                b_temp = _to_float(apc_ups.get("2.2.2.0"))
-                in_v = _to_float(apc_ups.get("3.2.1.0"))
-                out_load = _to_float(apc_ups.get("4.2.3.0"))
-                if b_cap > 0:
-                    sensors.append({"name": "Battery Charge", "category": "UPS", "value": f"{b_cap:.0f}%", "status": "ok"})
-                if b_temp > 0:
-                    temp_celsius = b_temp
-                    sensors.append({"name": "Battery Temp", "category": "Temperature", "value": f"{b_temp:.0f} °C", "status": "ok"})
-                if in_v > 0:
-                    sensors.append({"name": "Input Line Voltage", "category": "Voltage", "value": f"{in_v:.0f} VAC", "status": "ok"})
-                if out_load >= 0:
-                    sensors.append({"name": "UPS Output Load", "category": "Load", "value": f"{out_load:.0f}%", "status": "ok"})
             if std_ups:
                 _mark_mib("UPS-MIB")
-                b_chg = _to_float(std_ups.get("2.4.0"))
-                b_min = _to_int(std_ups.get("2.3.0"))
-                if b_chg > 0:
-                    sensors.append({"name": "Battery Charge", "category": "UPS", "value": f"{b_chg:.0f}%", "status": "ok"})
-                if b_min > 0:
-                    vendor_scalars["Estimated Runtime"] = f"{b_min} mins"
+
+            if apc_ident or apc_batt or apc_in or apc_out or apc_test or std_ups:
+                ups_telemetry = _parse_ups_telemetry(
+                    apc_ident, apc_batt, apc_in, apc_out, apc_test, std_ups
+                )
+                hardware_model = ups_telemetry["hardware_model"] or hardware_model
+                firmware_version = ups_telemetry["firmware_version"] or firmware_version
+                serial_number = ups_telemetry["serial_number"] or serial_number
+                if ups_telemetry["battery_temp_c"] is not None:
+                    temp_celsius = ups_telemetry["battery_temp_c"]
+
+                seen_sensors = {s.get("name") for s in sensors}
+                def _add_ups_sensor(name: str, category: str, value: str, status: str = "ok") -> None:
+                    if name not in seen_sensors:
+                        seen_sensors.add(name)
+                        sensors.append({"name": name, "category": category, "value": value, "status": status})
+
+                if ups_telemetry["battery_charge_pct"] is not None:
+                    b_val = ups_telemetry["battery_charge_pct"]
+                    _add_ups_sensor("Battery Charge", "UPS", f"{b_val:g}%", "warning" if b_val < 50 else "ok")
+                if ups_telemetry["battery_temp_c"] is not None:
+                    bt = ups_telemetry["battery_temp_c"]
+                    _add_ups_sensor("Battery Temp", "Temperature", f"{bt:g} °C", "warning" if bt >= 45 else "ok")
+                if ups_telemetry["input_voltage_v"] is not None:
+                    iv = ups_telemetry["input_voltage_v"]
+                    _add_ups_sensor("Input Line Voltage", "Voltage", f"{iv:g} VAC", "warning" if iv < 95 else "ok")
+                if ups_telemetry["output_voltage_v"] is not None:
+                    ov = ups_telemetry["output_voltage_v"]
+                    _add_ups_sensor("Output Voltage", "Voltage", f"{ov:g} VAC", "ok")
+                if ups_telemetry["output_load_pct"] is not None:
+                    ol = ups_telemetry["output_load_pct"]
+                    _add_ups_sensor("UPS Output Load", "Load", f"{ol:g}%", "warning" if ol >= 80 else "ok")
+                if ups_telemetry["output_watts"] is not None:
+                    _add_ups_sensor("Output Power", "Power", f"{ups_telemetry['output_watts']:g} W", "ok")
+                if ups_telemetry["battery_voltage_v"] is not None:
+                    _add_ups_sensor("Battery Bus Voltage", "Voltage", f"{ups_telemetry['battery_voltage_v']:g} VDC", "ok")
+
+                if ups_telemetry["output_status"]:
+                    vendor_scalars["UPS Status"] = ups_telemetry["output_status"]
+                if ups_telemetry["runtime_remaining_sec"] is not None:
+                    rt_m = ups_telemetry["runtime_remaining_sec"] // 60
+                    vendor_scalars["Estimated Runtime"] = f"{rt_m} mins"
+                if ups_telemetry["time_on_battery_sec"] > 0:
+                    vendor_scalars["Time on Battery"] = f"{ups_telemetry['time_on_battery_sec']}s"
+                if ups_telemetry["last_transfer_reason"]:
+                    vendor_scalars["Last Transfer Cause"] = ups_telemetry["last_transfer_reason"]
+                if ups_telemetry["self_test_result"]:
+                    vendor_scalars["Self-Test Result"] = ups_telemetry["self_test_result"]
 
         elif vendor_key == "printer":
-            prt_mib = await self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.2.1.43", timeout=3.0, sem=sem)
+            prt_mib = await self._snmp_walk_oid(
+                target, port, auth_args, "1.3.6.1.2.1.43", timeout=4.0, sem=sem, stats=poll_stats
+            )
             if prt_mib:
                 _mark_mib("Printer-MIB")
                 pages = _to_int(prt_mib.get("10.2.1.4.1.1"))
                 if pages > 0:
                     vendor_scalars["Total Lifetime Pages Printed"] = pages
                 serial_number = prt_mib.get("5.1.1.17.1") or serial_number
+                printer_supplies = _parse_printer_supplies(prt_mib)
 
-        # Apply sysDescr fallback extraction (UDM-Pro, switches, APs, Linux kernels, etc.)
+        # Apply sysDescr fallback extraction (UDM-Pro, switches, APs, APC NMC, Linux kernels, etc.)
         descr_meta = _parse_sys_descr_metadata(sys_descr, vendor_key)
         if not hardware_model and descr_meta["hardware_model"]:
             hardware_model = descr_meta["hardware_model"]
         if not firmware_version and not software_version and descr_meta["firmware_version"]:
             firmware_version = descr_meta["firmware_version"]
+        if not serial_number and descr_meta["serial_number"]:
+            serial_number = descr_meta["serial_number"]
         if descr_meta["os_kernel"]:
             vendor_scalars["OS / Kernel"] = descr_meta["os_kernel"]
+
+        ext_payload: Dict[str, Any] = {
+            "cpu_details": cpu_details,
+            "memory_details": memory_details,
+            "storage_volumes": storage_volumes[:24],
+            "sensors": sensors[:32],
+            "lldp_neighbors": lldp_neighbors[:32],
+            "wireless_radios": wireless_radios[:16],
+            "vendor_scalars": vendor_scalars,
+        }
+        if ups_telemetry is not None:
+            ext_payload["ups_telemetry"] = ups_telemetry
+        if printer_supplies:
+            ext_payload["printer_supplies"] = printer_supplies
 
         return {
             "active_mibs": active_mibs,
@@ -997,15 +1352,7 @@ class SNMPPoller:
             "ubnt_uptime_ticks": ubnt_uptime_ticks,
             "lldp_chassis_mac": lldp_chassis_mac,
             "bridge_mac": bridge_mac_norm,
-            "extended_metrics": {
-                "cpu_details": cpu_details,
-                "memory_details": memory_details,
-                "storage_volumes": storage_volumes[:24],
-                "sensors": sensors[:32],
-                "lldp_neighbors": lldp_neighbors[:32],
-                "wireless_radios": wireless_radios[:16],
-                "vendor_scalars": vendor_scalars,
-            },
+            "extended_metrics": ext_payload,
         }
 
     async def _poll_single_device(
@@ -1017,11 +1364,16 @@ class SNMPPoller:
         target = str(target_cfg["device_ip"]).strip()
         label = str(target_cfg.get("label") or "").strip()
         port = int(target_cfg.get("port") or self.default_port)
+        snmp_version = str(target_cfg.get("version") or self.default_version).strip().lower()
         auth_args = self._build_auth_args(target_cfg)
+        poll_stats: Dict[str, int] = {"walks": 0, "oids": 0}
 
         start_ts = time.perf_counter()
-        sys_scalars = await self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.2.1.1")
+        sys_scalars = await self._snmp_walk_oid(
+            target, port, auth_args, "1.3.6.1.2.1.1", stats=poll_stats
+        )
         if not sys_scalars:
+            fail_ms = round((time.perf_counter() - start_ts) * 1000.0, 2)
             async with pool.acquire() as conn:
                 await conn.execute(
                     """
@@ -1035,6 +1387,23 @@ class SNMPPoller:
                     target,
                     label or target,
                 )
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO snmp_poll_metrics (
+                            time, device_ip, success, poll_duration_ms, oid_walks,
+                            oids_collected, interfaces_ingested, responding_mib_count,
+                            snmp_version, error_message
+                        ) VALUES (NOW(), $1, FALSE, $2, $3, 0, 0, 0, $4, $5)
+                        """,
+                        target,
+                        fail_ms,
+                        poll_stats["walks"],
+                        snmp_version,
+                        "No SNMP response (timeout or auth mismatch)",
+                    )
+                except Exception:
+                    pass
             return None
 
         sys_descr = sys_scalars.get("1.0", "")
@@ -1072,21 +1441,21 @@ class SNMPPoller:
             cpu_loads,
             enrichment,
         ) = await asyncio.gather(
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_NAME, sem=dev_sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_DESCR, sem=dev_sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_ALIAS, sem=dev_sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_HIGH_SPEED, sem=dev_sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_SPEED, sem=dev_sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_PHYS_ADDR, sem=dev_sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_OPER_STATUS, sem=dev_sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_HC_IN_OCTETS, sem=dev_sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_HC_OUT_OCTETS, sem=dev_sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_IN_ERRORS, sem=dev_sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_OUT_ERRORS, sem=dev_sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_IN_DISCARDS, sem=dev_sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_OUT_DISCARDS, sem=dev_sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_IP_ADDR_TABLE, sem=dev_sem),
-            self._snmp_walk_oid(target, port, auth_args, OID_HR_PROC_LOAD, sem=dev_sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_NAME, sem=dev_sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_DESCR, sem=dev_sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_ALIAS, sem=dev_sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_HIGH_SPEED, sem=dev_sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_SPEED, sem=dev_sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_PHYS_ADDR, sem=dev_sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_OPER_STATUS, sem=dev_sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_HC_IN_OCTETS, sem=dev_sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_HC_OUT_OCTETS, sem=dev_sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_IN_ERRORS, sem=dev_sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_OUT_ERRORS, sem=dev_sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_IN_DISCARDS, sem=dev_sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_OUT_DISCARDS, sem=dev_sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_IP_ADDR_TABLE, sem=dev_sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_HR_PROC_LOAD, sem=dev_sem, stats=poll_stats),
             self._collect_vendor_enrichment(
                 target,
                 port,
@@ -1094,8 +1463,10 @@ class SNMPPoller:
                 vendor_profile["key"],
                 base_mibs,
                 sys_descr=sys_descr,
+                sys_name=sys_name,
                 redis_client=redis_client,
                 sem=dev_sem,
+                poll_stats=poll_stats,
             ),
         )
 
@@ -1103,8 +1474,8 @@ class SNMPPoller:
         used_counter_bits = 64
         if not hc_in and not hc_out:
             hc_in, hc_out = await asyncio.gather(
-                self._snmp_walk_oid(target, port, auth_args, OID_IF_IN_OCTETS, sem=dev_sem),
-                self._snmp_walk_oid(target, port, auth_args, OID_IF_OUT_OCTETS, sem=dev_sem),
+                self._snmp_walk_oid(target, port, auth_args, OID_IF_IN_OCTETS, sem=dev_sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, OID_IF_OUT_OCTETS, sem=dev_sem, stats=poll_stats),
             )
             if hc_in or hc_out:
                 used_counter_bits = 32
@@ -1404,6 +1775,59 @@ class SNMPPoller:
                     """,
                     rows_to_insert,
                 )
+
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO snmp_poll_metrics (
+                        time, device_ip, success, poll_duration_ms, oid_walks,
+                        oids_collected, interfaces_ingested, responding_mib_count,
+                        snmp_version, error_message
+                    ) VALUES (NOW(), $1, TRUE, $2, $3, $4, $5, $6, $7, '')
+                    """,
+                    target,
+                    poll_ms,
+                    poll_stats["walks"],
+                    poll_stats["oids"],
+                    len(rows_to_insert),
+                    len(responding_mibs),
+                    snmp_version,
+                )
+            except Exception as exc:
+                logger.debug("snmp_poll_metrics insert skipped: %s", exc)
+
+            ups_t = enrichment["extended_metrics"].get("ups_telemetry")
+            if isinstance(ups_t, dict) and any(
+                ups_t.get(k) is not None
+                for k in (
+                    "battery_charge_pct",
+                    "output_load_pct",
+                    "input_voltage_v",
+                    "runtime_remaining_sec",
+                    "output_watts",
+                )
+            ):
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO ups_metrics_raw (
+                            time, device_ip, battery_charge_pct, output_load_pct,
+                            runtime_remaining_sec, input_voltage_v, output_voltage_v,
+                            output_watts, battery_temp_c, output_status
+                        ) VALUES (NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        """,
+                        target,
+                        ups_t.get("battery_charge_pct"),
+                        ups_t.get("output_load_pct"),
+                        ups_t.get("runtime_remaining_sec"),
+                        ups_t.get("input_voltage_v"),
+                        ups_t.get("output_voltage_v"),
+                        ups_t.get("output_watts"),
+                        ups_t.get("battery_temp_c"),
+                        ups_t.get("output_status") or "",
+                    )
+                except Exception as exc:
+                    logger.debug("ups_metrics_raw insert skipped: %s", exc)
 
         return {
             "device_ip": target,

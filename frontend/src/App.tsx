@@ -1,13 +1,17 @@
 import React, { useEffect, useId, useRef, useState } from "react";
 import {
   Activity,
+  AlertTriangle,
   ArrowDown,
   ArrowDownRight,
   ArrowLeft,
   ArrowUp,
   ArrowUpDown,
   ArrowUpRight,
+  Battery,
+  BatteryCharging,
   Check,
+  CheckCircle2,
   ChevronDown,
   Clock,
   Cpu,
@@ -23,6 +27,7 @@ import {
   Network,
   Play,
   Plus,
+  Printer,
   RefreshCw,
   Router,
   Search,
@@ -30,8 +35,10 @@ import {
   Settings,
   ShieldCheck,
   Terminal,
+  Thermometer,
   Trash2,
   X,
+  Zap,
 } from "lucide-react";
 
 type TabKey = "pulse" | "devices" | "snmp" | "scanner" | "syslog" | "targets" | "settings";
@@ -229,6 +236,7 @@ interface UnifiedDeviceItem {
   mac_address: string | null;
   vendor: string | null;
   device_category?: string | null;
+  device_profile_type?: string;
   matched_mibs?: string[];
   subnet_cidr: string | null;
   vlan_id: number | null;
@@ -246,6 +254,123 @@ interface UnifiedDeviceItem {
   sources: string[];
   log_count_24h: number;
   last_seen: string | null;
+}
+
+interface UPSTelemetry {
+  hardware_model?: string;
+  firmware_version?: string;
+  serial_number?: string;
+  sku?: string;
+  manufacture_date?: string;
+  output_status?: string;
+  output_status_code?: number;
+  on_battery?: boolean;
+  battery_status?: string;
+  battery_replace_needed?: boolean;
+  battery_charge_pct?: number | null;
+  battery_temp_c?: number | null;
+  runtime_remaining_sec?: number | null;
+  time_on_battery_sec?: number;
+  battery_voltage_v?: number | null;
+  battery_nominal_voltage_v?: number | null;
+  last_replace_date?: string;
+  external_battery_packs?: number | null;
+  bad_battery_packs?: number | null;
+  input_voltage_v?: number | null;
+  input_max_voltage_v?: number | null;
+  input_min_voltage_v?: number | null;
+  input_frequency_hz?: number | null;
+  last_transfer_reason?: string;
+  output_voltage_v?: number | null;
+  output_frequency_hz?: number | null;
+  output_load_pct?: number | null;
+  output_current_a?: number | null;
+  output_watts?: number | null;
+  output_va?: number | null;
+  energy_kwh?: number | null;
+  self_test_result?: string;
+  self_test_date?: string;
+  calibration_result?: string;
+  calibration_date?: string;
+  alarms_present?: number;
+}
+
+interface UPSHistoryPoint {
+  time: string;
+  battery_charge_pct: number | null;
+  output_load_pct: number | null;
+  runtime_remaining_sec: number | null;
+  input_voltage_v: number | null;
+  output_voltage_v: number | null;
+  output_watts: number | null;
+  battery_temp_c: number | null;
+}
+
+interface PrinterSupply {
+  name: string;
+  level: number;
+  max_capacity: number;
+  pct: number | null;
+}
+
+interface SNMPTelemetrySeriesPoint {
+  time: string;
+  oids_collected: number;
+  interface_samples: number;
+  oid_walks: number;
+  avg_latency_ms: number;
+  max_latency_ms: number;
+  polls_ok: number;
+  polls_failed: number;
+  devices_polled: number;
+}
+
+interface SNMPTelemetryTarget {
+  device_ip: string;
+  sys_name: string;
+  vendor_name: string;
+  device_category: string;
+  device_profile_type: string;
+  enabled: boolean;
+  is_reachable: boolean | null;
+  snmp_version: string;
+  profile_name: string;
+  interface_count: number;
+  responding_mib_count: number;
+  responding_mibs: string[];
+  last_poll_duration_ms: number;
+  avg_latency_ms: number;
+  oids_per_poll: number;
+  walks_per_poll: number;
+  success_rate_pct: number;
+  failed_polls: number;
+  last_polled: string | null;
+}
+
+interface SNMPTelemetryPayload {
+  range: string;
+  summary: {
+    enabled_targets: number;
+    reachable_targets: number;
+    unreachable_targets: number;
+    total_polls: number;
+    successful_polls: number;
+    failed_polls: number;
+    success_rate_pct: number;
+    total_walks: number;
+    total_oids_ingested: number;
+    total_interface_samples: number;
+    oids_per_min: number;
+    avg_latency_ms: number;
+    p95_latency_ms: number;
+    max_latency_ms: number;
+    total_interfaces_tracked: number;
+    raw_table_rows_24h: number;
+    active_mibs_fleet: string[];
+    version_breakdown: Record<string, number>;
+  };
+  series: SNMPTelemetrySeriesPoint[];
+  targets: SNMPTelemetryTarget[];
 }
 
 interface DeviceDetailPayload {
@@ -349,12 +474,15 @@ interface DeviceDetailPayload {
         if_name: string;
         mac_address: string;
       }>;
+      ups_telemetry?: UPSTelemetry | null;
+      printer_supplies?: PrinterSupply[];
       vendor_scalars?: Record<string, string | number>;
     } | null;
     is_reachable: boolean;
     last_poll_duration_ms: number;
     last_polled: string | null;
   } | null;
+  device_profile_type?: "ups" | "nas" | "printer" | "network" | "server" | string;
   matched_mib_profile?: {
     vendor_name?: string;
     vendor?: string;
@@ -601,6 +729,19 @@ function formatUptime(sec: number | undefined | null): string {
   return `${m}m`;
 }
 
+function formatDurationCompact(sec: number | undefined | null): string {
+  if (sec == null || Number.isNaN(Number(sec))) return "—";
+  const s = Math.floor(Number(sec));
+  if (s <= 0) return "0s";
+  if (s < 60) return `${s}s`;
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
 function ipv4ToSortNumber(ip: string): number {
   const parts = (ip || "").split(".");
   if (parts.length !== 4) return Number.MAX_SAFE_INTEGER;
@@ -826,6 +967,17 @@ const DualAreaSparkChart: React.FC<{
   liveWindowMs?: number;
   showYAxis?: boolean;
   fixedMaxBps?: number | null;
+  primaryLabel?: string;
+  secondaryLabel?: string;
+  primaryShortLabel?: string;
+  secondaryShortLabel?: string;
+  primaryColor?: string;
+  secondaryColor?: string;
+  yAxisLabel?: string;
+  formatValue?: (val: number) => string;
+  formatAxisTick?: (val: number) => string;
+  emptyMessage?: string;
+  hideSecondary?: boolean;
 }> = ({
   points,
   height = 210,
@@ -833,7 +985,23 @@ const DualAreaSparkChart: React.FC<{
   liveWindowMs = 120_000,
   showYAxis = false,
   fixedMaxBps = null,
+  primaryLabel = "Download (RX)",
+  secondaryLabel = "Upload (TX)",
+  primaryShortLabel = "Download",
+  secondaryShortLabel = "Upload",
+  primaryColor = "#10B981",
+  secondaryColor = "#38BDF8",
+  yAxisLabel = "Mbps",
+  formatValue,
+  formatAxisTick,
+  emptyMessage = "Waiting for time-series samples...",
+  hideSecondary = false,
 }) => {
+  const isDefaultBps = !formatValue;
+  const formatVal = formatValue ?? formatBps;
+  const formatTick = formatAxisTick ?? formatAxisMbps;
+  const hideSecondaryRef = useRef<boolean>(hideSecondary);
+  hideSecondaryRef.current = hideSecondary;
   const rawId = useId();
   const gradPrefix = rawId.replace(/[^a-zA-Z0-9_-]/g, "");
   const rxGradId = `rxGrad-${gradPrefix}`;
@@ -975,7 +1143,7 @@ const DualAreaSparkChart: React.FC<{
           const s = samples[i];
           if (s.ts < winStart - sampleGapRef.current) continue;
           if (s.ts > winEnd + sampleGapRef.current) break;
-          const m = Math.max(s.inVal, s.outVal, s.p95In);
+          const m = hideSecondaryRef.current ? s.inVal : Math.max(s.inVal, s.outVal, s.p95In);
           if (m > visMax) visMax = m;
         }
         const targetMax = Math.max(1000, visMax * 1.12);
@@ -1003,7 +1171,7 @@ const DualAreaSparkChart: React.FC<{
         style={{ height }}
         className="flex items-center justify-center rounded-lg border border-slate-800/80 bg-[#0B101B] text-xs text-slate-500"
       >
-        Waiting for time-series samples...
+        {emptyMessage}
       </div>
     );
   }
@@ -1058,7 +1226,7 @@ const DualAreaSparkChart: React.FC<{
 
     let peakNow = 0;
     for (const s of visibleSlice) {
-      const m = Math.max(s.inVal, s.outVal, s.p95In);
+      const m = hideSecondary ? s.inVal : Math.max(s.inVal, s.outVal, s.p95In);
       if (m > peakNow) peakNow = m;
     }
     observedPeakBps = peakNow;
@@ -1094,9 +1262,14 @@ const DualAreaSparkChart: React.FC<{
   } else {
     observedPeakBps = Math.max(
       0,
-      ...points.map((p) => Math.max(p.inVal, p.outVal, p.p95In || 0)),
+      ...points.map((p) => (hideSecondary ? p.inVal : Math.max(p.inVal, p.outVal, p.p95In || 0))),
     );
-    maxVal = fixedMaxBps && fixedMaxBps > 0 ? fixedMaxBps : Math.max(1000, observedPeakBps);
+    maxVal =
+      fixedMaxBps && fixedMaxBps > 0
+        ? fixedMaxBps
+        : isDefaultBps
+          ? Math.max(1000, observedPeakBps)
+          : Math.max(1, observedPeakBps * 1.1);
     const firstTs = new Date(points[0].label).getTime();
     const lastTs = new Date(points[points.length - 1].label).getTime();
     spanMs =
@@ -1196,7 +1369,7 @@ const DualAreaSparkChart: React.FC<{
     const leftX = cursorX - tooltipW - 14;
     const rawBoxX = rightX + tooltipW <= rectW - 4 ? rightX : leftX;
     const boxX = Math.min(Math.max(4, rawBoxX), Math.max(4, rectW - tooltipW - 4));
-    const topDotY = (Math.min(inY, outY) / height) * rectH;
+    const topDotY = ((hideSecondary ? inY : Math.min(inY, outY)) / height) * rectH;
     const boxY = Math.min(Math.max(4, topDotY - 20), Math.max(4, rectH - tooltipH - 4));
 
     return {
@@ -1247,21 +1420,33 @@ const DualAreaSparkChart: React.FC<{
         <div className="flex items-center gap-4">
           {showYAxis && (
             <span className="w-12 text-right font-mono-tabular text-[11px] font-medium uppercase tracking-wider text-slate-500">
-              Mbps
+              {yAxisLabel}
             </span>
           )}
           <span className="flex items-center gap-1.5">
-            <span className="h-2 w-2 rounded-full bg-emerald-400" />
-            Download (RX)
+            <span
+              className="h-2 w-2 rounded-full"
+              style={{ backgroundColor: primaryColor }}
+            />
+            {primaryLabel}
           </span>
-          <span className="flex items-center gap-1.5">
-            <span className="h-2 w-2 rounded-full bg-sky-400" />
-            Upload (TX)
-          </span>
+          {!hideSecondary && (
+            <span className="flex items-center gap-1.5">
+              <span
+                className="h-2 w-2 rounded-full"
+                style={{ backgroundColor: secondaryColor }}
+              />
+              {secondaryLabel}
+            </span>
+          )}
         </div>
         <span className="font-mono-tabular text-slate-300">
-          Peak: {formatBps(observedPeakBps)}
-          {fixedMaxBps && fixedMaxBps > 0 ? ` / ${formatAxisMbps(fixedMaxBps)} Mbps` : ""}
+          Peak: {formatVal(observedPeakBps)}
+          {fixedMaxBps && fixedMaxBps > 0
+            ? isDefaultBps
+              ? ` / ${formatAxisMbps(fixedMaxBps)} Mbps`
+              : ` / ${formatVal(fixedMaxBps)}`
+            : ""}
         </span>
       </div>
 
@@ -1275,7 +1460,7 @@ const DualAreaSparkChart: React.FC<{
                   style={{ top: `${((topPad + plotSpanY * r) / height) * 100}%` }}
                   className="absolute right-1.5 -translate-y-1/2 leading-none"
                 >
-                  {formatAxisMbps(r === 1 ? 0 : maxVal * (1 - r))}
+                  {formatTick(r === 1 ? 0 : maxVal * (1 - r))}
                 </span>
               ))}
             </div>
@@ -1298,12 +1483,12 @@ const DualAreaSparkChart: React.FC<{
             >
               <defs>
                 <linearGradient id={rxGradId} x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#10B981" stopOpacity="0.32" />
-                  <stop offset="100%" stopColor="#10B981" stopOpacity="0.0" />
+                  <stop offset="0%" stopColor={primaryColor} stopOpacity="0.32" />
+                  <stop offset="100%" stopColor={primaryColor} stopOpacity="0.0" />
                 </linearGradient>
                 <linearGradient id={txGradId} x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#38BDF8" stopOpacity="0.26" />
-                  <stop offset="100%" stopColor="#38BDF8" stopOpacity="0.0" />
+                  <stop offset="0%" stopColor={secondaryColor} stopOpacity="0.26" />
+                  <stop offset="100%" stopColor={secondaryColor} stopOpacity="0.0" />
                 </linearGradient>
                 <clipPath id={clipId}>
                   <rect x={0} y={0} width={width} height={height} />
@@ -1342,23 +1527,25 @@ const DualAreaSparkChart: React.FC<{
               ))}
               <g clipPath={`url(#${clipId})`}>
                 {inSpline.areaPath && <path d={inSpline.areaPath} fill={`url(#${rxGradId})`} />}
-                {outSpline.areaPath && <path d={outSpline.areaPath} fill={`url(#${txGradId})`} />}
+                {!hideSecondary && outSpline.areaPath && (
+                  <path d={outSpline.areaPath} fill={`url(#${txGradId})`} />
+                )}
                 {inSpline.linePath && (
                   <path
                     d={inSpline.linePath}
                     fill="none"
-                    stroke="#10B981"
+                    stroke={primaryColor}
                     strokeWidth="2.2"
                     strokeLinecap="round"
                     strokeLinejoin="round"
                     vectorEffect="non-scaling-stroke"
                   />
                 )}
-                {outSpline.linePath && (
+                {!hideSecondary && outSpline.linePath && (
                   <path
                     d={outSpline.linePath}
                     fill="none"
-                    stroke="#38BDF8"
+                    stroke={secondaryColor}
                     strokeWidth="2"
                     strokeLinecap="round"
                     strokeLinejoin="round"
@@ -1382,10 +1569,12 @@ const DualAreaSparkChart: React.FC<{
                   }}
                 />
 
-                {/* Hover-only markers on Download & Upload curves */}
+                {/* Hover-only markers on primary & secondary curves */}
                 <div
-                  className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-emerald-400 ring-2 ring-[#0B101B] shadow-[0_0_8px_rgba(16,185,129,0.85)] motion-reduce:transition-none"
+                  className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-[#0B101B] motion-reduce:transition-none"
                   style={{
+                    backgroundColor: primaryColor,
+                    boxShadow: `0 0 8px ${primaryColor}`,
                     left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
                     top: `${(displayedHover.inYFrac * 100).toFixed(3)}%`,
                     opacity: isHovering ? 1 : 0,
@@ -1394,21 +1583,25 @@ const DualAreaSparkChart: React.FC<{
                       : "opacity 180ms ease-out",
                   }}
                 />
-                <div
-                  className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-sky-400 ring-2 ring-[#0B101B] shadow-[0_0_8px_rgba(56,189,248,0.85)] motion-reduce:transition-none"
-                  style={{
-                    left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
-                    top: `${(displayedHover.outYFrac * 100).toFixed(3)}%`,
-                    opacity: isHovering ? 1 : 0,
-                    transition: smoothPosTransition
-                      ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
-                      : "opacity 180ms ease-out",
-                  }}
-                />
+                {!hideSecondary && (
+                  <div
+                    className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-[#0B101B] motion-reduce:transition-none"
+                    style={{
+                      backgroundColor: secondaryColor,
+                      boxShadow: `0 0 8px ${secondaryColor}`,
+                      left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
+                      top: `${(displayedHover.outYFrac * 100).toFixed(3)}%`,
+                      opacity: isHovering ? 1 : 0,
+                      transition: smoothPosTransition
+                        ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
+                        : "opacity 180ms ease-out",
+                    }}
+                  />
+                )}
 
-                {/* Smooth floating Download / Upload tooltip box */}
+                {/* Smooth floating tooltip box */}
                 <div
-                  className="pointer-events-none absolute top-0 left-0 z-20 w-[204px] will-change-transform motion-reduce:transition-none"
+                  className="pointer-events-none absolute top-0 left-0 z-20 w-[212px] will-change-transform motion-reduce:transition-none"
                   style={{
                     transform: `translate3d(${displayedHover.boxX.toFixed(1)}px, ${displayedHover.boxY.toFixed(1)}px, 0)`,
                     transition: smoothPosTransition
@@ -1429,22 +1622,36 @@ const DualAreaSparkChart: React.FC<{
                     <div className="space-y-1">
                       <div className="flex items-center justify-between gap-2">
                         <span className="flex items-center gap-1.5 text-slate-300">
-                          <span className="h-2 w-2 rounded-full bg-emerald-400" />
-                          Download
+                          <span
+                            className="h-2 w-2 rounded-full"
+                            style={{ backgroundColor: primaryColor }}
+                          />
+                          {primaryShortLabel}
                         </span>
-                        <span className="font-mono-tabular font-semibold text-emerald-400">
-                          {formatBps(displayedHover.inVal)}
-                        </span>
-                      </div>
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="flex items-center gap-1.5 text-slate-300">
-                          <span className="h-2 w-2 rounded-full bg-sky-400" />
-                          Upload
-                        </span>
-                        <span className="font-mono-tabular font-semibold text-sky-400">
-                          {formatBps(displayedHover.outVal)}
+                        <span
+                          className="font-mono-tabular font-semibold"
+                          style={{ color: primaryColor }}
+                        >
+                          {formatVal(displayedHover.inVal)}
                         </span>
                       </div>
+                      {!hideSecondary && (
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="flex items-center gap-1.5 text-slate-300">
+                            <span
+                              className="h-2 w-2 rounded-full"
+                              style={{ backgroundColor: secondaryColor }}
+                            />
+                            {secondaryShortLabel}
+                          </span>
+                          <span
+                            className="font-mono-tabular font-semibold"
+                            style={{ color: secondaryColor }}
+                          >
+                            {formatVal(displayedHover.outVal)}
+                          </span>
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -1605,11 +1812,24 @@ export const App: React.FC = () => {
   >([]);
   const [loadingOverviewRange, setLoadingOverviewRange] = useState(false);
   const [interfaces, setInterfaces] = useState<SNMPInterface[]>([]);
-  const [selectedDeviceIp, setSelectedDeviceIp] = useState<string>("");
-  const [selectedIfIndex, setSelectedIfIndex] = useState<number>(1);
-  const [trendRange, setTrendRange] = useState<string>("24h");
-  const [trendSourceTable, setTrendSourceTable] = useState<string>("snmp_metrics_raw");
-  const [trendSeries, setTrendSeries] = useState<SNMPTrendPoint[]>([]);
+  const [snmpTelemetry, setSnmpTelemetry] = useState<SNMPTelemetryPayload | null>(null);
+  const [snmpTelemetryRange, setSnmpTelemetryRange] = useState<"1h" | "6h" | "24h" | "7d" | "30d">(
+    "24h",
+  );
+  const snmpTelemetryRangeRef = useRef<"1h" | "6h" | "24h" | "7d" | "30d">("24h");
+  snmpTelemetryRangeRef.current = snmpTelemetryRange;
+  const [snmpChartMode, setSnmpChartMode] = useState<"ingestion" | "latency" | "polls">(
+    "ingestion",
+  );
+  const [snmpPortFilterIp, setSnmpPortFilterIp] = useState<string>("");
+  const [pollingAllSnmp, setPollingAllSnmp] = useState(false);
+  const [upsHistory, setUpsHistory] = useState<UPSHistoryPoint[]>([]);
+  const [upsHistoryRange, setUpsHistoryRange] = useState<"1h" | "6h" | "24h" | "7d" | "30d">(
+    "24h",
+  );
+  const [upsChartMode, setUpsChartMode] = useState<"battery_load" | "voltage" | "runtime" | "watts">(
+    "battery_load",
+  );
 
   const [subnets, setSubnets] = useState<string[]>([]);
   const [selectedSubnet, setSelectedSubnet] = useState<string>("");
@@ -1804,6 +2024,14 @@ export const App: React.FC = () => {
         } else {
           setDetailTrendSeries([]);
         }
+        if (
+          data.device_profile_type === "ups" ||
+          Boolean(data.snmp_system?.extended_metrics?.ups_telemetry)
+        ) {
+          fetchUpsHistory(ip, upsHistoryRange);
+        } else {
+          setUpsHistory([]);
+        }
       }
     } finally {
       setLoadingDeviceDetail(false);
@@ -1827,6 +2055,8 @@ export const App: React.FC = () => {
   const openDevicePage = (ip: string) => {
     setSelectedDeviceDetailIp(ip);
     setDetailIfIndex(0);
+    setUpsHistory([]);
+    setUpsChartMode("battery_load");
     setActiveTab("devices");
     fetchDeviceDetail(ip, true);
   };
@@ -2436,26 +2666,49 @@ export const App: React.FC = () => {
         const data = await r.json();
         const list: SNMPInterface[] = data.interfaces || [];
         setInterfaces(list);
-        if (!selectedDeviceIp && list.length > 0) {
-          setSelectedDeviceIp(list[0].device_ip);
-          setSelectedIfIndex(list[0].if_index);
-        }
       }
     } catch {
       // ignore
     }
   };
 
-  const fetchTrends = async (devIp: string, ifIdx: number, rk: string) => {
-    if (!devIp) return;
+  const fetchSnmpTelemetry = async (rk?: string) => {
+    const targetRange = rk ?? snmpTelemetryRangeRef.current;
+    try {
+      const r = await fetch(`/api/snmp/telemetry?range=${encodeURIComponent(targetRange)}`);
+      if (r.ok) {
+        const data: SNMPTelemetryPayload = await r.json();
+        setSnmpTelemetry(data);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handlePollAllSnmp = async () => {
+    setPollingAllSnmp(true);
+    try {
+      await fetch("/api/snmp/poll-all", { method: "POST" });
+      setTimeout(() => {
+        fetchSnmpTelemetry();
+        fetchInterfaces();
+        fetchAllDevices();
+        setPollingAllSnmp(false);
+      }, 4000);
+    } catch {
+      setPollingAllSnmp(false);
+    }
+  };
+
+  const fetchUpsHistory = async (ip: string, rk = upsHistoryRange) => {
+    if (!ip) return;
     try {
       const r = await fetch(
-        `/api/snmp/trends?device_ip=${encodeURIComponent(devIp)}&if_index=${ifIdx}&range=${rk}`,
+        `/api/devices/${encodeURIComponent(ip)}/ups-history?range=${encodeURIComponent(rk)}`,
       );
       if (r.ok) {
         const data = await r.json();
-        setTrendSeries(data.series || []);
-        setTrendSourceTable(data.source_table || "snmp_metrics_raw");
+        setUpsHistory(data.series || []);
       }
     } catch {
       // ignore
@@ -2519,6 +2772,7 @@ export const App: React.FC = () => {
     fetchOverview();
     fetchAllDevices();
     fetchInterfaces();
+    fetchSnmpTelemetry(snmpTelemetryRange);
     fetchScanner();
     fetchLogs();
     fetchUpdateStatus(false);
@@ -2533,7 +2787,10 @@ export const App: React.FC = () => {
         fetchAllDevices();
         if (selectedDeviceDetailIp) fetchDeviceDetail(selectedDeviceDetailIp);
       }
-      if (activeTab === "snmp") fetchInterfaces();
+      if (activeTab === "snmp") {
+        fetchInterfaces();
+        fetchSnmpTelemetry(snmpTelemetryRange);
+      }
       if (activeTab === "scanner") fetchScanner();
       if (activeTab === "syslog") fetchLogs();
       if (activeTab === "settings") fetchServerInfo(false);
@@ -2551,6 +2808,7 @@ export const App: React.FC = () => {
     activeTab,
     overviewGraphMode,
     selectedDeviceDetailIp,
+    snmpTelemetryRange,
     logsPaused,
     logSeverity,
     logSourceIp,
@@ -2564,10 +2822,18 @@ export const App: React.FC = () => {
   }, [overviewGraphMode]);
 
   useEffect(() => {
-    if (selectedDeviceIp && selectedIfIndex >= 0) {
-      fetchTrends(selectedDeviceIp, selectedIfIndex, trendRange);
+    fetchSnmpTelemetry(snmpTelemetryRange);
+  }, [snmpTelemetryRange]);
+
+  useEffect(() => {
+    if (
+      selectedDeviceDetailIp &&
+      (deviceDetail?.device_profile_type === "ups" ||
+        Boolean(deviceDetail?.snmp_system?.extended_metrics?.ups_telemetry))
+    ) {
+      fetchUpsHistory(selectedDeviceDetailIp, upsHistoryRange);
     }
-  }, [selectedDeviceIp, selectedIfIndex, trendRange]);
+  }, [selectedDeviceDetailIp, upsHistoryRange, deviceDetail?.device_profile_type]);
 
   useEffect(() => {
     if (selectedDeviceDetailIp && detailIfIndex >= 0) {
@@ -2865,6 +3131,7 @@ export const App: React.FC = () => {
           if (msg.type === "snmp_update") {
             fetchOverview();
             fetchInterfaces();
+            fetchSnmpTelemetry();
             fetchAllDevices();
           }
           if (msg.type === "scanner_update") {
@@ -3153,6 +3420,16 @@ export const App: React.FC = () => {
     setActiveTab(tabId);
     setNavMenuOpen(false);
   };
+
+  const detailProfileType =
+    deviceDetail?.device_profile_type ||
+    (deviceDetail?.snmp_system?.extended_metrics?.ups_telemetry ? "ups" : "network");
+  const detailUps = deviceDetail?.snmp_system?.extended_metrics?.ups_telemetry || null;
+  const detailPrinterSupplies =
+    deviceDetail?.snmp_system?.extended_metrics?.printer_supplies || [];
+  const hasUpsWatts =
+    detailUps?.output_watts != null || upsHistory.some((p) => p.output_watts != null);
+  const activeUpsChartMode = upsChartMode === "watts" && !hasUpsWatts ? "battery_load" : upsChartMode;
 
   return (
     <div className="min-h-screen bg-[#090D16] text-slate-100">
@@ -4501,9 +4778,34 @@ export const App: React.FC = () => {
                         ? "ONLINE"
                         : "OFFLINE"}
                     </span>
+                    {detailProfileType === "ups" ? (
+                      <span className="inline-flex items-center gap-1 rounded border border-amber-500/30 bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-300">
+                        <BatteryCharging className="h-3 w-3" /> UPS / Power Backup
+                      </span>
+                    ) : detailProfileType === "nas" ? (
+                      <span className="inline-flex items-center gap-1 rounded border border-violet-500/30 bg-violet-500/15 px-2 py-0.5 text-[11px] font-medium text-violet-300">
+                        <HardDrive className="h-3 w-3" /> NAS / Storage
+                      </span>
+                    ) : detailProfileType === "printer" ? (
+                      <span className="inline-flex items-center gap-1 rounded border border-fuchsia-500/30 bg-fuchsia-500/15 px-2 py-0.5 text-[11px] font-medium text-fuchsia-300">
+                        <Printer className="h-3 w-3" /> Network Printer
+                      </span>
+                    ) : detailProfileType === "server" ? (
+                      <span className="inline-flex items-center gap-1 rounded border border-sky-500/30 bg-sky-500/15 px-2 py-0.5 text-[11px] font-medium text-sky-300">
+                        <Server className="h-3 w-3" /> Server / Host
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 rounded border border-cyan-500/30 bg-cyan-500/15 px-2 py-0.5 text-[11px] font-medium text-cyan-300">
+                        <Network className="h-3 w-3" /> Network Device
+                      </span>
+                    )}
                   </div>
                   <p className="text-xs text-slate-400">
-                    Complete Polled Telemetry — Discovery, SNMP System & Interfaces, and Syslogs
+                    {detailProfileType === "ups"
+                      ? "UPS Power, Battery Health, Runtime Telemetry, Management Interface & Syslogs"
+                      : detailProfileType === "printer"
+                        ? "Printer Toner & Supply Levels, SNMP Counters, and Syslogs"
+                        : "Complete Polled Telemetry — Discovery, SNMP System & Interfaces, and Syslogs"}
                   </p>
                 </div>
               </div>
@@ -4773,16 +5075,35 @@ export const App: React.FC = () => {
                                   : "—"}
                             </dd>
                           </div>
-                          <div>
-                            <dt className="text-slate-400">CPU, RAM & Temperature</dt>
-                            <dd className="mt-0.5 font-mono-tabular text-slate-200">
-                              CPU {deviceDetail.snmp_system.cpu_usage_pct?.toFixed(1) || "0.0"}% •
-                              RAM {deviceDetail.snmp_system.mem_usage_pct?.toFixed(1) || "0.0"}%
-                              {deviceDetail.snmp_system.temp_celsius != null
-                                ? ` • ${deviceDetail.snmp_system.temp_celsius}°C`
-                                : ""}
-                            </dd>
-                          </div>
+                          {detailProfileType === "ups" && detailUps ? (
+                            <div>
+                              <dt className="text-slate-400">UPS Power & Battery Summary</dt>
+                              <dd className="mt-0.5 font-mono-tabular text-slate-200">
+                                {detailUps.output_status || "Unknown"} • Batt{" "}
+                                {detailUps.battery_charge_pct != null
+                                  ? `${detailUps.battery_charge_pct}%`
+                                  : "—"}{" "}
+                                • Load{" "}
+                                {detailUps.output_load_pct != null
+                                  ? `${detailUps.output_load_pct}%`
+                                  : "—"}
+                                {detailUps.battery_temp_c != null
+                                  ? ` • ${detailUps.battery_temp_c}°C`
+                                  : ""}
+                              </dd>
+                            </div>
+                          ) : (
+                            <div>
+                              <dt className="text-slate-400">CPU, RAM & Temperature</dt>
+                              <dd className="mt-0.5 font-mono-tabular text-slate-200">
+                                CPU {deviceDetail.snmp_system.cpu_usage_pct?.toFixed(1) || "0.0"}% •
+                                RAM {deviceDetail.snmp_system.mem_usage_pct?.toFixed(1) || "0.0"}%
+                                {deviceDetail.snmp_system.temp_celsius != null
+                                  ? ` • ${deviceDetail.snmp_system.temp_celsius}°C`
+                                  : ""}
+                              </dd>
+                            </div>
+                          )}
                           <div>
                             <dt className="text-slate-400">Location & Contact</dt>
                             <dd className="mt-0.5 text-slate-300">
@@ -4845,6 +5166,562 @@ export const App: React.FC = () => {
                     )}
                   </div>
                 </div>
+
+                {/* UPS Power, Battery & Runtime Dashboard */}
+                {(detailProfileType === "ups" || detailUps !== null) && (
+                  <div className="space-y-5 rounded-xl border border-slate-800 bg-[#111827] p-5">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="flex flex-wrap items-center gap-2.5">
+                        <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
+                          <BatteryCharging className="h-4 w-4 text-amber-400" />
+                          UPS Power, Battery &amp; Runtime Telemetry
+                        </h3>
+                        {detailUps?.output_status && (
+                          <span
+                            className={`rounded border px-2 py-0.5 font-mono-tabular text-[11px] font-medium ${
+                              detailUps.on_battery
+                                ? "border-rose-500/40 bg-rose-500/15 text-rose-300"
+                                : detailUps.output_status.toLowerCase().includes("on line")
+                                  ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
+                                  : "border-amber-500/40 bg-amber-500/15 text-amber-300"
+                            }`}
+                          >
+                            {detailUps.output_status}
+                          </span>
+                        )}
+                        {detailUps?.battery_status && (
+                          <span
+                            className={`rounded border px-2 py-0.5 font-mono-tabular text-[11px] font-medium ${
+                              detailUps.battery_status.toLowerCase() === "normal"
+                                ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+                                : detailUps.battery_status.toLowerCase() === "low" ||
+                                    detailUps.battery_status.toLowerCase() === "fault" ||
+                                    detailUps.battery_status.toLowerCase() === "depleted"
+                                  ? "border-rose-500/40 bg-rose-500/15 text-rose-300"
+                                  : "border-slate-700 bg-slate-800 text-slate-300"
+                            }`}
+                          >
+                            Battery: {detailUps.battery_status}
+                          </span>
+                        )}
+                        {detailUps?.sku && (
+                          <span className="rounded border border-slate-700 bg-[#090D16] px-2 py-0.5 font-mono-tabular text-[11px] text-slate-300">
+                            {detailUps.sku}
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        {detailUps?.on_battery && (
+                          <span className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/15 px-2.5 py-1 text-[11px] font-semibold text-amber-300">
+                            <Zap className="h-3.5 w-3.5" /> Running on Battery Power
+                          </span>
+                        )}
+                        {detailUps?.battery_replace_needed && (
+                          <span className="inline-flex items-center gap-1 rounded border border-rose-500/40 bg-rose-500/15 px-2.5 py-1 text-[11px] font-semibold text-rose-300">
+                            <AlertTriangle className="h-3.5 w-3.5" /> Replace Battery Needed
+                          </span>
+                        )}
+                        {(detailUps?.alarms_present ?? 0) > 0 && (
+                          <span className="inline-flex items-center gap-1 rounded border border-rose-500/40 bg-rose-500/15 px-2.5 py-1 text-[11px] font-semibold text-rose-300">
+                            <AlertTriangle className="h-3.5 w-3.5" />
+                            {detailUps?.alarms_present} Active Alarm
+                            {(detailUps?.alarms_present ?? 0) === 1 ? "" : "s"}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {!detailUps ? (
+                      <div className="rounded-lg border border-slate-800 bg-[#090D16] p-5 text-center text-xs text-slate-400">
+                        Waiting for UPS SNMP MIB telemetry (<code>PowerNet-UPS-MIB</code> /{" "}
+                        <code>UPS-MIB</code>). Click{" "}
+                        <strong className="text-white">Poll SNMP Now</strong> above to collect power
+                        and battery readings.
+                      </div>
+                    ) : (
+                      <>
+                        {/* 4 UPS KPI Progress Cards */}
+                        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+                          {/* Card 1: Battery Charge & Health */}
+                          <div className="rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                            <div className="flex items-center justify-between text-xs text-slate-400">
+                              <span className="flex items-center gap-1.5">
+                                <Battery className="h-3.5 w-3.5 text-emerald-400" />
+                                Battery Charge &amp; Health
+                              </span>
+                              {detailUps.battery_temp_c != null && (
+                                <span className="inline-flex items-center gap-1 font-mono-tabular text-[11px] text-slate-300">
+                                  <Thermometer className="h-3 w-3 text-amber-400" />
+                                  {detailUps.battery_temp_c.toFixed(1)}°C
+                                </span>
+                              )}
+                            </div>
+                            <div className="mt-2 font-mono-tabular text-2xl font-bold text-white">
+                              {detailUps.battery_charge_pct != null
+                                ? `${detailUps.battery_charge_pct.toFixed(0)}%`
+                                : "—"}
+                            </div>
+                            <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+                              <div
+                                className={`h-full rounded-full transition-all ${
+                                  (detailUps.battery_charge_pct ?? 0) >= 80
+                                    ? "bg-emerald-500"
+                                    : (detailUps.battery_charge_pct ?? 0) >= 40
+                                      ? "bg-amber-500"
+                                      : "bg-rose-500"
+                                }`}
+                                style={{
+                                  width: `${Math.min(100, Math.max(0, detailUps.battery_charge_pct ?? 0))}%`,
+                                }}
+                              />
+                            </div>
+                            <div className="mt-3 space-y-1 text-[11px] text-slate-400">
+                              <div className="flex justify-between">
+                                <span>Bus Voltage</span>
+                                <span className="font-mono-tabular text-slate-200">
+                                  {detailUps.battery_voltage_v != null
+                                    ? `${detailUps.battery_voltage_v} VDC`
+                                    : "—"}
+                                  {detailUps.battery_nominal_voltage_v != null
+                                    ? ` / ${detailUps.battery_nominal_voltage_v}V nom`
+                                    : ""}
+                                </span>
+                              </div>
+                              {(detailUps.external_battery_packs != null ||
+                                detailUps.bad_battery_packs != null) && (
+                                <div className="flex justify-between">
+                                  <span>Battery Packs</span>
+                                  <span className="font-mono-tabular text-slate-200">
+                                    {detailUps.external_battery_packs ?? 0} ext •{" "}
+                                    <span
+                                      className={
+                                        (detailUps.bad_battery_packs ?? 0) > 0
+                                          ? "text-rose-400"
+                                          : "text-emerald-400"
+                                      }
+                                    >
+                                      {detailUps.bad_battery_packs ?? 0} bad
+                                    </span>
+                                  </span>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Card 2: Estimated Runtime */}
+                          <div className="rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                            <div className="flex items-center justify-between text-xs text-slate-400">
+                              <span className="flex items-center gap-1.5">
+                                <Clock className="h-3.5 w-3.5 text-sky-400" />
+                                Estimated Runtime
+                              </span>
+                            </div>
+                            <div className="mt-2 font-mono-tabular text-2xl font-bold text-white">
+                              {formatDurationCompact(detailUps.runtime_remaining_sec)}
+                            </div>
+                            <div className="mt-3 space-y-1 text-[11px] text-slate-400">
+                              <div className="flex justify-between">
+                                <span>Time on Battery</span>
+                                <span
+                                  className={`font-mono-tabular ${
+                                    (detailUps.time_on_battery_sec ?? 0) > 0
+                                      ? "font-semibold text-amber-300"
+                                      : "text-slate-200"
+                                  }`}
+                                >
+                                  {detailUps.time_on_battery_sec && detailUps.time_on_battery_sec > 0
+                                    ? formatDurationCompact(detailUps.time_on_battery_sec)
+                                    : "0s (On Utility AC)"}
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span>Battery State</span>
+                                <span className="font-mono-tabular text-slate-200">
+                                  {detailUps.battery_status || "—"}
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span>Last Replaced</span>
+                                <span className="font-mono-tabular text-slate-200">
+                                  {detailUps.last_replace_date || "—"}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Card 3: Output Load & Power */}
+                          <div className="rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                            <div className="flex items-center justify-between text-xs text-slate-400">
+                              <span className="flex items-center gap-1.5">
+                                <Zap className="h-3.5 w-3.5 text-amber-400" />
+                                Output Load &amp; Power
+                              </span>
+                              {detailUps.output_watts != null && (
+                                <span className="font-mono-tabular text-[11px] font-semibold text-amber-300">
+                                  {detailUps.output_watts} W
+                                </span>
+                              )}
+                            </div>
+                            <div className="mt-2 font-mono-tabular text-2xl font-bold text-white">
+                              {detailUps.output_load_pct != null
+                                ? `${detailUps.output_load_pct.toFixed(0)}%`
+                                : "—"}
+                            </div>
+                            <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+                              <div
+                                className={`h-full rounded-full transition-all ${
+                                  (detailUps.output_load_pct ?? 0) < 70
+                                    ? "bg-emerald-500"
+                                    : (detailUps.output_load_pct ?? 0) < 85
+                                      ? "bg-amber-500"
+                                      : "bg-rose-500"
+                                }`}
+                                style={{
+                                  width: `${Math.min(100, Math.max(0, detailUps.output_load_pct ?? 0))}%`,
+                                }}
+                              />
+                            </div>
+                            <div className="mt-3 space-y-1 text-[11px] text-slate-400">
+                              <div className="flex justify-between">
+                                <span>Real / Apparent</span>
+                                <span className="font-mono-tabular text-slate-200">
+                                  {detailUps.output_watts != null ? `${detailUps.output_watts} W` : "—"}
+                                  {detailUps.output_va != null ? ` / ${detailUps.output_va} VA` : ""}
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span>Output Current</span>
+                                <span className="font-mono-tabular text-slate-200">
+                                  {detailUps.output_current_a != null
+                                    ? `${detailUps.output_current_a} A`
+                                    : "—"}
+                                </span>
+                              </div>
+                              {detailUps.energy_kwh != null && (
+                                <div className="flex justify-between">
+                                  <span>Cumulative Energy</span>
+                                  <span className="font-mono-tabular text-slate-200">
+                                    {detailUps.energy_kwh} kWh
+                                  </span>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Card 4: AC Input & Output Line */}
+                          <div className="rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                            <div className="flex items-center justify-between text-xs text-slate-400">
+                              <span className="flex items-center gap-1.5">
+                                <Activity className="h-3.5 w-3.5 text-sky-400" />
+                                AC Input &amp; Output Line
+                              </span>
+                            </div>
+                            <div className="mt-2 font-mono-tabular text-xl font-bold text-white">
+                              {detailUps.input_voltage_v != null
+                                ? `${detailUps.input_voltage_v}V`
+                                : "—"}{" "}
+                              <span className="text-slate-500">→</span>{" "}
+                              {detailUps.output_voltage_v != null
+                                ? `${detailUps.output_voltage_v}V`
+                                : "—"}
+                            </div>
+                            <div className="mt-3 space-y-1 text-[11px] text-slate-400">
+                              <div className="flex justify-between">
+                                <span>Line Min / Max</span>
+                                <span className="font-mono-tabular text-slate-200">
+                                  {detailUps.input_min_voltage_v != null
+                                    ? detailUps.input_min_voltage_v
+                                    : "—"}
+                                  –
+                                  {detailUps.input_max_voltage_v != null
+                                    ? detailUps.input_max_voltage_v
+                                    : "—"}{" "}
+                                  VAC
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span>Freq In / Out</span>
+                                <span className="font-mono-tabular text-slate-200">
+                                  {detailUps.input_frequency_hz != null
+                                    ? detailUps.input_frequency_hz
+                                    : "—"}{" "}
+                                  /{" "}
+                                  {detailUps.output_frequency_hz != null
+                                    ? detailUps.output_frequency_hz
+                                    : "—"}{" "}
+                                  Hz
+                                </span>
+                              </div>
+                              <div className="flex justify-between gap-2">
+                                <span>Last Transfer</span>
+                                <span className="truncate font-mono-tabular text-slate-200">
+                                  {detailUps.last_transfer_reason || "—"}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* UPS Power & Battery Historical Chart */}
+                        <div className="space-y-3 rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                          <div className="flex flex-wrap items-center justify-between gap-3">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => setUpsChartMode("battery_load")}
+                                className={`rounded-md border px-2.5 py-1 text-xs font-medium transition ${
+                                  activeUpsChartMode === "battery_load"
+                                    ? "border-emerald-500/50 bg-emerald-600 text-white"
+                                    : "border-slate-700 bg-[#111827] text-slate-300 hover:bg-slate-800"
+                                }`}
+                              >
+                                Battery &amp; Load (%)
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setUpsChartMode("voltage")}
+                                className={`rounded-md border px-2.5 py-1 text-xs font-medium transition ${
+                                  activeUpsChartMode === "voltage"
+                                    ? "border-sky-500/50 bg-sky-600 text-white"
+                                    : "border-slate-700 bg-[#111827] text-slate-300 hover:bg-slate-800"
+                                }`}
+                              >
+                                AC Voltage (VAC)
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setUpsChartMode("runtime")}
+                                className={`rounded-md border px-2.5 py-1 text-xs font-medium transition ${
+                                  activeUpsChartMode === "runtime"
+                                    ? "border-emerald-500/50 bg-emerald-600 text-white"
+                                    : "border-slate-700 bg-[#111827] text-slate-300 hover:bg-slate-800"
+                                }`}
+                              >
+                                Runtime (min)
+                              </button>
+                              {hasUpsWatts && (
+                                <button
+                                  type="button"
+                                  onClick={() => setUpsChartMode("watts")}
+                                  className={`rounded-md border px-2.5 py-1 text-xs font-medium transition ${
+                                    activeUpsChartMode === "watts"
+                                      ? "border-amber-500/50 bg-amber-600 text-white"
+                                      : "border-slate-700 bg-[#111827] text-slate-300 hover:bg-slate-800"
+                                  }`}
+                                >
+                                  Power (W)
+                                </button>
+                              )}
+                            </div>
+
+                            <div className="flex items-center gap-1 rounded-lg border border-slate-800 bg-[#111827] p-1">
+                              {(["1h", "6h", "24h", "7d", "30d"] as const).map((rk) => (
+                                <button
+                                  key={rk}
+                                  type="button"
+                                  onClick={() => setUpsHistoryRange(rk)}
+                                  className={`rounded px-2.5 py-1 font-mono-tabular text-xs font-medium uppercase transition ${
+                                    upsHistoryRange === rk
+                                      ? "bg-amber-600 text-white"
+                                      : "text-slate-400 hover:text-slate-200"
+                                  }`}
+                                >
+                                  {rk}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
+                          {activeUpsChartMode === "battery_load" && (
+                            <DualAreaSparkChart
+                              showYAxis
+                              fixedMaxBps={100}
+                              primaryLabel="Battery Charge (%)"
+                              secondaryLabel="UPS Load (%)"
+                              primaryShortLabel="Battery"
+                              secondaryShortLabel="Load"
+                              primaryColor="#10B981"
+                              secondaryColor="#F59E0B"
+                              yAxisLabel="%"
+                              formatValue={(v) => `${v.toFixed(1)}%`}
+                              formatAxisTick={(v) => `${Math.round(v)}%`}
+                              emptyMessage="Collecting UPS battery & load time-series samples..."
+                              points={upsHistory.map((pt) => ({
+                                label: pt.time,
+                                inVal: pt.battery_charge_pct ?? 0,
+                                outVal: pt.output_load_pct ?? 0,
+                              }))}
+                            />
+                          )}
+                          {activeUpsChartMode === "voltage" && (
+                            <DualAreaSparkChart
+                              showYAxis
+                              primaryLabel="Utility Input (VAC)"
+                              secondaryLabel="UPS Output (VAC)"
+                              primaryShortLabel="Input"
+                              secondaryShortLabel="Output"
+                              primaryColor="#38BDF8"
+                              secondaryColor="#10B981"
+                              yAxisLabel="VAC"
+                              formatValue={(v) => `${v.toFixed(1)} V`}
+                              formatAxisTick={(v) => String(Math.round(v))}
+                              emptyMessage="Collecting UPS line voltage time-series samples..."
+                              points={upsHistory.map((pt) => ({
+                                label: pt.time,
+                                inVal: pt.input_voltage_v ?? 0,
+                                outVal: pt.output_voltage_v ?? 0,
+                              }))}
+                            />
+                          )}
+                          {activeUpsChartMode === "runtime" && (
+                            <DualAreaSparkChart
+                              showYAxis
+                              hideSecondary
+                              primaryLabel="Estimated Runtime (min)"
+                              primaryShortLabel="Runtime"
+                              primaryColor="#10B981"
+                              yAxisLabel="min"
+                              formatValue={(v) => formatDurationCompact(Math.round(v * 60))}
+                              formatAxisTick={(v) => `${Math.round(v)}m`}
+                              emptyMessage="Collecting UPS runtime time-series samples..."
+                              points={upsHistory.map((pt) => ({
+                                label: pt.time,
+                                inVal:
+                                  pt.runtime_remaining_sec != null
+                                    ? pt.runtime_remaining_sec / 60
+                                    : 0,
+                                outVal: 0,
+                              }))}
+                            />
+                          )}
+                          {activeUpsChartMode === "watts" && (
+                            <DualAreaSparkChart
+                              showYAxis
+                              hideSecondary
+                              primaryLabel="Output Power (W)"
+                              primaryShortLabel="Power"
+                              primaryColor="#F59E0B"
+                              yAxisLabel="W"
+                              formatValue={(v) => `${v.toFixed(0)} W`}
+                              formatAxisTick={(v) => String(Math.round(v))}
+                              emptyMessage="Collecting UPS wattage time-series samples..."
+                              points={upsHistory.map((pt) => ({
+                                label: pt.time,
+                                inVal: pt.output_watts ?? 0,
+                                outVal: 0,
+                              }))}
+                            />
+                          )}
+                        </div>
+
+                        {/* Battery Maintenance, Self-Test & Calibration Diagnostics */}
+                        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                          <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3 text-xs">
+                            <div className="text-slate-400">Self-Test Result</div>
+                            <div className="mt-1 flex items-center gap-1.5 font-mono-tabular font-semibold text-white">
+                              {detailUps.self_test_result?.toLowerCase() === "passed" && (
+                                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+                              )}
+                              <span>{detailUps.self_test_result || "—"}</span>
+                            </div>
+                            <div className="mt-0.5 font-mono-tabular text-[11px] text-slate-400">
+                              {detailUps.self_test_date ? `Date: ${detailUps.self_test_date}` : "No date"}
+                            </div>
+                          </div>
+
+                          <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3 text-xs">
+                            <div className="text-slate-400">Runtime Calibration</div>
+                            <div className="mt-1 font-mono-tabular font-semibold text-white">
+                              {detailUps.calibration_result || "—"}
+                            </div>
+                            <div className="mt-0.5 font-mono-tabular text-[11px] text-slate-400">
+                              {detailUps.calibration_date
+                                ? `Date: ${detailUps.calibration_date}`
+                                : "No date"}
+                            </div>
+                          </div>
+
+                          <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3 text-xs">
+                            <div className="text-slate-400">UPS Model / Mfg Date</div>
+                            <div className="mt-1 truncate font-mono-tabular font-semibold text-white">
+                              {detailUps.hardware_model || detailUps.sku || "—"}
+                            </div>
+                            <div className="mt-0.5 font-mono-tabular text-[11px] text-slate-400">
+                              {detailUps.manufacture_date
+                                ? `Mfg: ${detailUps.manufacture_date}`
+                                : detailUps.serial_number
+                                  ? `SN: ${detailUps.serial_number}`
+                                  : "—"}
+                            </div>
+                          </div>
+
+                          <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3 text-xs">
+                            <div className="text-slate-400">Battery Replacement &amp; Alarms</div>
+                            <div className="mt-1 font-mono-tabular font-semibold text-white">
+                              {detailUps.battery_replace_needed ? (
+                                <span className="text-rose-400">Replacement Recommended</span>
+                              ) : (
+                                <span className="text-emerald-400">Healthy</span>
+                              )}
+                            </div>
+                            <div className="mt-0.5 font-mono-tabular text-[11px] text-slate-400">
+                              {detailUps.last_replace_date
+                                ? `Replaced: ${detailUps.last_replace_date}`
+                                : "No replacement date"}{" "}
+                              • {detailUps.alarms_present ?? 0} alarms
+                            </div>
+                          </div>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {/* Printer Supplies & Consumables Card */}
+                {(detailProfileType === "printer" || detailPrinterSupplies.length > 0) && (
+                  <div className="space-y-4 rounded-xl border border-slate-800 bg-[#111827] p-5">
+                    <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
+                      <Printer className="h-4 w-4 text-fuchsia-400" />
+                      Printer Supplies &amp; Consumables (<code>Printer-MIB</code>)
+                    </h3>
+                    {detailPrinterSupplies.length === 0 ? (
+                      <div className="rounded-lg border border-slate-800 bg-[#090D16] p-4 text-xs text-slate-400">
+                        Waiting for <code>Printer-MIB</code> toner/drum/supply levels from this device.
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                        {detailPrinterSupplies.map((sup, idx) => (
+                          <div
+                            key={`${sup.name}-${idx}`}
+                            className="rounded-lg border border-slate-800 bg-[#090D16] p-3"
+                          >
+                            <div className="flex items-center justify-between gap-2 text-xs">
+                              <span className="truncate font-medium text-slate-200">{sup.name}</span>
+                              <span className="font-mono-tabular font-semibold text-white">
+                                {sup.pct != null ? `${sup.pct.toFixed(0)}%` : `${sup.level}`}
+                              </span>
+                            </div>
+                            {sup.pct != null && (
+                              <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+                                <div
+                                  className={`h-full rounded-full ${
+                                    sup.pct > 25
+                                      ? "bg-emerald-500"
+                                      : sup.pct > 10
+                                        ? "bg-amber-500"
+                                        : "bg-rose-500"
+                                  }`}
+                                  style={{ width: `${Math.min(100, Math.max(0, sup.pct))}%` }}
+                                />
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {/* Extended Vendor MIB Telemetry: Sensors, CPU/RAM/Storage, Wireless VAPs, and LLDP Neighbors */}
                 {deviceDetail?.snmp_system?.extended_metrics && (
@@ -5084,7 +5961,9 @@ export const App: React.FC = () => {
                       <div>
                         <h3 className="text-sm font-semibold text-white">
                           {detailIfIndex === 0
-                            ? `Device Traffic Overview — All Ports / Interfaces Combined (${deviceDetail.snmp_interfaces.length} Ports)`
+                            ? detailProfileType === "ups"
+                              ? `UPS Management Network Interface (IF-MIB) (${deviceDetail.snmp_interfaces.length} Port${deviceDetail.snmp_interfaces.length === 1 ? "" : "s"})`
+                              : `Device Traffic Overview — All Ports / Interfaces Combined (${deviceDetail.snmp_interfaces.length} Ports)`
                             : `Port #${detailIfIndex} (${
                                 deviceDetail.snmp_interfaces.find(
                                   (i) => i.if_index === detailIfIndex,
@@ -5093,7 +5972,9 @@ export const App: React.FC = () => {
                         </h3>
                         <p className="text-xs text-slate-400">
                           {detailIfIndex === 0
-                            ? "Showing total aggregated inbound & outbound traffic across all ports/interfaces on this device. Click any interface row below to inspect an individual port."
+                            ? detailProfileType === "ups"
+                              ? "Management card network port traffic & link status (UPS power, battery, and runtime trends are shown above)."
+                              : "Showing total aggregated inbound & outbound traffic across all ports/interfaces on this device. Click any interface row below to inspect an individual port."
                             : "Showing traffic for selected port. Click 'All Ports Combined (Overview)' to return to total device traffic."}
                         </p>
                       </div>
@@ -5247,64 +6128,32 @@ export const App: React.FC = () => {
           </div>
         )}
 
-        {/* ==================== VIEW 3: SNMP TRENDS & PORTS ==================== */}
+        {/* ==================== VIEW 3: SNMP TELEMETRY & PORTS ==================== */}
         {activeTab === "snmp" && (
           <div className="space-y-6">
+            {/* Top Control Bar */}
             <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-800 bg-[#111827] p-4">
-              <div className="flex flex-wrap items-center gap-3">
-                <div>
-                  <label className="block text-[11px] text-slate-400">Device IP</label>
-                  <select
-                    value={selectedDeviceIp}
-                    onChange={(e) => setSelectedDeviceIp(e.target.value)}
-                    className="mt-1 rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 font-mono-tabular text-xs text-white"
-                  >
-                    {Array.from(new Set(interfaces.map((i) => i.device_ip))).map((ip) => (
-                      <option key={ip} value={ip}>
-                        {ip}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-[11px] text-slate-400">Interface (IF-MIB)</label>
-                  <select
-                    value={selectedIfIndex}
-                    onChange={(e) => setSelectedIfIndex(Number(e.target.value))}
-                    className="mt-1 rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 font-mono-tabular text-xs text-white"
-                  >
-                    <option value={0}>All Ports / Interfaces Combined (Total Device Traffic)</option>
-                    {interfaces
-                      .filter((i) => !selectedDeviceIp || i.device_ip === selectedDeviceIp)
-                      .map((i) => (
-                        <option key={i.if_index} value={i.if_index}>
-                          #{i.if_index} — {i.if_name} ({formatBps(i.in_bps)} RX)
-                        </option>
-                      ))}
-                  </select>
-                </div>
-
-                <button
-                  onClick={() => setActiveTab("targets")}
-                  className="mt-4 flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-emerald-400 hover:bg-slate-700"
-                >
-                  <Plus className="h-3.5 w-3.5" /> Add / Edit SNMP Hosts & Secrets
-                </button>
+              <div>
+                <h2 className="flex items-center gap-2 text-base font-semibold text-white">
+                  <Database className="h-4 w-4 text-sky-400" />
+                  SNMP Ingestion &amp; Query Telemetry
+                </h2>
+                <p className="text-xs text-slate-400">
+                  Server-wide SNMP polling throughput, OID ingestion volume, query latency, and
+                  per-target health
+                </p>
               </div>
 
-              <div>
-                <label className="block text-right text-[11px] text-slate-400">
-                  TimescaleDB Rollup Window (Source: <code>{trendSourceTable}</code>)
-                </label>
-                <div className="mt-1 flex items-center gap-1 rounded-lg border border-slate-800 bg-[#090D16] p-1">
-                  {["1h", "6h", "24h", "7d", "30d", "1y", "all"].map((rk) => (
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="flex items-center gap-1 rounded-lg border border-slate-800 bg-[#090D16] p-1">
+                  {(["1h", "6h", "24h", "7d", "30d"] as const).map((rk) => (
                     <button
                       key={rk}
-                      onClick={() => setTrendRange(rk)}
+                      type="button"
+                      onClick={() => setSnmpTelemetryRange(rk)}
                       className={`rounded px-2.5 py-1 font-mono-tabular text-xs font-medium uppercase transition ${
-                        trendRange === rk
-                          ? "bg-emerald-600 text-white"
+                        snmpTelemetryRange === rk
+                          ? "bg-sky-600 text-white"
                           : "text-slate-400 hover:text-slate-200"
                       }`}
                     >
@@ -5312,29 +6161,407 @@ export const App: React.FC = () => {
                     </button>
                   ))}
                 </div>
+
+                <button
+                  type="button"
+                  onClick={handlePollAllSnmp}
+                  disabled={pollingAllSnmp}
+                  className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-60"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${pollingAllSnmp ? "animate-spin" : ""}`} />
+                  {pollingAllSnmp ? "Polling SNMP..." : "Poll All SNMP Now"}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveTab("targets")}
+                  className="flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-emerald-400 hover:bg-slate-700"
+                >
+                  <Plus className="h-3.5 w-3.5" /> Add / Edit SNMP Hosts
+                </button>
               </div>
             </div>
 
-            <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
-              <h3 className="mb-3 text-sm font-semibold text-white">
-                {selectedIfIndex === 0
-                  ? `All Ports Combined Throughput Trend (${selectedDeviceIp || "No Device"})`
-                  : `Interface Throughput Trend (${selectedDeviceIp || "No Device"} • ifIndex #${selectedIfIndex})`}
-              </h3>
-              <DualAreaSparkChart
-                points={trendSeries.map((pt) => ({
-                  label: pt.time,
-                  inVal: pt.avg_in_bps,
-                  outVal: pt.avg_out_bps,
-                  p95In: pt.p95_in_bps,
-                }))}
-              />
+            {/* 5 Fleet Summary KPI Cards */}
+            {(() => {
+              const s = snmpTelemetry?.summary;
+              const verText =
+                s && s.version_breakdown && Object.keys(s.version_breakdown).length > 0
+                  ? Object.entries(s.version_breakdown)
+                      .map(([k, v]) => `${k}: ${v}`)
+                      .join(" • ")
+                  : "No enabled targets";
+              const rate = s?.success_rate_pct ?? 100;
+              return (
+                <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
+                  <div className="rounded-xl border border-slate-800 bg-[#111827] p-4">
+                    <div className="text-xs text-slate-400">SNMP Targets Online</div>
+                    <div className="mt-1.5 font-mono-tabular text-2xl font-bold text-white">
+                      {s?.reachable_targets ?? 0}{" "}
+                      <span className="text-sm font-normal text-slate-400">
+                        / {s?.enabled_targets ?? 0}
+                      </span>
+                    </div>
+                    <div className="mt-1 truncate font-mono-tabular text-[11px] text-slate-400">
+                      {(s?.unreachable_targets ?? 0) > 0 ? (
+                        <span className="text-rose-400">{s?.unreachable_targets} offline • </span>
+                      ) : null}
+                      {verText}
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-slate-800 bg-[#111827] p-4">
+                    <div className="text-xs text-slate-400">OIDs Ingested</div>
+                    <div className="mt-1.5 font-mono-tabular text-2xl font-bold text-emerald-400">
+                      {(s?.total_oids_ingested ?? 0).toLocaleString()}
+                    </div>
+                    <div className="mt-1 font-mono-tabular text-[11px] text-slate-400">
+                      {s?.oids_per_min ?? 0} OIDs/min • {(s?.total_walks ?? 0).toLocaleString()} walks
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-slate-800 bg-[#111827] p-4">
+                    <div className="text-xs text-slate-400">Poll Success Rate</div>
+                    <div
+                      className={`mt-1.5 font-mono-tabular text-2xl font-bold ${
+                        rate >= 98
+                          ? "text-emerald-400"
+                          : rate >= 90
+                            ? "text-amber-400"
+                            : "text-rose-400"
+                      }`}
+                    >
+                      {rate.toFixed(1)}%
+                    </div>
+                    <div className="mt-1 font-mono-tabular text-[11px] text-slate-400">
+                      {s?.successful_polls ?? 0} ok / {s?.failed_polls ?? 0} failed
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-slate-800 bg-[#111827] p-4">
+                    <div className="text-xs text-slate-400">Query Latency</div>
+                    <div className="mt-1.5 font-mono-tabular text-2xl font-bold text-sky-400">
+                      {(s?.avg_latency_ms ?? 0).toFixed(0)} ms
+                    </div>
+                    <div className="mt-1 font-mono-tabular text-[11px] text-slate-400">
+                      P95 {(s?.p95_latency_ms ?? 0).toFixed(0)} ms • Max{" "}
+                      {(s?.max_latency_ms ?? 0).toFixed(0)} ms
+                    </div>
+                  </div>
+
+                  <div className="col-span-2 rounded-xl border border-slate-800 bg-[#111827] p-4 lg:col-span-1">
+                    <div className="text-xs text-slate-400">Interfaces &amp; DB Rows</div>
+                    <div className="mt-1.5 font-mono-tabular text-2xl font-bold text-white">
+                      {s?.total_interfaces_tracked ?? 0}
+                    </div>
+                    <div className="mt-1 font-mono-tabular text-[11px] text-slate-400">
+                      {(s?.raw_table_rows_24h ?? 0).toLocaleString()} raw rows (24h)
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* SNMP Ingestion & Query Telemetry Chart */}
+            <div className="space-y-4 rounded-xl border border-slate-800 bg-[#111827] p-5">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-sm font-semibold text-white">
+                    {snmpChartMode === "ingestion"
+                      ? "SNMP Ingestion Rate (OIDs & Interface Samples per Bucket)"
+                      : snmpChartMode === "latency"
+                        ? "SNMP Query Round-Trip Latency (Avg & Peak ms)"
+                        : "SNMP Poll Outcomes (Successful vs Failed Queries)"}
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    Telemetry recorded by the SNMP poller into TimescaleDB (
+                    <code>snmp_poll_metrics</code>) across the selected{" "}
+                    <span className="font-mono-tabular uppercase text-slate-300">
+                      {snmpTelemetryRange}
+                    </span>{" "}
+                    window.
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setSnmpChartMode("ingestion")}
+                    className={`rounded-md border px-2.5 py-1 text-xs font-medium transition ${
+                      snmpChartMode === "ingestion"
+                        ? "border-emerald-500/50 bg-emerald-600 text-white"
+                        : "border-slate-700 bg-[#090D16] text-slate-300 hover:bg-slate-800"
+                    }`}
+                  >
+                    OIDs &amp; Samples
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSnmpChartMode("latency")}
+                    className={`rounded-md border px-2.5 py-1 text-xs font-medium transition ${
+                      snmpChartMode === "latency"
+                        ? "border-sky-500/50 bg-sky-600 text-white"
+                        : "border-slate-700 bg-[#090D16] text-slate-300 hover:bg-slate-800"
+                    }`}
+                  >
+                    Query Latency (ms)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSnmpChartMode("polls")}
+                    className={`rounded-md border px-2.5 py-1 text-xs font-medium transition ${
+                      snmpChartMode === "polls"
+                        ? "border-emerald-500/50 bg-emerald-600 text-white"
+                        : "border-slate-700 bg-[#090D16] text-slate-300 hover:bg-slate-800"
+                    }`}
+                  >
+                    Poll Volume
+                  </button>
+                </div>
+              </div>
+
+              {snmpChartMode === "ingestion" && (
+                <DualAreaSparkChart
+                  showYAxis
+                  primaryLabel="OIDs Ingested"
+                  secondaryLabel="Interface Samples"
+                  primaryShortLabel="OIDs"
+                  secondaryShortLabel="If Samples"
+                  primaryColor="#10B981"
+                  secondaryColor="#38BDF8"
+                  yAxisLabel="OIDs"
+                  formatValue={(v) => `${Math.round(v).toLocaleString()}`}
+                  formatAxisTick={(v) =>
+                    v >= 1000 ? `${(v / 1000).toFixed(1)}k` : String(Math.round(v))
+                  }
+                  emptyMessage="Waiting for SNMP poll telemetry samples..."
+                  points={(snmpTelemetry?.series || []).map((pt) => ({
+                    label: pt.time,
+                    inVal: pt.oids_collected,
+                    outVal: pt.interface_samples,
+                  }))}
+                />
+              )}
+
+              {snmpChartMode === "latency" && (
+                <DualAreaSparkChart
+                  showYAxis
+                  primaryLabel="Avg Latency (ms)"
+                  secondaryLabel="Peak Latency (ms)"
+                  primaryShortLabel="Avg"
+                  secondaryShortLabel="Peak"
+                  primaryColor="#38BDF8"
+                  secondaryColor="#F59E0B"
+                  yAxisLabel="ms"
+                  formatValue={(v) => `${v.toFixed(1)} ms`}
+                  formatAxisTick={(v) => String(Math.round(v))}
+                  emptyMessage="Waiting for SNMP query latency telemetry..."
+                  points={(snmpTelemetry?.series || []).map((pt) => ({
+                    label: pt.time,
+                    inVal: pt.avg_latency_ms,
+                    outVal: pt.max_latency_ms,
+                  }))}
+                />
+              )}
+
+              {snmpChartMode === "polls" && (
+                <DualAreaSparkChart
+                  showYAxis
+                  primaryLabel="Successful Polls"
+                  secondaryLabel="Failed Polls"
+                  primaryShortLabel="OK"
+                  secondaryShortLabel="Failed"
+                  primaryColor="#10B981"
+                  secondaryColor="#F43F5E"
+                  yAxisLabel="Polls"
+                  formatValue={(v) => `${Math.round(v)}`}
+                  formatAxisTick={(v) => String(Math.round(v))}
+                  emptyMessage="Waiting for SNMP poll count telemetry..."
+                  points={(snmpTelemetry?.series || []).map((pt) => ({
+                    label: pt.time,
+                    inVal: pt.polls_ok,
+                    outVal: pt.polls_failed,
+                  }))}
+                />
+              )}
             </div>
 
+            {/* Active Fleet MIBs Strip */}
+            {(snmpTelemetry?.summary?.active_mibs_fleet?.length ?? 0) > 0 && (
+              <div className="rounded-xl border border-slate-800 bg-[#111827] px-5 py-3.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-medium text-slate-400">Active Fleet MIBs:</span>
+                  {(snmpTelemetry?.summary?.active_mibs_fleet || []).map((mib) => (
+                    <span
+                      key={mib}
+                      className="rounded border border-sky-500/30 bg-[#090D16] px-2 py-0.5 font-mono-tabular text-[11px] text-sky-300"
+                    >
+                      {mib}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Per-Target SNMP Query Health Table */}
             <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
-              <h3 className="mb-3 text-sm font-semibold text-white">
-                64-Bit Interface Counters (<code>ifXTable</code>)
-              </h3>
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-sm font-semibold text-white">
+                  Per-Target SNMP Query Health ({snmpTelemetry?.targets?.length ?? 0})
+                </h3>
+                <span className="text-xs text-slate-400">
+                  Click any target row to inspect its device-specific telemetry page
+                </span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-800 text-slate-400">
+                      <th className="pb-2 font-medium">Status</th>
+                      <th className="pb-2 font-medium">Device</th>
+                      <th className="pb-2 font-medium">Type &amp; Vendor</th>
+                      <th className="pb-2 font-medium">Profile / Ver</th>
+                      <th className="pb-2 font-medium">OIDs / Poll</th>
+                      <th className="pb-2 font-medium">Walks</th>
+                      <th className="pb-2 font-medium">Avg / Last Latency</th>
+                      <th className="pb-2 font-medium">Success Rate</th>
+                      <th className="pb-2 font-medium">Responding MIBs</th>
+                      <th className="pb-2 text-right font-medium">Last Polled</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60">
+                    {(snmpTelemetry?.targets?.length ?? 0) === 0 ? (
+                      <tr>
+                        <td colSpan={10} className="py-6 text-center text-slate-500">
+                          No SNMP targets configured yet. Click Add / Edit SNMP Hosts above.
+                        </td>
+                      </tr>
+                    ) : (
+                      (snmpTelemetry?.targets || []).map((t) => (
+                        <tr
+                          key={t.device_ip}
+                          onClick={() => openDevicePage(t.device_ip)}
+                          className="cursor-pointer transition hover:bg-slate-800/40"
+                        >
+                          <td className="py-2.5">
+                            <span
+                              className={`inline-block rounded px-1.5 py-0.5 font-mono-tabular text-[11px] ${
+                                !t.enabled
+                                  ? "bg-slate-800 text-slate-500"
+                                  : t.is_reachable
+                                    ? "bg-emerald-500/15 text-emerald-400"
+                                    : "bg-rose-500/15 text-rose-400"
+                              }`}
+                            >
+                              {!t.enabled ? "DISABLED" : t.is_reachable ? "ONLINE" : "OFFLINE"}
+                            </span>
+                          </td>
+                          <td className="py-2.5">
+                            <div className="font-mono-tabular font-semibold text-emerald-400 underline">
+                              {t.device_ip}
+                            </div>
+                            <div className="text-[11px] text-slate-400">{t.sys_name || "—"}</div>
+                          </td>
+                          <td className="py-2.5">
+                            <span
+                              className={`mr-1.5 inline-block rounded border px-1.5 py-0.5 text-[10px] uppercase ${
+                                t.device_profile_type === "ups"
+                                  ? "border-amber-500/30 bg-amber-500/15 text-amber-300"
+                                  : t.device_profile_type === "nas"
+                                    ? "border-violet-500/30 bg-violet-500/15 text-violet-300"
+                                    : t.device_profile_type === "printer"
+                                      ? "border-fuchsia-500/30 bg-fuchsia-500/15 text-fuchsia-300"
+                                      : t.device_profile_type === "server"
+                                        ? "border-sky-500/30 bg-sky-500/15 text-sky-300"
+                                        : "border-cyan-500/30 bg-cyan-500/15 text-cyan-300"
+                              }`}
+                            >
+                              {t.device_profile_type}
+                            </span>
+                            <span className="text-slate-300">
+                              {t.vendor_name || t.device_category || "—"}
+                            </span>
+                          </td>
+                          <td className="py-2.5 font-mono-tabular text-slate-300">
+                            {t.profile_name} ({t.snmp_version})
+                          </td>
+                          <td className="py-2.5 font-mono-tabular text-white">
+                            {t.oids_per_poll.toFixed(0)}
+                          </td>
+                          <td className="py-2.5 font-mono-tabular text-slate-300">
+                            {t.walks_per_poll.toFixed(0)}
+                          </td>
+                          <td className="py-2.5 font-mono-tabular text-sky-400">
+                            {t.avg_latency_ms.toFixed(0)} / {t.last_poll_duration_ms.toFixed(0)} ms
+                          </td>
+                          <td className="py-2.5 font-mono-tabular">
+                            <span
+                              className={
+                                t.success_rate_pct >= 98
+                                  ? "text-emerald-400"
+                                  : t.success_rate_pct >= 90
+                                    ? "text-amber-400"
+                                    : "text-rose-400"
+                              }
+                            >
+                              {t.success_rate_pct.toFixed(1)}%
+                            </span>
+                            {t.failed_polls > 0 && (
+                              <span className="ml-1 text-[10px] text-rose-400">
+                                ({t.failed_polls} err)
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2.5">
+                            <div className="flex flex-wrap gap-1">
+                              {t.responding_mibs.slice(0, 3).map((mib) => (
+                                <span
+                                  key={mib}
+                                  className="rounded border border-slate-700 bg-[#090D16] px-1.5 py-0.5 font-mono-tabular text-[10px] text-slate-300"
+                                >
+                                  {mib}
+                                </span>
+                              ))}
+                              {t.responding_mibs.length > 3 && (
+                                <span className="font-mono-tabular text-[10px] text-slate-500">
+                                  +{t.responding_mibs.length - 3}
+                                </span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="py-2.5 text-right font-mono-tabular text-slate-400">
+                            {t.last_polled ? new Date(t.last_polled).toLocaleTimeString() : "Never"}
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* 64-Bit Interface Counters (ifXTable) */}
+            <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+                <h3 className="text-sm font-semibold text-white">
+                  64-Bit Interface Counters (<code>ifXTable</code>)
+                </h3>
+                <div className="flex items-center gap-2">
+                  <label className="text-[11px] text-slate-400">Device IP:</label>
+                  <select
+                    value={snmpPortFilterIp}
+                    onChange={(e) => setSnmpPortFilterIp(e.target.value)}
+                    className="rounded-md border border-slate-700 bg-[#090D16] px-2.5 py-1 font-mono-tabular text-xs text-white"
+                  >
+                    <option value="">All Polled Devices</option>
+                    {Array.from(new Set(interfaces.map((i) => i.device_ip))).map((ip) => (
+                      <option key={ip} value={ip}>
+                        {ip}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs">
                   <thead>
@@ -5351,50 +6578,41 @@ export const App: React.FC = () => {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800/60 font-mono-tabular">
-                    {interfaces.map((intf) => (
-                      <tr
-                        key={`${intf.device_ip}-${intf.if_index}`}
-                        onClick={() => {
-                          setSelectedDeviceIp(intf.device_ip);
-                          setSelectedIfIndex(intf.if_index);
-                        }}
-                        className="cursor-pointer hover:bg-slate-800/40"
-                      >
-                        <td
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            openDevicePage(intf.device_ip);
-                          }}
-                          className="py-2.5 text-emerald-400 underline"
+                    {interfaces
+                      .filter((intf) => !snmpPortFilterIp || intf.device_ip === snmpPortFilterIp)
+                      .map((intf) => (
+                        <tr
+                          key={`${intf.device_ip}-${intf.if_index}`}
+                          onClick={() => openDevicePage(intf.device_ip)}
+                          className="cursor-pointer hover:bg-slate-800/40"
                         >
-                          {intf.device_ip}
-                        </td>
-                        <td className="py-2.5 text-slate-400">#{intf.if_index}</td>
-                        <td className="py-2.5 font-semibold text-white">{intf.if_name}</td>
-                        <td className="py-2.5 font-sans text-slate-400">
-                          {intf.if_alias || intf.if_descr || "—"}
-                        </td>
-                        <td className="py-2.5 text-slate-300">
-                          {intf.if_speed_bps > 0 ? formatBps(intf.if_speed_bps) : "Auto"}
-                        </td>
-                        <td className="py-2.5 text-emerald-400">{formatBps(intf.in_bps)}</td>
-                        <td className="py-2.5 text-sky-400">{formatBps(intf.out_bps)}</td>
-                        <td className="py-2.5 text-slate-400">
-                          {intf.in_errors} / {intf.out_errors}
-                        </td>
-                        <td className="py-2.5 text-right">
-                          <span
-                            className={`inline-block rounded px-1.5 py-0.5 text-[11px] ${
-                              intf.if_oper_status === 1
-                                ? "bg-emerald-500/15 text-emerald-400"
-                                : "bg-slate-800 text-slate-400"
-                            }`}
-                          >
-                            {intf.if_oper_status === 1 ? "UP" : "DOWN"}
-                          </span>
-                        </td>
-                      </tr>
-                    ))}
+                          <td className="py-2.5 text-emerald-400 underline">{intf.device_ip}</td>
+                          <td className="py-2.5 text-slate-400">#{intf.if_index}</td>
+                          <td className="py-2.5 font-semibold text-white">{intf.if_name}</td>
+                          <td className="py-2.5 font-sans text-slate-400">
+                            {intf.if_alias || intf.if_descr || "—"}
+                          </td>
+                          <td className="py-2.5 text-slate-300">
+                            {intf.if_speed_bps > 0 ? formatBps(intf.if_speed_bps) : "Auto"}
+                          </td>
+                          <td className="py-2.5 text-emerald-400">{formatBps(intf.in_bps)}</td>
+                          <td className="py-2.5 text-sky-400">{formatBps(intf.out_bps)}</td>
+                          <td className="py-2.5 text-slate-400">
+                            {intf.in_errors} / {intf.out_errors}
+                          </td>
+                          <td className="py-2.5 text-right">
+                            <span
+                              className={`inline-block rounded px-1.5 py-0.5 text-[11px] ${
+                                intf.if_oper_status === 1
+                                  ? "bg-emerald-500/15 text-emerald-400"
+                                  : "bg-slate-800 text-slate-400"
+                              }`}
+                            >
+                              {intf.if_oper_status === 1 ? "UP" : "DOWN"}
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
                   </tbody>
                 </table>
               </div>

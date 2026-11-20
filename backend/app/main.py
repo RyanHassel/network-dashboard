@@ -1975,6 +1975,360 @@ async def get_snmp_interfaces(device_ip: Optional[str] = None) -> Dict[str, Any]
     return {"interfaces": items}
 
 
+def _classify_device_profile(
+    snmp_sys: Optional[Dict[str, Any]],
+    unifi_dev: Optional[Dict[str, Any]],
+    fallback_mib: Optional[Dict[str, Any]],
+) -> str:
+    """Classifies a managed device into ups, nas, printer, network, or server."""
+    if snmp_sys:
+        ext = snmp_sys.get("extended_metrics")
+        if isinstance(ext, dict) and ext.get("ups_telemetry"):
+            return "ups"
+        if snmp_sys.get("has_ups_telemetry"):
+            return "ups"
+
+    mibs: List[str] = []
+    texts: List[str] = []
+    for src in (snmp_sys, fallback_mib):
+        if not isinstance(src, dict):
+            continue
+        for key in ("device_category", "category", "vendor_name", "sys_descr", "sys_name"):
+            val = src.get(key)
+            if val:
+                texts.append(str(val))
+        for mib_col in ("matched_mibs", "mibs"):
+            raw_m = src.get(mib_col)
+            if isinstance(raw_m, list):
+                mibs.extend(str(x) for x in raw_m)
+
+    combined = " ".join(texts + mibs).lower()
+    if any(m in ("PowerNet-UPS-MIB", "UPS-MIB", "CPS-MIB") for m in mibs) or re.search(
+        r"\b(ups|powernet|uninterruptible|battery backup|smart-ups|back-ups|apc|cyberpower|eaton|symmetra|tripp lite)\b",
+        combined,
+    ):
+        return "ups"
+    if "Printer-MIB" in mibs or re.search(r"\b(printer|mfp|laserjet|officejet)\b", combined):
+        return "printer"
+    if any(
+        m in ("SYNOLOGY-SYSTEM-MIB", "SYNOLOGY-DISK-MIB", "SYNOLOGY-RAID-MIB") for m in mibs
+    ) or re.search(r"\b(nas|storage server|storage appliance|synology|truenas|freenas|qnap)\b", combined):
+        return "nas"
+    if unifi_dev or re.search(
+        r"\b(switch|gateway|router|firewall|ubiquiti|unifi|udm|mikrotik|cisco|fortinet|juniper|aruba|arista|netgear|access point)\b",
+        combined,
+    ):
+        return "network"
+    return "server"
+
+
+@app.post("/api/snmp/poll-all")
+async def trigger_snmp_poll_all() -> Dict[str, str]:
+    await _notify_worker("snmp_now")
+    return {"status": "triggered", "message": "Immediate SNMP fleet poll queued."}
+
+
+@app.get("/api/snmp/telemetry")
+async def get_snmp_telemetry(
+    range_key: str = Query(default="24h", alias="range"),
+) -> Dict[str, Any]:
+    """Returns application-level SNMP ingestion, query latency, OID volume, and per-target health."""
+    rk = (range_key or "24h").strip().lower()
+    if rk == "1d":
+        rk = "24h"
+    if rk not in ("1h", "6h", "24h", "7d", "30d"):
+        rk = "24h"
+
+    range_specs = {
+        "1h": ("1 hour", "1 minute", 60.0),
+        "6h": ("6 hours", "5 minutes", 360.0),
+        "24h": ("24 hours", "15 minutes", 1440.0),
+        "7d": ("7 days", "1 hour", 10080.0),
+        "30d": ("30 days", "6 hours", 43200.0),
+    }
+    sql_interval, sql_bucket, window_mins = range_specs[rk]
+
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        poll_buckets = await conn.fetch(
+            f"""
+            SELECT time_bucket('{sql_bucket}', time) AS bucket,
+                   COALESCE(SUM(oids_collected), 0) AS oids_collected,
+                   COALESCE(SUM(interfaces_ingested), 0) AS interface_samples,
+                   COALESCE(SUM(oid_walks), 0) AS oid_walks,
+                   COALESCE(AVG(poll_duration_ms) FILTER (WHERE success), 0) AS avg_latency_ms,
+                   COALESCE(MAX(poll_duration_ms), 0) AS max_latency_ms,
+                   COUNT(*) FILTER (WHERE success) AS polls_ok,
+                   COUNT(*) FILTER (WHERE NOT success) AS polls_failed,
+                   COUNT(DISTINCT device_ip) AS devices_polled
+            FROM snmp_poll_metrics
+            WHERE time > NOW() - INTERVAL '{sql_interval}'
+            GROUP BY bucket
+            ORDER BY bucket ASC
+            """
+        )
+
+        raw_buckets = await conn.fetch(
+            f"""
+            SELECT time_bucket('{sql_bucket}', time) AS bucket,
+                   COUNT(*) AS interface_samples,
+                   COUNT(DISTINCT device_ip) AS devices_polled
+            FROM snmp_metrics_raw
+            WHERE time > NOW() - INTERVAL '{sql_interval}'
+            GROUP BY bucket
+            ORDER BY bucket ASC
+            """
+        )
+
+        global_row = await conn.fetchrow(
+            f"""
+            SELECT COUNT(*) AS total_polls,
+                   COUNT(*) FILTER (WHERE success) AS successful_polls,
+                   COUNT(*) FILTER (WHERE NOT success) AS failed_polls,
+                   COALESCE(SUM(oid_walks), 0) AS total_walks,
+                   COALESCE(SUM(oids_collected), 0) AS total_oids_ingested,
+                   COALESCE(SUM(interfaces_ingested), 0) AS total_interface_samples,
+                   COALESCE(AVG(poll_duration_ms) FILTER (WHERE success), 0) AS avg_latency_ms,
+                   COALESCE(percentile_disc(0.95) WITHIN GROUP (ORDER BY poll_duration_ms) FILTER (WHERE success), 0) AS p95_latency_ms,
+                   COALESCE(MAX(poll_duration_ms), 0) AS max_latency_ms,
+                   MIN(time) AS first_poll_time
+            FROM snmp_poll_metrics
+            WHERE time > NOW() - INTERVAL '{sql_interval}'
+            """
+        )
+
+        per_dev_stats_rows = await conn.fetch(
+            f"""
+            SELECT device_ip,
+                   COUNT(*) AS total_polls,
+                   COUNT(*) FILTER (WHERE success) AS polls_ok,
+                   COUNT(*) FILTER (WHERE NOT success) AS polls_failed,
+                   COALESCE(AVG(poll_duration_ms) FILTER (WHERE success), 0) AS avg_latency_ms,
+                   COALESCE(AVG(oids_collected) FILTER (WHERE success), 0) AS oids_per_poll,
+                   COALESCE(AVG(oid_walks) FILTER (WHERE success), 0) AS walks_per_poll
+            FROM snmp_poll_metrics
+            WHERE time > NOW() - INTERVAL '{sql_interval}'
+            GROUP BY device_ip
+            """
+        )
+
+        target_rows = await conn.fetch(
+            """
+            SELECT t.device_ip, t.label, t.enabled,
+                   COALESCE(p.name, 'Default') AS profile_name,
+                   COALESCE(p.version, 'v2c') AS snmp_version,
+                   d.sys_name, d.sys_descr, d.sys_object_id, d.vendor_name,
+                   d.device_category, d.matched_mibs, d.interface_count,
+                   d.is_reachable, d.last_poll_duration_ms, d.last_polled,
+                   (d.extended_metrics ? 'ups_telemetry') AS has_ups_telemetry,
+                   d.extended_metrics -> 'responding_mibs' AS responding_mibs
+            FROM snmp_targets_config t
+            LEFT JOIN snmp_profiles p ON p.id = t.profile_id
+            LEFT JOIN snmp_devices d ON d.device_ip = t.device_ip
+            ORDER BY t.id ASC
+            """
+        )
+
+        raw_rows_24h = int(
+            await conn.fetchval(
+                "SELECT COUNT(*) FROM snmp_metrics_raw WHERE time > NOW() - INTERVAL '24 hours'"
+            )
+            or 0
+        )
+
+    dev_stats_map = {str(r["device_ip"]): dict(r) for r in per_dev_stats_rows}
+
+    targets_out: List[Dict[str, Any]] = []
+    enabled_targets = 0
+    reachable_targets = 0
+    unreachable_targets = 0
+    total_interfaces_tracked = 0
+    active_mibs_set: set[str] = set()
+    version_counts: Dict[str, int] = {}
+
+    for rec in target_rows:
+        r = dict(rec)
+        ip = str(r["device_ip"])
+        enabled = bool(r.get("enabled", True))
+        ver = str(r.get("snmp_version") or "v2c").lower()
+        if enabled:
+            enabled_targets += 1
+            version_counts[ver] = version_counts.get(ver, 0) + 1
+            if r.get("is_reachable") is True:
+                reachable_targets += 1
+            elif r.get("is_reachable") is False:
+                unreachable_targets += 1
+
+        raw_matched = r.get("matched_mibs")
+        if isinstance(raw_matched, str):
+            try:
+                raw_matched = json.loads(raw_matched)
+            except Exception:
+                raw_matched = []
+        matched_mibs = raw_matched if isinstance(raw_matched, list) else []
+
+        raw_resp = r.get("responding_mibs")
+        if isinstance(raw_resp, str):
+            try:
+                raw_resp = json.loads(raw_resp)
+            except Exception:
+                raw_resp = None
+        resp_mibs = raw_resp if isinstance(raw_resp, list) else matched_mibs
+
+        for m in resp_mibs:
+            active_mibs_set.add(str(m))
+
+        if_cnt = int(r.get("interface_count") or 0)
+        if enabled:
+            total_interfaces_tracked += if_cnt
+
+        profile_type = _classify_device_profile(
+            {
+                "device_category": r.get("device_category"),
+                "vendor_name": r.get("vendor_name"),
+                "sys_descr": r.get("sys_descr"),
+                "sys_name": r.get("sys_name") or r.get("label"),
+                "matched_mibs": matched_mibs,
+                "has_ups_telemetry": bool(r.get("has_ups_telemetry")),
+            },
+            None,
+            None,
+        )
+
+        st = dev_stats_map.get(ip, {})
+        tot_p = int(st.get("total_polls") or 0)
+        ok_p = int(st.get("polls_ok") or 0)
+        fail_p = int(st.get("polls_failed") or 0)
+        success_pct = (
+            round((ok_p / tot_p) * 100.0, 1)
+            if tot_p > 0
+            else (100.0 if r.get("is_reachable") else 0.0)
+        )
+        last_lat = float(r.get("last_poll_duration_ms") or 0.0)
+        avg_lat = round(float(st.get("avg_latency_ms") or last_lat), 1)
+
+        targets_out.append(
+            {
+                "device_ip": ip,
+                "sys_name": r.get("sys_name") or r.get("label") or ip,
+                "vendor_name": r.get("vendor_name") or "Standard SNMP Device",
+                "device_category": r.get("device_category") or "Network Device",
+                "device_profile_type": profile_type,
+                "enabled": enabled,
+                "is_reachable": r.get("is_reachable"),
+                "snmp_version": ver,
+                "profile_name": r.get("profile_name") or "Default",
+                "interface_count": if_cnt,
+                "responding_mib_count": len(resp_mibs),
+                "responding_mibs": resp_mibs,
+                "last_poll_duration_ms": round(last_lat, 1),
+                "avg_latency_ms": avg_lat,
+                "oids_per_poll": round(float(st.get("oids_per_poll") or 0.0), 1),
+                "walks_per_poll": round(float(st.get("walks_per_poll") or 0.0), 1),
+                "success_rate_pct": success_pct,
+                "failed_polls": fail_p,
+                "last_polled": r["last_polled"].isoformat() if r.get("last_polled") else None,
+            }
+        )
+
+    lat_samples = [
+        t["last_poll_duration_ms"] for t in targets_out if t["last_poll_duration_ms"] > 0
+    ]
+    fallback_avg_lat = round(sum(lat_samples) / len(lat_samples), 1) if lat_samples else 0.0
+
+    buckets_by_iso: Dict[str, Dict[str, Any]] = {}
+    for b in poll_buckets:
+        ts_iso = b["bucket"].isoformat()
+        buckets_by_iso[ts_iso] = {
+            "time": ts_iso,
+            "oids_collected": int(b["oids_collected"] or 0),
+            "interface_samples": int(b["interface_samples"] or 0),
+            "oid_walks": int(b["oid_walks"] or 0),
+            "avg_latency_ms": round(float(b["avg_latency_ms"] or 0.0), 1),
+            "max_latency_ms": round(float(b["max_latency_ms"] or 0.0), 1),
+            "polls_ok": int(b["polls_ok"] or 0),
+            "polls_failed": int(b["polls_failed"] or 0),
+            "devices_polled": int(b["devices_polled"] or 0),
+        }
+
+    for rb in raw_buckets:
+        ts_iso = rb["bucket"].isoformat()
+        if ts_iso not in buckets_by_iso:
+            devs = int(rb["devices_polled"] or 0)
+            samples = int(rb["interface_samples"] or 0)
+            buckets_by_iso[ts_iso] = {
+                "time": ts_iso,
+                "oids_collected": samples,
+                "interface_samples": samples,
+                "oid_walks": 0,
+                "avg_latency_ms": fallback_avg_lat,
+                "max_latency_ms": max(lat_samples, default=0.0),
+                "polls_ok": devs,
+                "polls_failed": 0,
+                "devices_polled": devs,
+            }
+
+    series = [buckets_by_iso[k] for k in sorted(buckets_by_iso.keys())]
+
+    total_polls = int(global_row["total_polls"] or 0) if global_row else 0
+    successful_polls = int(global_row["successful_polls"] or 0) if global_row else 0
+    failed_polls = int(global_row["failed_polls"] or 0) if global_row else 0
+    total_walks = int(global_row["total_walks"] or 0) if global_row else 0
+    total_oids = int(global_row["total_oids_ingested"] or 0) if global_row else 0
+    total_if_samples = int(global_row["total_interface_samples"] or 0) if global_row else 0
+    avg_lat_ms = float(global_row["avg_latency_ms"] or 0.0) if global_row else 0.0
+    p95_lat_ms = float(global_row["p95_latency_ms"] or 0.0) if global_row else 0.0
+    max_lat_ms = float(global_row["max_latency_ms"] or 0.0) if global_row else 0.0
+
+    # Immediate fallback metrics from snmp_metrics_raw & snmp_devices right after initial upgrade
+    if total_polls == 0 and series:
+        total_if_samples = sum(pt["interface_samples"] for pt in series)
+        total_oids = total_if_samples
+        successful_polls = sum(pt["polls_ok"] for pt in series)
+        total_polls = successful_polls
+        avg_lat_ms = fallback_avg_lat
+        p95_lat_ms = max(lat_samples, default=0.0)
+        max_lat_ms = p95_lat_ms
+
+    elapsed_mins = window_mins
+    first_poll_time = global_row["first_poll_time"] if global_row else None
+    if first_poll_time is not None:
+        dt_mins = (datetime.now(timezone.utc) - first_poll_time).total_seconds() / 60.0
+        elapsed_mins = max(1.0, min(window_mins, dt_mins + 1.0))
+
+    success_rate_pct = (
+        round((successful_polls / total_polls) * 100.0, 1)
+        if total_polls > 0
+        else (100.0 if reachable_targets > 0 else 0.0)
+    )
+
+    return {
+        "range": rk,
+        "summary": {
+            "enabled_targets": enabled_targets,
+            "reachable_targets": reachable_targets,
+            "unreachable_targets": unreachable_targets,
+            "total_polls": total_polls,
+            "successful_polls": successful_polls,
+            "failed_polls": failed_polls,
+            "success_rate_pct": success_rate_pct,
+            "total_walks": total_walks,
+            "total_oids_ingested": total_oids,
+            "total_interface_samples": total_if_samples,
+            "oids_per_min": round(total_oids / elapsed_mins, 1) if total_oids > 0 else 0.0,
+            "avg_latency_ms": round(avg_lat_ms, 1),
+            "p95_latency_ms": round(p95_lat_ms, 1),
+            "max_latency_ms": round(max_lat_ms, 1),
+            "total_interfaces_tracked": total_interfaces_tracked,
+            "raw_table_rows_24h": raw_rows_24h,
+            "active_mibs_fleet": sorted(active_mibs_set),
+            "version_breakdown": version_counts,
+        },
+        "series": series,
+        "targets": targets_out,
+    }
+
+
 @app.get("/api/snmp/trends")
 async def get_snmp_trends(
     device_ip: str = Query(...),
@@ -2287,6 +2641,7 @@ async def get_all_devices() -> Dict[str, Any]:
                    sys_uptime_ticks, cpu_usage_pct, mem_usage_pct, temp_celsius, interface_count,
                    vendor_name, device_category, matched_mibs, hardware_model, serial_number,
                    firmware_version, mac_address, subnet_cidr, first_polled,
+                   (extended_metrics ? 'ups_telemetry') AS has_ups_telemetry,
                    is_reachable, last_poll_duration_ms, last_polled
             FROM snmp_devices
             """
@@ -2397,6 +2752,8 @@ async def get_all_devices() -> Dict[str, Any]:
                 else r["vendor_name"]
             )
         item["device_category"] = r.get("device_category") or item["device_category"]
+        if r.get("has_ups_telemetry"):
+            item["has_ups_telemetry"] = True
         raw_mibs = r.get("matched_mibs")
         if isinstance(raw_mibs, str):
             try:
@@ -2472,6 +2829,19 @@ async def get_all_devices() -> Dict[str, Any]:
                 "Generic / Standard RFC",
             ):
                 item["vendor"] = matched_vendor
+        item["device_profile_type"] = _classify_device_profile(
+            {
+                "device_category": item.get("device_category"),
+                "vendor_name": item.get("vendor"),
+                "sys_descr": item.get("sys_descr"),
+                "sys_name": item.get("hostname"),
+                "matched_mibs": item.get("matched_mibs") or [],
+                "has_ups_telemetry": bool(item.get("has_ups_telemetry")),
+            },
+            True if "UniFi" in item.get("sources", []) else None,
+            None,
+        )
+        item.pop("has_ups_telemetry", None)
 
     def _ip_sort_key(d: Dict[str, Any]):
         try:
@@ -2744,8 +3114,13 @@ async def get_device_detail(device_ip: str) -> Dict[str, Any]:
         ),
     }
 
+    device_profile_type = _classify_device_profile(
+        snmp_sys_dict, unifi_dev_dict, fallback_mib_match
+    )
+
     return {
         "ip_address": device_ip,
+        "device_profile_type": device_profile_type,
         "discovered_host": host_dict,
         "snmp_config": snmp_cfg_dict,
         "snmp_system": snmp_sys_dict,
@@ -2756,6 +3131,90 @@ async def get_device_detail(device_ip: str) -> Dict[str, Any]:
         "unifi_client": unifi_cli_dict,
         "recent_logs": [_serialize(r) for r in log_rows],
     }
+
+
+@app.get("/api/devices/{device_ip}/ups-history")
+async def get_device_ups_history(
+    device_ip: str,
+    range_key: str = Query(default="24h", alias="range"),
+) -> Dict[str, Any]:
+    """Returns time-series battery, load, runtime, voltage, and wattage telemetry for a UPS device."""
+    rk = (range_key or "24h").strip().lower()
+    if rk == "1d":
+        rk = "24h"
+    if rk not in ("1h", "6h", "24h", "7d", "30d"):
+        rk = "24h"
+
+    range_map = {
+        "1h": ("1 hour", None),
+        "6h": ("6 hours", None),
+        "24h": ("24 hours", "5 minutes"),
+        "7d": ("7 days", "15 minutes"),
+        "30d": ("30 days", "1 hour"),
+    }
+    sql_interval, bucket_size = range_map[rk]
+
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        if bucket_size is None:
+            rows = await conn.fetch(
+                f"""
+                SELECT time AS bucket,
+                       battery_charge_pct,
+                       output_load_pct,
+                       runtime_remaining_sec,
+                       input_voltage_v,
+                       output_voltage_v,
+                       output_watts,
+                       battery_temp_c
+                FROM ups_metrics_raw
+                WHERE device_ip = $1
+                  AND time > NOW() - INTERVAL '{sql_interval}'
+                ORDER BY time ASC
+                """,
+                device_ip,
+            )
+        else:
+            rows = await conn.fetch(
+                f"""
+                SELECT time_bucket('{bucket_size}', time) AS bucket,
+                       AVG(battery_charge_pct) AS battery_charge_pct,
+                       AVG(output_load_pct) AS output_load_pct,
+                       AVG(runtime_remaining_sec) AS runtime_remaining_sec,
+                       AVG(input_voltage_v) AS input_voltage_v,
+                       AVG(output_voltage_v) AS output_voltage_v,
+                       AVG(output_watts) AS output_watts,
+                       AVG(battery_temp_c) AS battery_temp_c
+                FROM ups_metrics_raw
+                WHERE device_ip = $1
+                  AND time > NOW() - INTERVAL '{sql_interval}'
+                GROUP BY bucket
+                ORDER BY bucket ASC
+                """,
+                device_ip,
+            )
+
+    def _opt_round(v: Any, digits: int = 1) -> Optional[float]:
+        return round(float(v), digits) if v is not None else None
+
+    series = [
+        {
+            "time": r["bucket"].isoformat(),
+            "battery_charge_pct": _opt_round(r["battery_charge_pct"], 1),
+            "output_load_pct": _opt_round(r["output_load_pct"], 1),
+            "runtime_remaining_sec": (
+                int(round(float(r["runtime_remaining_sec"])))
+                if r["runtime_remaining_sec"] is not None
+                else None
+            ),
+            "input_voltage_v": _opt_round(r["input_voltage_v"], 1),
+            "output_voltage_v": _opt_round(r["output_voltage_v"], 1),
+            "output_watts": _opt_round(r["output_watts"], 1),
+            "battery_temp_c": _opt_round(r["battery_temp_c"], 1),
+        }
+        for r in rows
+    ]
+    return {"device_ip": device_ip, "range": rk, "series": series}
 
 
 @app.post("/api/devices/rematch-mibs")

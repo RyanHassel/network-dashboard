@@ -256,6 +256,60 @@ SELECT add_continuous_aggregate_policy(
     if_not_exists => TRUE
 );
 
+-- Server-level SNMP query / ingestion telemetry
+CREATE TABLE IF NOT EXISTS snmp_poll_metrics (
+    time                 TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    device_ip            TEXT NOT NULL,
+    success              BOOLEAN NOT NULL DEFAULT TRUE,
+    poll_duration_ms     DOUBLE PRECISION NOT NULL DEFAULT 0,
+    oid_walks            INT NOT NULL DEFAULT 0,
+    oids_collected       INT NOT NULL DEFAULT 0,
+    interfaces_ingested  INT NOT NULL DEFAULT 0,
+    responding_mib_count INT NOT NULL DEFAULT 0,
+    snmp_version         TEXT DEFAULT 'v2c',
+    error_message        TEXT DEFAULT ''
+);
+
+SELECT create_hypertable(
+    'snmp_poll_metrics',
+    'time',
+    chunk_time_interval => INTERVAL '1 day',
+    if_not_exists => TRUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_snmp_poll_metrics_time
+    ON snmp_poll_metrics (time DESC);
+CREATE INDEX IF NOT EXISTS idx_snmp_poll_metrics_dev_time
+    ON snmp_poll_metrics (device_ip, time DESC);
+
+SELECT add_retention_policy('snmp_poll_metrics', INTERVAL '30 days', if_not_exists => TRUE);
+
+-- UPS Power, Battery & Runtime Historical Telemetry
+CREATE TABLE IF NOT EXISTS ups_metrics_raw (
+    time                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    device_ip             TEXT NOT NULL,
+    battery_charge_pct    DOUBLE PRECISION,
+    output_load_pct       DOUBLE PRECISION,
+    runtime_remaining_sec INT,
+    input_voltage_v       DOUBLE PRECISION,
+    output_voltage_v      DOUBLE PRECISION,
+    output_watts          DOUBLE PRECISION,
+    battery_temp_c        DOUBLE PRECISION,
+    output_status         TEXT DEFAULT ''
+);
+
+SELECT create_hypertable(
+    'ups_metrics_raw',
+    'time',
+    chunk_time_interval => INTERVAL '1 day',
+    if_not_exists => TRUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_ups_metrics_raw_dev_time
+    ON ups_metrics_raw (device_ip, time DESC);
+
+SELECT add_retention_policy('ups_metrics_raw', INTERVAL '180 days', if_not_exists => TRUE);
+
 -- ==============================================================================
 -- 3. Allowed-Subnet Network Scanner (<10 Subnets)
 -- ==============================================================================

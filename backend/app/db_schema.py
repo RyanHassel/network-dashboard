@@ -85,6 +85,40 @@ CREATE TABLE IF NOT EXISTS custom_mibs (
     objects        JSONB DEFAULT '[]'::jsonb,
     uploaded_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS snmp_poll_metrics (
+    time                 TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    device_ip            TEXT NOT NULL,
+    success              BOOLEAN NOT NULL DEFAULT TRUE,
+    poll_duration_ms     DOUBLE PRECISION NOT NULL DEFAULT 0,
+    oid_walks            INT NOT NULL DEFAULT 0,
+    oids_collected       INT NOT NULL DEFAULT 0,
+    interfaces_ingested  INT NOT NULL DEFAULT 0,
+    responding_mib_count INT NOT NULL DEFAULT 0,
+    snmp_version         TEXT DEFAULT 'v2c',
+    error_message        TEXT DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_snmp_poll_metrics_time
+    ON snmp_poll_metrics (time DESC);
+CREATE INDEX IF NOT EXISTS idx_snmp_poll_metrics_dev_time
+    ON snmp_poll_metrics (device_ip, time DESC);
+
+CREATE TABLE IF NOT EXISTS ups_metrics_raw (
+    time                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    device_ip             TEXT NOT NULL,
+    battery_charge_pct    DOUBLE PRECISION,
+    output_load_pct       DOUBLE PRECISION,
+    runtime_remaining_sec INT,
+    input_voltage_v       DOUBLE PRECISION,
+    output_voltage_v      DOUBLE PRECISION,
+    output_watts          DOUBLE PRECISION,
+    battery_temp_c        DOUBLE PRECISION,
+    output_status         TEXT DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_ups_metrics_raw_dev_time
+    ON ups_metrics_raw (device_ip, time DESC);
 """
 
 
@@ -92,6 +126,20 @@ async def ensure_dynamic_config_tables(pool: asyncpg.Pool) -> None:
     """Ensures dynamic configuration tables and default settings exist."""
     async with pool.acquire() as conn:
         await conn.execute(DYNAMIC_CONFIG_DDL)
+
+        for tbl, ret_days in (("snmp_poll_metrics", 30), ("ups_metrics_raw", 180)):
+            try:
+                await conn.execute(
+                    f"SELECT create_hypertable('{tbl}', 'time', chunk_time_interval => INTERVAL '1 day', if_not_exists => TRUE)"
+                )
+            except Exception as exc:
+                logger.debug("create_hypertable(%s) note: %s", tbl, exc)
+            try:
+                await conn.execute(
+                    f"SELECT add_retention_policy('{tbl}', INTERVAL '{ret_days} days', if_not_exists => TRUE)"
+                )
+            except Exception as exc:
+                logger.debug("add_retention_policy(%s) note: %s", tbl, exc)
 
         await conn.execute(
             """

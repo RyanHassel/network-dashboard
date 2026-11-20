@@ -50,7 +50,7 @@ VENDOR_CATALOG: List[Dict[str, Any]] = [
     {
         "key": "apc",
         "pens": ["318"],
-        "keywords": ["apc", "smart-ups", "powernet", "schneider", "symmetra"],
+        "keywords": ["apc", "smart-ups", "back-ups", "powernet", "schneider", "symmetra", "ap96"],
         "vendor_name": "APC by Schneider Electric",
         "category": "UPS / Power Distribution",
         "mibs": ["SNMPv2-MIB", "IF-MIB", "PowerNet-UPS-MIB", "UPS-MIB"],
@@ -58,7 +58,7 @@ VENDOR_CATALOG: List[Dict[str, Any]] = [
     {
         "key": "cyberpower",
         "pens": ["3808"],
-        "keywords": ["cyberpower", "rmcard"],
+        "keywords": ["cyberpower", "rmcard", "cps"],
         "vendor_name": "CyberPower Systems",
         "category": "UPS / Power Protection",
         "mibs": ["SNMPv2-MIB", "IF-MIB", "UPS-MIB", "CPS-MIB"],
@@ -66,7 +66,7 @@ VENDOR_CATALOG: List[Dict[str, Any]] = [
     {
         "key": "eaton",
         "pens": ["534"],
-        "keywords": ["eaton", "powerware"],
+        "keywords": ["eaton", "powerware", "tripp lite", "tripplite"],
         "vendor_name": "Eaton Corporation",
         "category": "UPS / Power Management",
         "mibs": ["SNMPv2-MIB", "IF-MIB", "UPS-MIB", "ENTITY-MIB"],
@@ -182,6 +182,14 @@ VENDOR_CATALOG: List[Dict[str, Any]] = [
         "vendor_name": "Microsoft Windows",
         "category": "Windows Host / Server",
         "mibs": ["SNMPv2-MIB", "IF-MIB", "HOST-RESOURCES-MIB"],
+    },
+    {
+        "key": "ups",
+        "pens": ["850"],
+        "keywords": ["uninterruptible", "battery backup", "ups-mib"],
+        "vendor_name": "UPS Power Backup",
+        "category": "UPS / Power Distribution",
+        "mibs": ["SNMPv2-MIB", "IF-MIB", "UPS-MIB", "PowerNet-UPS-MIB"],
     },
     {
         "key": "linux",
