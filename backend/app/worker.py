@@ -276,7 +276,11 @@ async def live_traffic_loop(
                 SELECT DISTINCT device_ip, if_index
                 FROM snmp_metrics_raw
                 WHERE time > NOW() - INTERVAL '24 hours'
-                  AND COALESCE(LOWER(if_name), '') IN ('lo', 'loopback', 'null0')
+                  AND (
+                      COALESCE(LOWER(if_name), '') IN ('lo', 'lo0', 'loopback', 'loopback0', 'null0')
+                      OR COALESCE(LOWER(if_name), '') LIKE '%loopback%'
+                      OR COALESCE(LOWER(if_descr), '') LIKE '%loopback%'
+                  )
                 """
             )
             raw_graph = await conn.fetchval(

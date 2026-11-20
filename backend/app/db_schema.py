@@ -1,5 +1,7 @@
 import json
 import logging
+from typing import Any, Dict
+
 import asyncpg
 
 logger = logging.getLogger("netdash.schema")
@@ -172,54 +174,158 @@ async def ensure_dynamic_config_tables(pool: asyncpg.Pool) -> None:
     await repair_implausible_snmp_spikes(pool)
 
 
-async def repair_implausible_snmp_spikes(pool: asyncpg.Pool) -> None:
-    """Zeros out historical SNMP counter-drop spike artifacts on recent uncompressed chunks."""
+async def repair_implausible_snmp_spikes(
+    pool: asyncpg.Pool, force_refresh: bool = False
+) -> Dict[str, Any]:
+    """Zeros out historical SNMP counter-drop/zero-baseline/rate-mismatch spike artifacts across all devices."""
+    updated_rows = 0
+    repaired_by_device: Dict[str, int] = {}
     try:
         async with pool.acquire() as conn:
             marker_exists = bool(
                 await conn.fetchval(
-                    "SELECT 1 FROM app_settings WHERE key = 'snmp_spike_cleanup_v1'"
+                    "SELECT 1 FROM app_settings WHERE key = 'snmp_spike_cleanup_v2'"
                 )
             )
-            status = await conn.execute(
+            repaired_rows = await conn.fetch(
                 """
-                WITH dev_caps AS (
+                WITH if_caps AS (
                     SELECT device_ip,
-                           LEAST(
-                               GREATEST(COALESCE(MAX(if_speed_bps), 0) * 1.25, 10000000000.0),
-                               40000000000.0
-                           ) AS dev_max_bps
+                           if_index,
+                           COALESCE(MAX(NULLIF(if_speed_bps, 0)), 0) AS known_if_speed
                     FROM snmp_metrics_raw
-                    WHERE time > NOW() - INTERVAL '6 days'
-                    GROUP BY device_ip
+                    WHERE time > NOW() - INTERVAL '7 days'
+                    GROUP BY device_ip, if_index
+                ),
+                dev_caps AS (
+                    SELECT m.device_ip,
+                           COALESCE(MAX(NULLIF(m.if_speed_bps, 0)), 0) AS known_dev_speed,
+                           COALESCE(
+                               BOOL_OR(
+                                   d.device_category ILIKE '%ups%'
+                                   OR d.device_category ILIKE '%printer%'
+                                   OR (d.extended_metrics ? 'ups_telemetry')
+                               ),
+                               FALSE
+                           ) AS is_low_bw
+                    FROM snmp_metrics_raw m
+                    LEFT JOIN snmp_devices d ON d.device_ip = m.device_ip
+                    WHERE m.time > NOW() - INTERVAL '7 days'
+                    GROUP BY m.device_ip
+                ),
+                windowed AS (
+                    SELECT time,
+                           device_ip,
+                           if_index,
+                           if_speed_bps,
+                           in_octets,
+                           out_octets,
+                           in_bps,
+                           out_bps,
+                           sys_uptime,
+                           LAG(time) OVER (PARTITION BY device_ip, if_index ORDER BY time ASC) AS prev_time,
+                           LAG(time, 2) OVER (PARTITION BY device_ip, if_index ORDER BY time ASC) AS prev2_time,
+                           LAG(in_octets) OVER (PARTITION BY device_ip, if_index ORDER BY time ASC) AS prev_in_oct,
+                           LAG(in_octets, 2) OVER (PARTITION BY device_ip, if_index ORDER BY time ASC) AS prev2_in_oct,
+                           LAG(out_octets) OVER (PARTITION BY device_ip, if_index ORDER BY time ASC) AS prev_out_oct,
+                           LAG(out_octets, 2) OVER (PARTITION BY device_ip, if_index ORDER BY time ASC) AS prev2_out_oct,
+                           LAG(sys_uptime) OVER (PARTITION BY device_ip, if_index ORDER BY time ASC) AS prev_uptime,
+                           MAX(in_octets) OVER (
+                               PARTITION BY device_ip, if_index
+                               ORDER BY time ASC
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                           ) AS prior_max_in_oct,
+                           MAX(out_octets) OVER (
+                               PARTITION BY device_ip, if_index
+                               ORDER BY time ASC
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                           ) AS prior_max_out_oct
+                    FROM snmp_metrics_raw
+                    WHERE time > NOW() - INTERVAL '7 days'
+                ),
+                scored AS (
+                    SELECT r.*,
+                           CASE
+                               WHEN COALESCE(NULLIF(r.if_speed_bps, 0), NULLIF(ic.known_if_speed, 0), NULLIF(dc.known_dev_speed, 0), 0) > 0
+                                   THEN LEAST(
+                                       COALESCE(NULLIF(r.if_speed_bps, 0), NULLIF(ic.known_if_speed, 0), NULLIF(dc.known_dev_speed, 0), 0)::double precision * 1.15,
+                                       40000000000.0
+                                   )
+                               WHEN dc.is_low_bw THEN 115000000.0
+                               ELSE 10000000000.0
+                           END AS row_cap_bps,
+                           COALESCE(EXTRACT(EPOCH FROM (r.time - r.prev_time)), 0.0) AS dt_sec,
+                           COALESCE(EXTRACT(EPOCH FROM (r.time - r.prev2_time)), 0.0) AS dt2_sec
+                    FROM windowed r
+                    JOIN if_caps ic ON ic.device_ip = r.device_ip AND ic.if_index = r.if_index
+                    JOIN dev_caps dc ON dc.device_ip = r.device_ip
+                    WHERE r.time > NOW() - INTERVAL '6 days'
                 ),
                 flagged AS (
-                    SELECT r.time,
-                           r.device_ip,
-                           r.if_index,
+                    SELECT s.time,
+                           s.device_ip,
+                           s.if_index,
                            (
-                               (COALESCE(r.if_speed_bps, 0) > 0 AND r.in_bps > GREATEST(r.if_speed_bps * 1.25, 100000000.0))
-                               OR r.in_bps > dc.dev_max_bps
-                               OR (r.prev_in_oct = 0 AND r.in_bps > 500000000.0)
+                               s.in_bps > s.row_cap_bps
+                               OR (s.prev_in_oct IS NULL AND s.in_bps > 0)
+                               OR (s.prev_in_oct = 0 AND s.in_bps > 0 AND (COALESCE(s.prior_max_in_oct, 0) > 0 OR s.in_bps > 5000000.0))
+                               OR (s.prev_in_oct IS NOT NULL AND s.in_octets <= s.prev_in_oct AND s.in_bps > 0)
+                               OR (COALESCE(s.prev_uptime, 0) > 0 AND COALESCE(s.sys_uptime, 0) > 0 AND s.sys_uptime < s.prev_uptime AND s.in_bps > 0)
+                               OR (
+                                   s.dt_sec >= 5.0
+                                   AND s.prev_in_oct > 0
+                                   AND s.in_octets > s.prev_in_oct
+                                   AND s.in_bps > 1000000.0
+                                   AND s.in_bps > GREATEST(
+                                       ((s.in_octets::double precision - s.prev_in_oct::double precision) * 8.0 / GREATEST(s.dt_sec, 5.0)) * 3.0,
+                                       1000000.0
+                                   )
+                               )
+                               OR (
+                                   s.dt_sec > 0.0
+                                   AND s.dt_sec < 5.0
+                                   AND s.prev2_time IS NOT NULL
+                                   AND s.dt2_sec >= 5.0
+                                   AND s.prev2_in_oct > 0
+                                   AND s.in_octets >= s.prev2_in_oct
+                                   AND s.in_bps > 10000000.0
+                                   AND s.in_bps > GREATEST(
+                                       ((s.in_octets::double precision - s.prev2_in_oct::double precision) * 8.0 / GREATEST(s.dt2_sec, 5.0)) * 4.0,
+                                       1000000.0
+                                   )
+                               )
                            ) AS bad_in,
                            (
-                               (COALESCE(r.if_speed_bps, 0) > 0 AND r.out_bps > GREATEST(r.if_speed_bps * 1.25, 100000000.0))
-                               OR r.out_bps > dc.dev_max_bps
-                               OR (r.prev_out_oct = 0 AND r.out_bps > 500000000.0)
+                               s.out_bps > s.row_cap_bps
+                               OR (s.prev_out_oct IS NULL AND s.out_bps > 0)
+                               OR (s.prev_out_oct = 0 AND s.out_bps > 0 AND (COALESCE(s.prior_max_out_oct, 0) > 0 OR s.out_bps > 5000000.0))
+                               OR (s.prev_out_oct IS NOT NULL AND s.out_octets <= s.prev_out_oct AND s.out_bps > 0)
+                               OR (COALESCE(s.prev_uptime, 0) > 0 AND COALESCE(s.sys_uptime, 0) > 0 AND s.sys_uptime < s.prev_uptime AND s.out_bps > 0)
+                               OR (
+                                   s.dt_sec >= 5.0
+                                   AND s.prev_out_oct > 0
+                                   AND s.out_octets > s.prev_out_oct
+                                   AND s.out_bps > 1000000.0
+                                   AND s.out_bps > GREATEST(
+                                       ((s.out_octets::double precision - s.prev_out_oct::double precision) * 8.0 / GREATEST(s.dt_sec, 5.0)) * 3.0,
+                                       1000000.0
+                                   )
+                               )
+                               OR (
+                                   s.dt_sec > 0.0
+                                   AND s.dt_sec < 5.0
+                                   AND s.prev2_time IS NOT NULL
+                                   AND s.dt2_sec >= 5.0
+                                   AND s.prev2_out_oct > 0
+                                   AND s.out_octets >= s.prev2_out_oct
+                                   AND s.out_bps > 10000000.0
+                                   AND s.out_bps > GREATEST(
+                                       ((s.out_octets::double precision - s.prev2_out_oct::double precision) * 8.0 / GREATEST(s.dt2_sec, 5.0)) * 4.0,
+                                       1000000.0
+                                   )
+                               )
                            ) AS bad_out
-                    FROM (
-                        SELECT time,
-                               device_ip,
-                               if_index,
-                               if_speed_bps,
-                               in_bps,
-                               out_bps,
-                               LAG(in_octets) OVER (PARTITION BY device_ip, if_index ORDER BY time ASC) AS prev_in_oct,
-                               LAG(out_octets) OVER (PARTITION BY device_ip, if_index ORDER BY time ASC) AS prev_out_oct
-                        FROM snmp_metrics_raw
-                        WHERE time > NOW() - INTERVAL '6 days'
-                    ) r
-                    JOIN dev_caps dc ON dc.device_ip = r.device_ip
+                    FROM scored s
                 )
                 UPDATE snmp_metrics_raw t
                 SET in_bps = CASE WHEN f.bad_in THEN 0 ELSE t.in_bps END,
@@ -229,19 +335,23 @@ async def repair_implausible_snmp_spikes(pool: asyncpg.Pool) -> None:
                   AND t.device_ip = f.device_ip
                   AND t.if_index = f.if_index
                   AND (f.bad_in OR f.bad_out)
+                RETURNING t.device_ip
                 """
             )
-            updated_rows = 0
-            if isinstance(status, str) and status.startswith("UPDATE "):
-                try:
-                    updated_rows = int(status.split()[-1])
-                except ValueError:
-                    updated_rows = 0
+            for row in repaired_rows:
+                dip = str(row["device_ip"])
+                repaired_by_device[dip] = repaired_by_device.get(dip, 0) + 1
+            updated_rows = len(repaired_rows)
 
             if updated_rows > 0:
-                logger.info("Repaired %d implausible SNMP spike row(s) in snmp_metrics_raw.", updated_rows)
+                logger.info(
+                    "Repaired %d implausible SNMP spike row(s) across %d device(s): %s",
+                    updated_rows,
+                    len(repaired_by_device),
+                    repaired_by_device,
+                )
 
-            if updated_rows > 0 or not marker_exists:
+            if updated_rows > 0 or not marker_exists or force_refresh:
                 for view_name in ("snmp_metrics_hourly", "snmp_metrics_daily"):
                     try:
                         await conn.execute(
@@ -253,10 +363,11 @@ async def repair_implausible_snmp_spikes(pool: asyncpg.Pool) -> None:
                 await conn.execute(
                     """
                     INSERT INTO app_settings (key, value)
-                    VALUES ('snmp_spike_cleanup_v1', $1::jsonb)
+                    VALUES ('snmp_spike_cleanup_v2', $1::jsonb)
                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
                     """,
-                    json.dumps({"repaired_rows": updated_rows}),
+                    json.dumps({"repaired_rows": updated_rows, "repaired_devices": repaired_by_device}),
                 )
     except Exception as exc:
         logger.warning("SNMP spike cleanup skipped: %s", exc)
+    return {"repaired_rows": updated_rows, "repaired_devices": repaired_by_device}

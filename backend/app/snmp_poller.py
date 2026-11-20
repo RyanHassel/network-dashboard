@@ -71,6 +71,32 @@ def _to_int(val: Optional[str], default: int = 0) -> int:
         return default
 
 
+def _parse_counter_int(val: Optional[str]) -> Optional[int]:
+    """Parses a non-negative SNMP counter reading; returns None for errors/missing/negative text."""
+    if not val:
+        return None
+    s = val.strip().replace('"', "")
+    if not s or "No Such" in s or "End of MIB" in s or "Wrong Type" in s:
+        return None
+    token = s.split()[0]
+    try:
+        parsed = int(float(token))
+        return parsed if parsed >= 0 else None
+    except ValueError:
+        return None
+
+
+def _is_loopback_interface(name: str, descr: str = "") -> bool:
+    """Identifies loopback or null virtual interfaces by SNMP ifName or ifDescr."""
+    for raw in (name, descr):
+        s = (raw or "").strip().lower()
+        if not s:
+            continue
+        if s in ("lo", "lo0", "loopback", "loopback0", "null0") or s.startswith("lo0") or "loopback" in s:
+            return True
+    return False
+
+
 def _compute_safe_rate_bps(
     delta_octets: int,
     dt: float,
@@ -83,11 +109,11 @@ def _compute_safe_rate_bps(
     if delta_octets <= 0 or dt < min_dt:
         return 0.0
     rate_bps = (delta_octets * 8.0) / dt
-    # Guard against cumulative lifetime octets jumping from a 0 baseline
-    if prev_octets == 0 and rate_bps > 1_000_000_000.0:
+    # Guard against cumulative lifetime octets dumping when baseline starts/resets at 0
+    if prev_octets == 0 and rate_bps > 5_000_000.0:
         logger.debug("Ignoring implausible zero-baseline SNMP rate jump: %.2f bps", rate_bps)
         return 0.0
-    max_bps = max(speed_bps * 1.25, 100_000_000.0) if speed_bps > 0 else max_fallback_bps
+    max_bps = min(speed_bps * 1.15, 40_000_000_000.0) if speed_bps > 0 else max_fallback_bps
     if rate_bps > max_bps:
         logger.debug("Ignoring implausible SNMP rate %.2f bps > ceiling %.2f bps", rate_bps, max_bps)
         return 0.0
@@ -677,6 +703,7 @@ class SNMPPoller:
         self._live_ignore_indices: Dict[str, Set[int]] = {}
         self._live_if_speeds: Dict[Tuple[str, int], int] = {}
         self._live_dev_max_speed: Dict[str, float] = {}
+        self._device_locks: Dict[str, asyncio.Lock] = {}
 
     @staticmethod
     def _build_auth_args(profile: Dict[str, Any]) -> List[str]:
@@ -1362,6 +1389,20 @@ class SNMPPoller:
         redis_client: aioredis.Redis,
     ) -> Optional[Dict[str, Any]]:
         target = str(target_cfg["device_ip"]).strip()
+        lock = self._device_locks.get(target)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._device_locks[target] = lock
+        async with lock:
+            return await self._poll_single_device_locked(target_cfg, pool, redis_client)
+
+    async def _poll_single_device_locked(
+        self,
+        target_cfg: Dict[str, Any],
+        pool: asyncpg.Pool,
+        redis_client: aioredis.Redis,
+    ) -> Optional[Dict[str, Any]]:
+        target = str(target_cfg["device_ip"]).strip()
         label = str(target_cfg.get("label") or "").strip()
         port = int(target_cfg.get("port") or self.default_port)
         snmp_version = str(target_cfg.get("version") or self.default_version).strip().lower()
@@ -1422,6 +1463,12 @@ class SNMPPoller:
         # Bound per-device subprocess concurrency to avoid SNMP agent throttling/drops
         dev_sem = asyncio.Semaphore(6)
 
+        async def _timed_walk(oid_prefix: str) -> Tuple[Dict[str, str], float]:
+            data = await self._snmp_walk_oid(
+                target, port, auth_args, oid_prefix, sem=dev_sem, stats=poll_stats
+            )
+            return data, time.time()
+
         # Walk interface tables, IP address table, HR processor load, and vendor enrichment MIBs
         (
             if_names,
@@ -1431,8 +1478,8 @@ class SNMPPoller:
             if_speed32,
             if_phys,
             if_oper,
-            hc_in,
-            hc_out,
+            (hc_in, in_oct_ts),
+            (hc_out, out_oct_ts),
             in_errs,
             out_errs,
             in_disc,
@@ -1448,8 +1495,8 @@ class SNMPPoller:
             self._snmp_walk_oid(target, port, auth_args, OID_IF_SPEED, sem=dev_sem, stats=poll_stats),
             self._snmp_walk_oid(target, port, auth_args, OID_IF_PHYS_ADDR, sem=dev_sem, stats=poll_stats),
             self._snmp_walk_oid(target, port, auth_args, OID_IF_OPER_STATUS, sem=dev_sem, stats=poll_stats),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_HC_IN_OCTETS, sem=dev_sem, stats=poll_stats),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_HC_OUT_OCTETS, sem=dev_sem, stats=poll_stats),
+            _timed_walk(OID_IF_HC_IN_OCTETS),
+            _timed_walk(OID_IF_HC_OUT_OCTETS),
             self._snmp_walk_oid(target, port, auth_args, OID_IF_IN_ERRORS, sem=dev_sem, stats=poll_stats),
             self._snmp_walk_oid(target, port, auth_args, OID_IF_OUT_ERRORS, sem=dev_sem, stats=poll_stats),
             self._snmp_walk_oid(target, port, auth_args, OID_IF_IN_DISCARDS, sem=dev_sem, stats=poll_stats),
@@ -1473,9 +1520,9 @@ class SNMPPoller:
         # Fallback to 32-bit IF-MIB counters when 64-bit HC counters are unavailable
         used_counter_bits = 64
         if not hc_in and not hc_out:
-            hc_in, hc_out = await asyncio.gather(
-                self._snmp_walk_oid(target, port, auth_args, OID_IF_IN_OCTETS, sem=dev_sem, stats=poll_stats),
-                self._snmp_walk_oid(target, port, auth_args, OID_IF_OUT_OCTETS, sem=dev_sem, stats=poll_stats),
+            (hc_in, in_oct_ts), (hc_out, out_oct_ts) = await asyncio.gather(
+                _timed_walk(OID_IF_IN_OCTETS),
+                _timed_walk(OID_IF_OUT_OCTETS),
             )
             if hc_in or hc_out:
                 used_counter_bits = 32
@@ -1542,7 +1589,6 @@ class SNMPPoller:
         mem_usage = float(enrichment["mem_pct"] or 0.0)
         temp_celsius = enrichment["temp_celsius"]
 
-        now_epoch = time.time()
         all_indices = sorted(
             {int(k) for k in set(if_names.keys()) | set(if_descrs.keys()) if k.isdigit()}
         )
@@ -1551,14 +1597,17 @@ class SNMPPoller:
         for idx in all_indices:
             k = str(idx)
             high_speed_mbps = _to_int(if_speeds.get(k), 0)
-            if_speed_map[idx] = (
-                high_speed_mbps * 1_000_000 if high_speed_mbps > 0 else _to_int(if_speed32.get(k), 0)
-            )
+            raw_spd = high_speed_mbps * 1_000_000 if high_speed_mbps > 0 else _to_int(if_speed32.get(k), 0)
+            if raw_spd == 0:
+                raw_spd = self._live_if_speeds.get((target, idx), 0)
+            if_speed_map[idx] = raw_spd
         max_device_speed_bps = max(if_speed_map.values(), default=0)
-        fallback_cap_bps = min(
-            max(max_device_speed_bps * 1.25, 10_000_000_000.0),
-            100_000_000_000.0,
-        )
+        if max_device_speed_bps > 0:
+            fallback_cap_bps = min(max_device_speed_bps * 1.15, 40_000_000_000.0)
+        elif vendor_profile["key"] in ("apc", "cyberpower", "eaton", "ups", "printer"):
+            fallback_cap_bps = 115_000_000.0
+        else:
+            fallback_cap_bps = 10_000_000_000.0
         self._live_dev_max_speed[target] = fallback_cap_bps
 
         rows_to_insert: List[Tuple[Any, ...]] = []
@@ -1566,20 +1615,19 @@ class SNMPPoller:
         for idx in all_indices:
             k = str(idx)
             name = if_names.get(k) or if_descrs.get(k) or f"if{idx}"
-            if name.strip().lower() in ("lo", "loopback", "null0"):
-                loopback_indices.add(idx)
             descr = if_descrs.get(k) or name
+            if _is_loopback_interface(name, descr):
+                loopback_indices.add(idx)
             alias = if_aliases.get(k, "")
             speed_bps = if_speed_map.get(idx, 0)
-            self._live_if_speeds[(target, idx)] = speed_bps
+            if speed_bps > 0:
+                self._live_if_speeds[(target, idx)] = speed_bps
 
             oper_raw = (if_oper.get(k) or "1").strip()
             oper_status = 1 if (_to_int(oper_raw, 2) == 1 or oper_raw.lower().startswith("up")) else 2
 
-            has_in = k in hc_in
-            has_out = k in hc_out
-            in_oct = _to_int(hc_in.get(k), 0) if has_in else 0
-            out_oct = _to_int(hc_out.get(k), 0) if has_out else 0
+            parsed_in = _parse_counter_int(hc_in.get(k)) if k in hc_in else None
+            parsed_out = _parse_counter_int(hc_out.get(k)) if k in hc_out else None
             in_err = _to_int(in_errs.get(k), 0)
             out_err = _to_int(out_errs.get(k), 0)
             in_dsc = _to_int(in_disc.get(k), 0)
@@ -1621,41 +1669,70 @@ class SNMPPoller:
             rebooted = sys_uptime > 0 and prev_uptime > 0 and sys_uptime < prev_uptime
             reset_baseline = width_changed or rebooted
 
+            transient_zero_in = (
+                parsed_in == 0 and not reset_baseline and prev_in is not None and prev_in > 0
+            )
+            transient_zero_out = (
+                parsed_out == 0 and not reset_baseline and prev_out is not None and prev_out > 0
+            )
+            has_in = parsed_in is not None and not transient_zero_in
+            has_out = parsed_out is not None and not transient_zero_out
+            in_oct = parsed_in if has_in and parsed_in is not None else 0
+            out_oct = parsed_out if has_out and parsed_out is not None else 0
+
             in_bps = 0.0
             out_bps = 0.0
             if not reset_baseline:
                 if has_in and prev_in is not None and prev_in_ts is not None:
                     in_bps = _compute_safe_rate_bps(
                         in_oct - prev_in,
-                        now_epoch - prev_in_ts,
+                        in_oct_ts - prev_in_ts,
                         speed_bps,
                         prev_in,
                         max_fallback_bps=fallback_cap_bps,
-                        min_dt=1.0,
+                        min_dt=5.0,
                     )
                 if has_out and prev_out is not None and prev_out_ts is not None:
                     out_bps = _compute_safe_rate_bps(
                         out_oct - prev_out,
-                        now_epoch - prev_out_ts,
+                        out_oct_ts - prev_out_ts,
                         speed_bps,
                         prev_out,
                         max_fallback_bps=fallback_cap_bps,
-                        min_dt=1.0,
+                        min_dt=5.0,
                     )
 
             next_state: Dict[str, Any] = {
                 "counter_bits": used_counter_bits,
                 "sys_uptime": sys_uptime,
             }
-            if has_in:
-                next_state["in_ts"] = now_epoch
+            if (
+                has_in
+                and not reset_baseline
+                and prev_in is not None
+                and prev_in_ts is not None
+                and (in_oct_ts - prev_in_ts) < 5.0
+            ):
+                next_state["in_ts"] = prev_in_ts
+                next_state["in_oct"] = prev_in
+            elif has_in:
+                next_state["in_ts"] = in_oct_ts
                 next_state["in_oct"] = in_oct
             elif not reset_baseline and prev_in is not None and prev_in_ts is not None:
                 next_state["in_ts"] = prev_in_ts
                 next_state["in_oct"] = prev_in
 
-            if has_out:
-                next_state["out_ts"] = now_epoch
+            if (
+                has_out
+                and not reset_baseline
+                and prev_out is not None
+                and prev_out_ts is not None
+                and (out_oct_ts - prev_out_ts) < 5.0
+            ):
+                next_state["out_ts"] = prev_out_ts
+                next_state["out_oct"] = prev_out
+            elif has_out:
+                next_state["out_ts"] = out_oct_ts
                 next_state["out_oct"] = out_oct
             elif not reset_baseline and prev_out is not None and prev_out_ts is not None:
                 next_state["out_ts"] = prev_out_ts
@@ -2153,19 +2230,25 @@ class SNMPPoller:
                 elif idx in ignore:
                     continue
                 k = str(idx)
-                has_in = k in hc_in
-                has_out = k in hc_out
-                if not has_in and not has_out:
+                parsed_in = _parse_counter_int(hc_in.get(k)) if k in hc_in else None
+                parsed_out = _parse_counter_int(hc_out.get(k)) if k in hc_out else None
+                if parsed_in is None and parsed_out is None:
                     continue
-                in_oct = _to_int(hc_in.get(k), 0) if has_in else 0
-                out_oct = _to_int(hc_out.get(k), 0) if has_out else 0
                 speed_bps = self._live_if_speeds.get((ip, idx), 0)
 
                 prev = self._live_prev_counters.get((ip, idx))
                 width_changed = prev is not None and prev.get("bits") != used_bits
+                prev_in_val = int(prev["in_oct"]) if prev and prev.get("in_oct") is not None else None
+                prev_out_val = int(prev["out_oct"]) if prev and prev.get("out_oct") is not None else None
+                transient_zero_in = parsed_in == 0 and not width_changed and prev_in_val is not None and prev_in_val > 0
+                transient_zero_out = parsed_out == 0 and not width_changed and prev_out_val is not None and prev_out_val > 0
+                has_in = parsed_in is not None and not transient_zero_in
+                has_out = parsed_out is not None and not transient_zero_out
+                in_oct = parsed_in if has_in and parsed_in is not None else 0
+                out_oct = parsed_out if has_out and parsed_out is not None else 0
+
                 if prev is not None and not width_changed:
-                    if has_in and prev.get("in_oct") is not None and prev.get("in_ts") is not None:
-                        prev_in_val = int(prev["in_oct"])
+                    if has_in and prev_in_val is not None and prev.get("in_ts") is not None:
                         dt_in = now_epoch - float(prev["in_ts"])
                         if dt_in >= 0.4:
                             rate_in = _compute_safe_rate_bps(
@@ -2178,8 +2261,7 @@ class SNMPPoller:
                             )
                             dev_rx += rate_in
                             has_delta = True
-                    if has_out and prev.get("out_oct") is not None and prev.get("out_ts") is not None:
-                        prev_out_val = int(prev["out_oct"])
+                    if has_out and prev_out_val is not None and prev.get("out_ts") is not None:
                         dt_out = now_epoch - float(prev["out_ts"])
                         if dt_out >= 0.4:
                             rate_out = _compute_safe_rate_bps(

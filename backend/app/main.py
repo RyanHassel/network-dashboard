@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnec
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from app.db_schema import ensure_dynamic_config_tables
+from app.db_schema import ensure_dynamic_config_tables, repair_implausible_snmp_spikes
 from app.mib_catalog import (
     MIBS_DIR,
     VENDOR_CATALOG,
@@ -1504,14 +1504,18 @@ async def get_overview_graph_options() -> Dict[str, Any]:
             FROM snmp_devices
             """
         )
+        clean_in_z = _clean_bps_sql("in_bps", coalesce_zero=True)
+        clean_out_z = _clean_bps_sql("out_bps", coalesce_zero=True)
         if_rows = await conn.fetch(
-            """
+            f"""
             SELECT DISTINCT ON (device_ip, if_index)
                 device_ip, if_index, if_name, if_descr, if_alias,
-                if_speed_bps, if_oper_status, in_bps, out_bps
+                if_speed_bps, if_oper_status,
+                {clean_in_z} AS in_bps,
+                {clean_out_z} AS out_bps
             FROM snmp_metrics_raw
             WHERE time > NOW() - INTERVAL '7 days'
-              AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+              AND {_NON_LOOPBACK_SQL}
             ORDER BY device_ip, if_index, time DESC
             """
         )
@@ -2086,11 +2090,18 @@ async def delete_unifi_controller(ctrl_id: int) -> Dict[str, Any]:
 # ==============================================================================
 
 
+_NON_LOOPBACK_SQL = (
+    "COALESCE(LOWER(if_name), '') NOT IN ('lo', 'lo0', 'loopback', 'loopback0', 'null0') "
+    "AND COALESCE(LOWER(if_name), '') NOT LIKE '%loopback%' "
+    "AND COALESCE(LOWER(if_descr), '') NOT LIKE '%loopback%'"
+)
+
+
 def _clean_bps_sql(col: str, coalesce_zero: bool = False) -> str:
     """SQL expression that masks physically impossible SNMP throughput counter spikes."""
     expr = (
         f"CASE WHEN (COALESCE(if_speed_bps, 0) > 0 "
-        f"AND {col} > GREATEST(if_speed_bps * 1.25, 100000000.0)) "
+        f"AND {col} > if_speed_bps * 1.15) "
         f"OR {col} > 40000000000.0 THEN NULL ELSE {col} END"
     )
     return f"COALESCE({expr}, 0)" if coalesce_zero else expr
@@ -2145,9 +2156,9 @@ async def _query_overview_traffic_series(
                     spec_ips.append(ip)
                     spec_indices.append(idx)
 
-        custom_where = """
+        custom_where = f"""
             (
-                (device_ip = ANY($1::text[]) AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0'))
+                (device_ip = ANY($1::text[]) AND {_NON_LOOPBACK_SQL})
                 OR (device_ip, if_index) IN (SELECT * FROM unnest($2::text[], $3::int[]))
             )
         """
@@ -2246,7 +2257,7 @@ async def _query_overview_traffic_series(
                                0.0 AS latency_ms
                         FROM snmp_metrics_hourly
                         WHERE bucket > NOW() - INTERVAL '7 days'
-                          AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+                          AND {_NON_LOOPBACK_SQL}
                         GROUP BY bucket
                         ORDER BY bucket ASC
                         """
@@ -2266,7 +2277,7 @@ async def _query_overview_traffic_series(
                                    AVG({clean_avg_out}) AS if_tx
                             FROM snmp_metrics_hourly
                             WHERE bucket > NOW() - INTERVAL '30 days'
-                              AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+                              AND {_NON_LOOPBACK_SQL}
                             GROUP BY 1, device_ip, if_index
                         ) sub
                         GROUP BY bucket
@@ -2289,7 +2300,7 @@ async def _query_overview_traffic_series(
                                AVG({clean_raw_out}) AS if_tx
                         FROM snmp_metrics_raw
                         WHERE time > NOW() - INTERVAL '{sql_interval}'
-                          AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+                          AND {_NON_LOOPBACK_SQL}
                         GROUP BY bucket, device_ip, if_index
                     ) sub
                     GROUP BY bucket
@@ -2445,13 +2456,17 @@ async def get_overview_traffic(
 @app.get("/api/snmp/interfaces")
 async def get_snmp_interfaces(device_ip: Optional[str] = None) -> Dict[str, Any]:
     pool = _get_pool()
+    c_in_z = _clean_bps_sql("in_bps", coalesce_zero=True)
+    c_out_z = _clean_bps_sql("out_bps", coalesce_zero=True)
     async with pool.acquire() as conn:
         if device_ip:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT DISTINCT ON (device_ip, if_index)
                     device_ip, hostname, if_index, if_name, if_descr, if_alias,
-                    if_speed_bps, if_oper_status, in_bps, out_bps,
+                    if_speed_bps, if_oper_status,
+                    {c_in_z} AS in_bps,
+                    {c_out_z} AS out_bps,
                     in_errors, out_errors, cpu_usage, sys_uptime, time
                 FROM snmp_metrics_raw
                 WHERE device_ip = $1 AND time > NOW() - INTERVAL '24 hours'
@@ -2461,10 +2476,12 @@ async def get_snmp_interfaces(device_ip: Optional[str] = None) -> Dict[str, Any]
             )
         else:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT DISTINCT ON (device_ip, if_index)
                     device_ip, hostname, if_index, if_name, if_descr, if_alias,
-                    if_speed_bps, if_oper_status, in_bps, out_bps,
+                    if_speed_bps, if_oper_status,
+                    {c_in_z} AS in_bps,
+                    {c_out_z} AS out_bps,
                     in_errors, out_errors, cpu_usage, sys_uptime, time
                 FROM snmp_metrics_raw
                 WHERE time > NOW() - INTERVAL '24 hours'
@@ -2530,6 +2547,12 @@ def _classify_device_profile(
 async def trigger_snmp_poll_all() -> Dict[str, str]:
     await _notify_worker("snmp_now")
     return {"status": "triggered", "message": "Immediate SNMP fleet poll queued."}
+
+
+@app.post("/api/snmp/repair-spikes")
+async def trigger_snmp_spike_repair() -> Dict[str, Any]:
+    """Scans recent raw SNMP interface metrics across all devices and zeros out counter-spike artifacts."""
+    return await repair_implausible_snmp_spikes(_get_pool(), force_refresh=True)
 
 
 @app.get("/api/snmp/telemetry")
@@ -2892,7 +2915,7 @@ async def get_snmp_trends(
                         FROM snmp_metrics_raw
                         WHERE device_ip = $1
                           AND time > NOW() - INTERVAL '{sql_interval}'
-                          AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+                          AND {_NON_LOOPBACK_SQL}
                         GROUP BY bucket, if_index
                     ) sub
                     GROUP BY bucket
@@ -2916,7 +2939,7 @@ async def get_snmp_trends(
                     FROM snmp_metrics_hourly
                     WHERE device_ip = $1
                       AND bucket > NOW() - INTERVAL '{sql_interval}'
-                      AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+                      AND {_NON_LOOPBACK_SQL}
                     GROUP BY bucket
                     ORDER BY bucket ASC
                     """,
@@ -2938,7 +2961,7 @@ async def get_snmp_trends(
                     FROM snmp_metrics_daily
                     WHERE device_ip = $1
                       {where_time}
-                      AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+                      AND {_NON_LOOPBACK_SQL}
                     GROUP BY bucket
                     ORDER BY bucket ASC
                     """,
@@ -3397,11 +3420,16 @@ async def get_device_detail(device_ip: str) -> Dict[str, Any]:
             device_ip,
         )
 
+        c_dev_in_z = _clean_bps_sql("in_bps", coalesce_zero=True)
+        c_dev_out_z = _clean_bps_sql("out_bps", coalesce_zero=True)
         snmp_if_rows = await conn.fetch(
-            """
+            f"""
             SELECT DISTINCT ON (if_index)
                 if_index, if_name, if_descr, if_alias, if_speed_bps, if_oper_status,
-                in_octets, out_octets, in_bps, out_bps, in_errors, out_errors,
+                in_octets, out_octets,
+                {c_dev_in_z} AS in_bps,
+                {c_dev_out_z} AS out_bps,
+                in_errors, out_errors,
                 in_discards, out_discards, cpu_usage, sys_uptime, time
             FROM snmp_metrics_raw
             WHERE device_ip = $1
