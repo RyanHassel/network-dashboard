@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 import asyncpg
 import httpx
 
+from app.db_schema import ensure_device_ids
+
 logger = logging.getLogger("netdash.unifi")
 
 
@@ -106,6 +108,7 @@ class UniFiCollector:
             online_devices = 0
 
             async with pool.acquire() as conn:
+                unifi_ips: List[str] = []
                 for dev in device_data:
                     mac = str(dev.get("mac", "")).lower()
                     if not mac:
@@ -126,6 +129,10 @@ class UniFiCollector:
                             lan_ip = parsed_host
                         except ValueError:
                             pass
+                    for cand_ip in (lan_ip, ip_addr):
+                        c_ip = str(cand_ip or "").strip()
+                        if c_ip and c_ip not in unifi_ips:
+                            unifi_ips.append(c_ip)
                     state_code = int(dev.get("state", 1) or 0)
                     status = "online" if state_code == 1 else "offline"
                     if state_code == 1:
@@ -241,6 +248,8 @@ class UniFiCollector:
                     if not mac:
                         continue
                     ip_addr = str(sta.get("ip", ""))
+                    if ip_addr and ip_addr not in unifi_ips:
+                        unifi_ips.append(ip_addr)
                     hostname = str(sta.get("name") or sta.get("hostname") or ip_addr or mac)
                     oui = str(sta.get("oui", ""))
                     is_wired = bool(sta.get("is_wired", False))
@@ -312,6 +321,9 @@ class UniFiCollector:
                         tx_bytes,
                         uptime_sec,
                     )
+
+                if unifi_ips:
+                    await ensure_device_ids(conn, unifi_ips, touch_last_seen=True)
 
                 await conn.execute(
                     """

@@ -1,12 +1,22 @@
 import json
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, List
 
 import asyncpg
 
 logger = logging.getLogger("netdash.schema")
 
 DYNAMIC_CONFIG_DDL = """
+CREATE TABLE IF NOT EXISTS device_registry (
+    id         SERIAL PRIMARY KEY,
+    ip_address TEXT NOT NULL UNIQUE,
+    first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_registry_ip
+    ON device_registry (ip_address);
+
 CREATE TABLE IF NOT EXISTS app_settings (
     key        TEXT PRIMARY KEY,
     value      JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -124,10 +134,100 @@ CREATE INDEX IF NOT EXISTS idx_ups_metrics_raw_dev_time
 """
 
 
+async def ensure_device_ids(
+    conn: asyncpg.Connection,
+    ips: Iterable[str],
+    touch_last_seen: bool = False,
+) -> Dict[str, int]:
+    """Ensures every IP has a persistent integer ID in device_registry and returns {ip: id}."""
+    cleaned: List[str] = []
+    seen: set = set()
+    for raw in ips:
+        ip_str = str(raw or "").strip()
+        if not ip_str or ip_str in seen:
+            continue
+        seen.add(ip_str)
+        cleaned.append(ip_str)
+
+    if not cleaned:
+        return {}
+
+    if touch_last_seen:
+        await conn.execute(
+            """
+            INSERT INTO device_registry (ip_address, first_seen, last_seen)
+            SELECT ip, NOW(), NOW()
+            FROM UNNEST($1::text[]) AS t(ip)
+            ON CONFLICT (ip_address) DO UPDATE SET
+                last_seen = NOW()
+            """,
+            cleaned,
+        )
+    else:
+        await conn.execute(
+            """
+            INSERT INTO device_registry (ip_address, first_seen, last_seen)
+            SELECT ip, NOW(), NOW()
+            FROM UNNEST($1::text[]) AS t(ip)
+            ON CONFLICT (ip_address) DO NOTHING
+            """,
+            cleaned,
+        )
+
+    rows = await conn.fetch(
+        "SELECT id, ip_address FROM device_registry WHERE ip_address = ANY($1::text[])",
+        cleaned,
+    )
+    return {str(r["ip_address"]): int(r["id"]) for r in rows}
+
+
+async def backfill_device_registry(conn: asyncpg.Connection) -> None:
+    """Backfills device_registry with all previously discovered/managed devices in stable order."""
+    try:
+        await conn.execute(
+            """
+            WITH all_ips AS (
+                SELECT host(ip_address) AS ip, COALESCE(first_seen, NOW()) AS fs, COALESCE(last_seen, NOW()) AS ls
+                FROM discovered_hosts
+                UNION ALL
+                SELECT device_ip AS ip, COALESCE(created_at, NOW()) AS fs, NOW() AS ls
+                FROM snmp_targets_config
+                WHERE device_ip IS NOT NULL AND device_ip != ''
+                UNION ALL
+                SELECT device_ip AS ip, COALESCE(first_polled, last_polled, NOW()) AS fs, COALESCE(last_polled, NOW()) AS ls
+                FROM snmp_devices
+                WHERE device_ip IS NOT NULL AND device_ip != ''
+                UNION ALL
+                SELECT lan_ip AS ip, COALESCE(last_seen, NOW()) AS fs, COALESCE(last_seen, NOW()) AS ls
+                FROM unifi_devices
+                WHERE lan_ip IS NOT NULL AND lan_ip != ''
+                UNION ALL
+                SELECT ip_address AS ip, COALESCE(last_seen, NOW()) AS fs, COALESCE(last_seen, NOW()) AS ls
+                FROM unifi_devices
+                WHERE ip_address IS NOT NULL AND ip_address != ''
+                UNION ALL
+                SELECT ip_address AS ip, COALESCE(last_seen, NOW()) AS fs, COALESCE(last_seen, NOW()) AS ls
+                FROM unifi_clients
+                WHERE ip_address IS NOT NULL AND ip_address != ''
+            )
+            INSERT INTO device_registry (ip_address, first_seen, last_seen)
+            SELECT ip, MIN(fs), MAX(ls)
+            FROM all_ips
+            WHERE ip IS NOT NULL AND TRIM(ip) != ''
+            GROUP BY ip
+            ORDER BY MIN(fs) ASC, ip ASC
+            ON CONFLICT (ip_address) DO NOTHING
+            """
+        )
+    except Exception as exc:
+        logger.warning("device_registry backfill skipped: %s", exc)
+
+
 async def ensure_dynamic_config_tables(pool: asyncpg.Pool) -> None:
     """Ensures dynamic configuration tables and default settings exist."""
     async with pool.acquire() as conn:
         await conn.execute(DYNAMIC_CONFIG_DDL)
+        await backfill_device_registry(conn)
 
         for tbl, ret_days in (("snmp_poll_metrics", 30), ("ups_metrics_raw", 180)):
             try:

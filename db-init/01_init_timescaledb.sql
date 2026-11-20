@@ -311,8 +311,17 @@ CREATE INDEX IF NOT EXISTS idx_ups_metrics_raw_dev_time
 SELECT add_retention_policy('ups_metrics_raw', INTERVAL '180 days', if_not_exists => TRUE);
 
 -- ==============================================================================
--- 3. Allowed-Subnet Network Scanner (<10 Subnets)
+-- 3. Persistent Device Registry & Allowed-Subnet Network Scanner (<10 Subnets)
 -- ==============================================================================
+
+CREATE TABLE IF NOT EXISTS device_registry (
+    id         SERIAL PRIMARY KEY,
+    ip_address TEXT NOT NULL UNIQUE,
+    first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_registry_ip ON device_registry (ip_address);
 
 CREATE TABLE IF NOT EXISTS discovered_hosts (
     ip_address       INET PRIMARY KEY,

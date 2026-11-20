@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional
 import asyncpg
 import nmap
 
+from app.db_schema import ensure_device_ids
+
 logger = logging.getLogger("netdash.scanner")
 
 
@@ -255,6 +257,11 @@ class SubnetScanner:
                         src,
                         sw_mac,
                         sw_port,
+                    )
+
+                if discovered:
+                    await ensure_device_ids(
+                        conn, list(discovered.keys()), touch_last_seen=True
                     )
 
                 duration_sec = round(time.perf_counter() - t0, 2)

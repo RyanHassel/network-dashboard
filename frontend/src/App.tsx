@@ -43,7 +43,47 @@ import {
 
 type TabKey = "pulse" | "devices" | "snmp" | "scanner" | "syslog" | "targets" | "settings";
 
+const TAB_PATHS: Record<TabKey, string> = {
+  pulse: "/",
+  devices: "/devices",
+  snmp: "/snmp",
+  scanner: "/scanner",
+  syslog: "/syslog",
+  targets: "/targets",
+  settings: "/settings",
+};
+
+function parseAppRoute(pathname: string): { tab: TabKey; deviceRef: string | null } {
+  const clean = (pathname || "/").replace(/\/+$/, "") || "/";
+  if (clean === "/" || clean === "/overview" || clean === "/pulse") {
+    return { tab: "pulse", deviceRef: null };
+  }
+  if (clean === "/devices") {
+    return { tab: "devices", deviceRef: null };
+  }
+  if (clean.startsWith("/devices/")) {
+    const rawRef = clean.slice("/devices/".length).split("/")[0] || "";
+    try {
+      const decoded = decodeURIComponent(rawRef).trim();
+      return { tab: "devices", deviceRef: decoded || null };
+    } catch {
+      return { tab: "devices", deviceRef: rawRef.trim() || null };
+    }
+  }
+  if (clean === "/snmp") return { tab: "snmp", deviceRef: null };
+  if (clean === "/scanner") return { tab: "scanner", deviceRef: null };
+  if (clean === "/syslog") return { tab: "syslog", deviceRef: null };
+  if (clean === "/targets") return { tab: "targets", deviceRef: null };
+  if (clean === "/settings") return { tab: "settings", deviceRef: null };
+  return { tab: "pulse", deviceRef: null };
+}
+
+function isModifiedClick(e: React.MouseEvent): boolean {
+  return e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0;
+}
+
 type DeviceSortKey =
+  | "device_id"
   | "status"
   | "ip_address"
   | "hostname"
@@ -183,6 +223,7 @@ interface SNMPProfile {
 
 interface SNMPTargetConfig {
   id: number;
+  device_id?: number | null;
   device_ip: string;
   label: string;
   profile_id: number | null;
@@ -247,6 +288,7 @@ interface OverviewGraphOptionInterface {
 }
 
 interface OverviewGraphOptionDevice {
+  device_id?: number | null;
   device_ip: string;
   hostname: string;
   vendor: string | null;
@@ -275,6 +317,7 @@ interface AllConfigPayload {
 }
 
 interface UnifiedDeviceItem {
+  device_id?: number | null;
   ip_address: string;
   hostname: string;
   mac_address: string | null;
@@ -370,6 +413,7 @@ interface SNMPTelemetrySeriesPoint {
 }
 
 interface SNMPTelemetryTarget {
+  device_id?: number | null;
   device_ip: string;
   sys_name: string;
   vendor_name: string;
@@ -418,6 +462,7 @@ interface SNMPTelemetryPayload {
 }
 
 interface DeviceDetailPayload {
+  device_id?: number | null;
   ip_address: string;
   discovered_host: {
     ip_address: string;
@@ -647,8 +692,10 @@ interface OverviewPayload {
   overview_graph_source?: OverviewGraphSourceMeta;
   live_series?: LiveTrafficSample[];
   unifi_devices: Array<{
+    device_id?: number | null;
     mac: string;
     ip_address: string;
+    lan_ip?: string | null;
     name: string;
     model: string;
     device_type: string;
@@ -665,6 +712,7 @@ interface OverviewPayload {
     tx_bps: number;
   }>;
   snmp_devices: Array<{
+    device_id?: number | null;
     device_ip: string;
     sys_name: string;
     sys_descr: string;
@@ -686,6 +734,7 @@ interface OverviewPayload {
 }
 
 interface SNMPInterface {
+  device_id?: number | null;
   device_ip: string;
   hostname: string;
   if_index: number;
@@ -714,6 +763,7 @@ interface SNMPTrendPoint {
 }
 
 interface DiscoveredHost {
+  device_id?: number | null;
   ip_address: string;
   subnet_cidr: string;
   mac_address: string | null;
@@ -728,6 +778,7 @@ interface DiscoveredHost {
 
 interface SyslogEntry {
   time: string;
+  device_id?: number | null;
   source_ip: string;
   hostname: string;
   facility: string;
@@ -1210,7 +1261,7 @@ const DualAreaSparkChart: React.FC<{
       } else {
         const winEnd = displayEndRef.current;
         const winStart = winEnd - liveWindowMs;
-        let visMax = 1000;
+        let visMax = 0;
         for (let i = 0; i < samples.length; i++) {
           const s = samples[i];
           if (s.ts < winStart - sampleGapRef.current) continue;
@@ -1218,7 +1269,7 @@ const DualAreaSparkChart: React.FC<{
           const m = hideSecondaryRef.current ? s.inVal : Math.max(s.inVal, s.outVal, s.p95In);
           if (m > visMax) visMax = m;
         }
-        const targetMax = Math.max(1000, visMax * 1.12);
+        const targetMax = Math.max(1000, visMax * 1.15);
         const alpha = Math.min(1, 1 - Math.exp(-dtMs / 420));
         if (displayMaxRef.current <= 1000 && targetMax > 1000) {
           displayMaxRef.current = targetMax;
@@ -1323,7 +1374,7 @@ const DualAreaSparkChart: React.FC<{
         ? fixedMaxBps
         : displayMaxRef.current > 1000
           ? displayMaxRef.current
-          : Math.max(1000, peakNow * 1.12);
+          : Math.max(1000, peakNow * 1.15);
 
     inPts = visibleSlice.map((s) => ({
       x: ((s.ts - liveWindowStart) / liveWindowMs) * width,
@@ -1376,7 +1427,7 @@ const DualAreaSparkChart: React.FC<{
       fixedMaxBps && fixedMaxBps > 0
         ? fixedMaxBps
         : isDefaultBps
-          ? Math.max(1000, observedPeakBps)
+          ? Math.max(1000, observedPeakBps * 1.15)
           : Math.max(1, observedPeakBps * 1.1);
 
     inPts = windowedSlice.map((s) => ({
@@ -1426,7 +1477,7 @@ const DualAreaSparkChart: React.FC<{
       fixedMaxBps && fixedMaxBps > 0
         ? fixedMaxBps
         : isDefaultBps
-          ? Math.max(1000, observedPeakBps)
+          ? Math.max(1000, observedPeakBps * 1.15)
           : Math.max(1, observedPeakBps * 1.1);
     const firstTs = new Date(points[0].label).getTime();
     const lastTs = new Date(points[points.length - 1].label).getTime();
@@ -1582,13 +1633,34 @@ const DualAreaSparkChart: React.FC<{
         : hoverData;
   const smoothPosTransition = !useLiveRender && animateMove;
 
+  const useDynamicBpsAxis =
+    isDefaultBps && !formatAxisTick && !(fixedMaxBps && fixedMaxBps > 0);
+  const dynamicBpsScale = useDynamicBpsAxis
+    ? maxVal >= 1_000_000_000
+      ? { unit: "Gbps", divisor: 1_000_000_000 }
+      : maxVal >= 1_000_000
+        ? { unit: "Mbps", divisor: 1_000_000 }
+        : maxVal >= 1_000
+          ? { unit: "Kbps", divisor: 1_000 }
+          : { unit: "bps", divisor: 1 }
+    : null;
+  const effectiveYAxisLabel = dynamicBpsScale ? dynamicBpsScale.unit : yAxisLabel;
+  const formatDynamicBpsTick = (val: number): string => {
+    if (!dynamicBpsScale) return formatTick(val);
+    const scaled = val / dynamicBpsScale.divisor;
+    if (scaled <= 0) return "0";
+    if (scaled >= 100) return Math.round(scaled).toString();
+    if (scaled >= 10) return parseFloat(scaled.toFixed(1)).toString();
+    return parseFloat(scaled.toFixed(2)).toString();
+  };
+
   return (
     <div className="relative w-full overflow-visible rounded-lg border border-slate-800/80 bg-[#0B101B] p-3">
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
         <div className="flex items-center gap-4">
           {showYAxis && (
-            <span className="w-12 text-right font-mono-tabular text-[11px] font-medium uppercase tracking-wider text-slate-500">
-              {yAxisLabel}
+            <span className="w-14 text-right font-mono-tabular text-[11px] font-medium uppercase tracking-wider text-slate-500">
+              {effectiveYAxisLabel}
             </span>
           )}
           <span className="flex items-center gap-1.5">
@@ -1620,7 +1692,7 @@ const DualAreaSparkChart: React.FC<{
 
       <div className={showYAxis ? "flex items-stretch gap-2" : ""}>
         {showYAxis && (
-          <div className="flex w-12 shrink-0 flex-col">
+          <div className="flex w-14 shrink-0 flex-col">
             <div className="relative h-44 w-full select-none pr-1.5 text-right font-mono-tabular text-[11px] text-slate-400">
               {[0, 0.25, 0.5, 0.75, 1].map((r) => (
                 <span
@@ -1628,7 +1700,7 @@ const DualAreaSparkChart: React.FC<{
                   style={{ top: `${((topPad + plotSpanY * r) / height) * 100}%` }}
                   className="absolute right-1.5 -translate-y-1/2 leading-none"
                 >
-                  {formatTick(r === 1 ? 0 : maxVal * (1 - r))}
+                  {formatDynamicBpsTick(r === 1 ? 0 : maxVal * (1 - r))}
                 </span>
               ))}
             </div>
@@ -1867,7 +1939,10 @@ const DualAreaSparkChart: React.FC<{
 };
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<TabKey>("pulse");
+  const initialRoute = parseAppRoute(
+    typeof window !== "undefined" ? window.location.pathname : "/",
+  );
+  const [activeTab, setActiveTab] = useState<TabKey>(initialRoute.tab);
   const [navMenuOpen, setNavMenuOpen] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [settingsFeedback, setSettingsFeedback] = useState<{
@@ -2006,9 +2081,15 @@ export const App: React.FC = () => {
   const [deviceFilter, setDeviceFilter] = useState<"all" | "online" | "snmp">("all");
   const [deviceSortKey, setDeviceSortKey] = useState<DeviceSortKey>("ip_address");
   const [deviceSortDir, setDeviceSortDir] = useState<SortDirection>("asc");
-  const [selectedDeviceDetailIp, setSelectedDeviceDetailIp] = useState<string | null>(null);
+  const [selectedDeviceRef, setSelectedDeviceRef] = useState<string | null>(initialRoute.deviceRef);
+  const [selectedDeviceDetailIp, setSelectedDeviceDetailIp] = useState<string | null>(
+    initialRoute.deviceRef && !/^\d+$/.test(initialRoute.deviceRef) ? initialRoute.deviceRef : null,
+  );
   const [deviceDetail, setDeviceDetail] = useState<DeviceDetailPayload | null>(null);
   const [loadingDeviceDetail, setLoadingDeviceDetail] = useState(false);
+  const [deviceDetailError, setDeviceDetailError] = useState<string | null>(null);
+  const deviceDetailReqIdRef = useRef<number>(0);
+  const lastLoadedDeviceRef = useRef<string | null>(null);
   const [detailIfIndex, setDetailIfIndex] = useState<number>(0);
   const [detailTrendRange, setDetailTrendRange] = useState<string>("24h");
   const [detailTrendSeries, setDetailTrendSeries] = useState<SNMPTrendPoint[]>([]);
@@ -2018,6 +2099,13 @@ export const App: React.FC = () => {
   // Domain Telemetry State
   const [overview, setOverview] = useState<OverviewPayload | null>(null);
   const [overviewGraphMode, setOverviewGraphMode] = useState<OverviewRangeKey>("live");
+  const [overviewScaleMode, setOverviewScaleMode] = useState<"auto" | "isp">(() => {
+    try {
+      return localStorage.getItem("netdash_overview_scale_mode") === "isp" ? "isp" : "auto";
+    } catch {
+      return "auto";
+    }
+  });
   const [liveTrafficSeries, setLiveTrafficSeries] = useState<LiveTrafficSample[]>([]);
   const [overviewHistorySeries, setOverviewHistorySeries] = useState<
     Array<{ time: string; rx_bps: number; tx_bps: number; latency_ms: number }>
@@ -2336,17 +2424,40 @@ export const App: React.FC = () => {
     }
   };
 
-  const fetchDeviceDetail = async (ip: string, resetToOverview = false) => {
+  const fetchDeviceDetail = async (deviceRef: string, resetToOverview = false) => {
+    const reqId = ++deviceDetailReqIdRef.current;
     setLoadingDeviceDetail(true);
     try {
-      const r = await fetch(`/api/devices/${encodeURIComponent(ip)}`);
+      const r = await fetch(`/api/devices/${encodeURIComponent(deviceRef)}`);
+      if (reqId !== deviceDetailReqIdRef.current) return;
+      if (r.status === 404) {
+        setDeviceDetail(null);
+        setDeviceDetailError(`Device "${deviceRef}" was not found.`);
+        return;
+      }
       if (r.ok) {
         const data: DeviceDetailPayload = await r.json();
+        if (reqId !== deviceDetailReqIdRef.current) return;
+        setDeviceDetailError(null);
         setDeviceDetail(data);
+        setSelectedDeviceDetailIp(data.ip_address);
+
+        if (data.device_id != null) {
+          const canonicalRef = String(data.device_id);
+          const canonicalPath = `/devices/${canonicalRef}`;
+          lastLoadedDeviceRef.current = canonicalRef;
+          if (typeof window !== "undefined" && window.location.pathname !== canonicalPath) {
+            window.history.replaceState(null, "", canonicalPath);
+          }
+          setSelectedDeviceRef(canonicalRef);
+        } else {
+          lastLoadedDeviceRef.current = deviceRef;
+        }
+
         if (data.snmp_interfaces && data.snmp_interfaces.length > 0) {
           const targetIdx = resetToOverview ? 0 : detailIfIndex;
           if (resetToOverview) setDetailIfIndex(0);
-          fetchDetailTrend(ip, targetIdx, detailTrendRange);
+          fetchDetailTrend(data.ip_address, targetIdx, detailTrendRange);
         } else {
           setDetailTrendSeries([]);
         }
@@ -2354,13 +2465,24 @@ export const App: React.FC = () => {
           data.device_profile_type === "ups" ||
           Boolean(data.snmp_system?.extended_metrics?.ups_telemetry)
         ) {
-          fetchUpsHistory(ip, upsHistoryRange);
+          fetchUpsHistory(data.ip_address, upsHistoryRange);
         } else {
           setUpsHistory([]);
         }
+      } else {
+        setDeviceDetail(null);
+        setDeviceDetailError(
+          `Failed to load telemetry for device "${deviceRef}" (HTTP ${r.status}).`,
+        );
+      }
+    } catch {
+      if (reqId === deviceDetailReqIdRef.current) {
+        setDeviceDetailError(`Unable to load telemetry for device "${deviceRef}".`);
       }
     } finally {
-      setLoadingDeviceDetail(false);
+      if (reqId === deviceDetailReqIdRef.current) {
+        setLoadingDeviceDetail(false);
+      }
     }
   };
 
@@ -2378,15 +2500,55 @@ export const App: React.FC = () => {
     }
   };
 
-  const openDevicePage = (ip: string) => {
+  const navigateToPath = (path: string, replace = false) => {
+    const targetPath = (path || "/").replace(/\/+$/, "") || "/";
+    if (typeof window !== "undefined" && window.location.pathname !== targetPath) {
+      if (replace) {
+        window.history.replaceState(null, "", targetPath);
+      } else {
+        window.history.pushState(null, "", targetPath);
+      }
+    }
+    const nextRoute = parseAppRoute(targetPath);
+    setActiveTab(nextRoute.tab);
+    setSelectedDeviceRef(nextRoute.deviceRef);
+    setNavMenuOpen(false);
+    if (!nextRoute.deviceRef) {
+      lastLoadedDeviceRef.current = null;
+      setSelectedDeviceDetailIp(null);
+      setDeviceDetail(null);
+      setDeviceDetailError(null);
+    }
+  };
+
+  const navigateToTab = (tab: TabKey) => {
+    navigateToPath(TAB_PATHS[tab]);
+  };
+
+  const toggleOverviewScaleMode = () => {
+    setOverviewScaleMode((prev) => {
+      const next = prev === "auto" ? "isp" : "auto";
+      try {
+        localStorage.setItem("netdash_overview_scale_mode", next);
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  };
+
+  const openDevicePage = (ip: string, deviceId?: number | null) => {
+    const resolvedId = deviceId ?? deviceIdByIp[ip] ?? null;
+    const nextRef = resolvedId != null ? String(resolvedId) : ip;
     setSelectedDeviceDetailIp(ip);
+    setDeviceDetail(null);
+    setDeviceDetailError(null);
     setDetailIfIndex(0);
     setDetailTrendRange("24h");
     setUpsHistoryRange("24h");
     setUpsHistory([]);
     setUpsChartMode("battery_load");
-    setActiveTab("devices");
-    fetchDeviceDetail(ip, true);
+    navigateToPath(`/devices/${encodeURIComponent(nextRef)}`);
   };
 
   const handleRematchAllMibs = async () => {
@@ -2398,8 +2560,8 @@ export const App: React.FC = () => {
         fetchConfig();
         fetchOverview();
         fetchInterfaces();
-        if (selectedDeviceDetailIp) {
-          fetchDeviceDetail(selectedDeviceDetailIp, false);
+        if (selectedDeviceRef) {
+          fetchDeviceDetail(selectedDeviceRef, false);
         }
         setRematchingMibs(false);
       }, 4500);
@@ -3113,7 +3275,7 @@ export const App: React.FC = () => {
       }
       if (activeTab === "devices") {
         fetchAllDevices();
-        if (selectedDeviceDetailIp) fetchDeviceDetail(selectedDeviceDetailIp);
+        if (selectedDeviceRef) fetchDeviceDetail(selectedDeviceRef);
       }
       if (activeTab === "snmp") {
         fetchInterfaces();
@@ -3135,13 +3297,56 @@ export const App: React.FC = () => {
   }, [
     activeTab,
     overviewGraphMode,
-    selectedDeviceDetailIp,
+    selectedDeviceRef,
     snmpTelemetryRange,
     logsPaused,
     logSeverity,
     logSourceIp,
     logSearch,
   ]);
+
+  useEffect(() => {
+    const onPopState = () => {
+      const nextRoute = parseAppRoute(window.location.pathname);
+      setActiveTab(nextRoute.tab);
+      setNavMenuOpen(false);
+      setSelectedDeviceRef(nextRoute.deviceRef);
+      if (!nextRoute.deviceRef) {
+        lastLoadedDeviceRef.current = null;
+        setSelectedDeviceDetailIp(null);
+        setDeviceDetail(null);
+        setDeviceDetailError(null);
+      }
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  useEffect(() => {
+    if (!selectedDeviceRef) {
+      lastLoadedDeviceRef.current = null;
+      setDeviceDetail(null);
+      setSelectedDeviceDetailIp(null);
+      setDeviceDetailError(null);
+      return;
+    }
+    if (selectedDeviceRef === lastLoadedDeviceRef.current) {
+      return;
+    }
+    lastLoadedDeviceRef.current = selectedDeviceRef;
+    setDeviceDetail(null);
+    setDeviceDetailError(null);
+    const knownIpForRef = !/^\d+$/.test(selectedDeviceRef)
+      ? selectedDeviceRef
+      : (allDevices.find((d) => String(d.device_id) === selectedDeviceRef)?.ip_address ?? null);
+    setSelectedDeviceDetailIp(knownIpForRef);
+    setDetailIfIndex(0);
+    setDetailTrendRange("24h");
+    setUpsHistoryRange("24h");
+    setUpsHistory([]);
+    setUpsChartMode("battery_load");
+    fetchDeviceDetail(selectedDeviceRef, true);
+  }, [selectedDeviceRef]);
 
   useEffect(() => {
     if (overviewGraphMode !== "live") {
@@ -3156,24 +3361,65 @@ export const App: React.FC = () => {
   useEffect(() => {
     if (activeTab === "settings") {
       fetchOverviewGraphOptions();
+      fetchServerInfo(false);
     }
   }, [activeTab]);
 
   useEffect(() => {
+    const devIp = deviceDetail?.ip_address || selectedDeviceDetailIp;
     if (
-      selectedDeviceDetailIp &&
+      devIp &&
       (deviceDetail?.device_profile_type === "ups" ||
         Boolean(deviceDetail?.snmp_system?.extended_metrics?.ups_telemetry))
     ) {
-      fetchUpsHistory(selectedDeviceDetailIp, upsHistoryRange);
+      fetchUpsHistory(devIp, upsHistoryRange);
     }
-  }, [selectedDeviceDetailIp, upsHistoryRange, deviceDetail?.device_profile_type]);
+  }, [
+    deviceDetail?.ip_address,
+    selectedDeviceDetailIp,
+    upsHistoryRange,
+    deviceDetail?.device_profile_type,
+  ]);
 
   useEffect(() => {
-    if (selectedDeviceDetailIp && detailIfIndex >= 0) {
-      fetchDetailTrend(selectedDeviceDetailIp, detailIfIndex, detailTrendRange);
+    const devIp = deviceDetail?.ip_address || selectedDeviceDetailIp;
+    if (devIp && detailIfIndex >= 0) {
+      fetchDetailTrend(devIp, detailIfIndex, detailTrendRange);
     }
-  }, [selectedDeviceDetailIp, detailIfIndex, detailTrendRange]);
+  }, [deviceDetail?.ip_address, selectedDeviceDetailIp, detailIfIndex, detailTrendRange]);
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    if (activeTab === "devices" && selectedDeviceRef) {
+      const host =
+        deviceDetail?.resolved_identity?.hostname ||
+        deviceDetail?.snmp_system?.sys_name ||
+        deviceDetail?.ip_address ||
+        selectedDeviceDetailIp ||
+        `Device #${selectedDeviceRef}`;
+      const idTag = deviceDetail?.device_id != null ? ` (#${deviceDetail.device_id})` : "";
+      document.title = `NetDash — ${host}${idTag}`;
+      return;
+    }
+    const titleMap: Record<TabKey, string> = {
+      pulse: "NetDash — Overview",
+      devices: "NetDash — Devices",
+      snmp: "NetDash — SNMP Trends & Ports",
+      scanner: "NetDash — Subnet Scanner Matrix",
+      syslog: "NetDash — Live Syslog Stream",
+      targets: "NetDash — Targets & SNMP",
+      settings: "NetDash — Settings",
+    };
+    document.title = titleMap[activeTab];
+  }, [
+    activeTab,
+    selectedDeviceRef,
+    selectedDeviceDetailIp,
+    deviceDetail?.device_id,
+    deviceDetail?.ip_address,
+    deviceDetail?.resolved_identity?.hostname,
+    deviceDetail?.snmp_system?.sys_name,
+  ]);
 
   useEffect(() => {
     if (activeTab !== "settings") {
@@ -3527,6 +3773,65 @@ export const App: React.FC = () => {
     }
   };
 
+  const deviceIdByIp: Record<string, number> = {};
+  for (const d of allDevices) {
+    if (d.device_id != null && d.ip_address) deviceIdByIp[d.ip_address] = d.device_id;
+  }
+  for (const s of overview?.snmp_devices || []) {
+    if (s.device_id != null && s.device_ip && deviceIdByIp[s.device_ip] == null) {
+      deviceIdByIp[s.device_ip] = s.device_id;
+    }
+  }
+  for (const u of overview?.unifi_devices || []) {
+    const uIp = u.lan_ip || u.ip_address;
+    if (u.device_id != null && uIp && deviceIdByIp[uIp] == null) {
+      deviceIdByIp[uIp] = u.device_id;
+    }
+  }
+  for (const h of hosts) {
+    if (h.device_id != null && h.ip_address && deviceIdByIp[h.ip_address] == null) {
+      deviceIdByIp[h.ip_address] = h.device_id;
+    }
+  }
+  for (const t of snmpTelemetry?.targets || []) {
+    if (t.device_id != null && t.device_ip && deviceIdByIp[t.device_ip] == null) {
+      deviceIdByIp[t.device_ip] = t.device_id;
+    }
+  }
+  for (const intf of interfaces) {
+    if (intf.device_id != null && intf.device_ip && deviceIdByIp[intf.device_ip] == null) {
+      deviceIdByIp[intf.device_ip] = intf.device_id;
+    }
+  }
+  for (const t of config?.snmp_targets || []) {
+    if (t.device_id != null && t.device_ip && deviceIdByIp[t.device_ip] == null) {
+      deviceIdByIp[t.device_ip] = t.device_id;
+    }
+  }
+  for (const d of overviewGraphOptions) {
+    if (d.device_id != null && d.device_ip && deviceIdByIp[d.device_ip] == null) {
+      deviceIdByIp[d.device_ip] = d.device_id;
+    }
+  }
+  if (deviceDetail?.device_id != null && deviceDetail.ip_address) {
+    deviceIdByIp[deviceDetail.ip_address] = deviceDetail.device_id;
+  }
+
+  const getDeviceHref = (ip: string, explicitId?: number | null): string => {
+    const id = explicitId ?? deviceIdByIp[ip] ?? null;
+    return `/devices/${id != null ? String(id) : encodeURIComponent(ip)}`;
+  };
+
+  const resolvedDetailDeviceId =
+    deviceDetail?.device_id ??
+    (selectedDeviceDetailIp ? (deviceIdByIp[selectedDeviceDetailIp] ?? null) : null) ??
+    (selectedDeviceRef && /^\d+$/.test(selectedDeviceRef) ? Number(selectedDeviceRef) : null);
+
+  const activeDetailIp =
+    deviceDetail?.ip_address ||
+    selectedDeviceDetailIp ||
+    (selectedDeviceRef && !/^\d+$/.test(selectedDeviceRef) ? selectedDeviceRef : null);
+
   const gw = overview?.gateway;
   const overviewGraphSource = overview?.overview_graph_source;
   const isCustomOverviewSource = overviewGraphSource?.mode === "custom";
@@ -3536,6 +3841,7 @@ export const App: React.FC = () => {
     Number(ispConfig?.upload_mbps ?? 0),
   );
   const ispCeilingBps = ispCeilingMbps > 0 ? ispCeilingMbps * 1_000_000 : null;
+  const overviewFixedMaxBps = overviewScaleMode === "isp" ? ispCeilingBps : null;
   const isLiveOverview = overviewGraphMode === "live" && liveTrafficSeries.length >= 2;
   const activeOverviewSeries =
     overviewGraphMode === "live"
@@ -3579,7 +3885,10 @@ export const App: React.FC = () => {
       if (deviceFilter === "snmp" && !d.sources.includes("SNMP")) return false;
       if (deviceSearch.trim()) {
         const q = deviceSearch.trim().toLowerCase();
+        const qNum = q.replace(/^#/, "");
         return (
+          (d.device_id != null &&
+            (String(d.device_id).includes(qNum) || `#${d.device_id}`.includes(q))) ||
           d.ip_address.toLowerCase().includes(q) ||
           (d.hostname || "").toLowerCase().includes(q) ||
           (d.mac_address || "").toLowerCase().includes(q) ||
@@ -3606,6 +3915,12 @@ export const App: React.FC = () => {
 
       let cmp = 0;
       switch (deviceSortKey) {
+        case "device_id":
+          cmp =
+            ((a.device_id ?? Number.MAX_SAFE_INTEGER) -
+              (b.device_id ?? Number.MAX_SAFE_INTEGER)) *
+            dir;
+          break;
         case "status":
           if (a.is_online !== b.is_online) {
             cmp = (a.is_online ? -1 : 1) * dir;
@@ -3748,17 +4063,20 @@ export const App: React.FC = () => {
       : primaryTabs.find((t) => t.id === activeTab) || primaryTabs[0];
   const ActiveNavIcon = activeNavMeta.icon;
 
-  const handleGoHome = () => {
-    setSelectedDeviceDetailIp(null);
-    setActiveTab("pulse");
-    setNavMenuOpen(false);
+  const handleGoHome = (e?: React.MouseEvent) => {
+    if (e && isModifiedClick(e)) return;
+    if (e) e.preventDefault();
+    navigateToPath("/");
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
-  const handleSelectNavTab = (tabId: Exclude<TabKey, "settings">) => {
-    if (tabId === "devices") setSelectedDeviceDetailIp(null);
-    setActiveTab(tabId);
-    setNavMenuOpen(false);
+  const handleSelectNavTab = (
+    tabId: Exclude<TabKey, "settings">,
+    e?: React.MouseEvent,
+  ) => {
+    if (e && isModifiedClick(e)) return;
+    if (e) e.preventDefault();
+    navigateToTab(tabId);
   };
 
   const detailProfileType =
@@ -3777,26 +4095,26 @@ export const App: React.FC = () => {
       <header className="sticky top-0 z-30 border-b border-slate-800/90 bg-[#090D16]/95 backdrop-blur-md">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-4 py-3 sm:px-6">
           <div className="flex min-w-0 items-center gap-3">
-            <button
-              type="button"
+            <a
+              href="/"
               onClick={handleGoHome}
               className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 transition hover:border-emerald-400/60 hover:bg-emerald-500/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/70"
               title="Go to Overview"
               aria-label="NetDash Overview"
             >
               <Activity className="h-5 w-5" />
-            </button>
+            </a>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <h1 className="text-base font-semibold tracking-tight text-white">
-                  <button
-                    type="button"
+                  <a
+                    href="/"
                     onClick={handleGoHome}
                     className="cursor-pointer rounded-sm text-left transition hover:text-emerald-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/70"
                     title="Return to Overview"
                   >
                     NetDash
-                  </button>
+                  </a>
                 </h1>
                 <span className="shrink-0 rounded border border-slate-700 bg-slate-800/80 px-1.5 py-0.5 font-mono-tabular text-[11px] text-slate-300">
                   {updateInfo?.current_version ||
@@ -3813,13 +4131,14 @@ export const App: React.FC = () => {
 
           {/* Right Status & Settings Controls (always locked to top-right corner) */}
           <div className="flex shrink-0 items-center gap-2">
-            <button
-              type="button"
-              onClick={() => {
-                setActiveTab("settings");
-                setNavMenuOpen(false);
-                fetchServerInfo(false);
+            <a
+              href="/settings"
+              onClick={(e) => {
+                if (isModifiedClick(e)) return;
+                e.preventDefault();
+                navigateToTab("settings");
               }}
+              aria-current={activeTab === "settings" ? "page" : undefined}
               className={`group relative flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition ${
                 updateInfo?.update_available && !installingUpdate
                   ? activeTab === "settings"
@@ -3850,7 +4169,7 @@ export const App: React.FC = () => {
               {updateInfo?.update_available && !installingUpdate && (
                 <DownloadCloud className="h-3.5 w-3.5 shrink-0 text-amber-300" />
               )}
-            </button>
+            </a>
 
             <div className="flex items-center gap-1.5 rounded-md border border-slate-800 bg-[#111827] px-2.5 py-1.5 text-xs">
               <span
@@ -3877,10 +4196,10 @@ export const App: React.FC = () => {
                 const Icon = tab.icon;
                 const active = activeTab === tab.id;
                 return (
-                  <button
+                  <a
                     key={tab.id}
-                    type="button"
-                    onClick={() => handleSelectNavTab(tab.id)}
+                    href={TAB_PATHS[tab.id]}
+                    onClick={(e) => handleSelectNavTab(tab.id, e)}
                     aria-current={active ? "page" : undefined}
                     className={`group flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-medium transition-all duration-150 ${
                       active ? tab.activeClass : tab.inactiveClass
@@ -3892,7 +4211,7 @@ export const App: React.FC = () => {
                       }`}
                     />
                     <span>{tab.label}</span>
-                  </button>
+                  </a>
                 );
               })}
             </div>
@@ -3934,11 +4253,11 @@ export const App: React.FC = () => {
                       const Icon = tab.icon;
                       const active = activeTab === tab.id;
                       return (
-                        <button
+                        <a
                           key={tab.id}
-                          type="button"
+                          href={TAB_PATHS[tab.id]}
                           tabIndex={navMenuOpen ? 0 : -1}
-                          onClick={() => handleSelectNavTab(tab.id)}
+                          onClick={(e) => handleSelectNavTab(tab.id, e)}
                           aria-current={active ? "page" : undefined}
                           className={`group flex items-center gap-2 rounded-lg border px-3 py-2 text-left text-xs font-medium transition-all duration-150 ${
                             active ? tab.activeClass : tab.inactiveClass
@@ -3950,7 +4269,7 @@ export const App: React.FC = () => {
                             }`}
                           />
                           <span className="truncate">{tab.label}</span>
-                        </button>
+                        </a>
                       );
                     })}
                   </div>
@@ -4489,15 +4808,17 @@ export const App: React.FC = () => {
                       {allDevices.length} Total Discovered
                     </div>
                   </div>
-                  <button
-                    onClick={() => {
-                      setSelectedDeviceDetailIp(null);
-                      setActiveTab("devices");
+                  <a
+                    href="/devices"
+                    onClick={(e) => {
+                      if (isModifiedClick(e)) return;
+                      e.preventDefault();
+                      navigateToTab("devices");
                     }}
                     className="rounded border border-slate-700 bg-slate-800/80 px-2.5 py-1 font-sans text-xs text-emerald-400 hover:bg-slate-700"
                   >
                     View Devices →
-                  </button>
+                  </a>
                 </div>
               </div>
 
@@ -4514,12 +4835,17 @@ export const App: React.FC = () => {
                     </div>
                     <div className="text-xs text-slate-400">Reachable SNMP Targets</div>
                   </div>
-                  <button
-                    onClick={() => setActiveTab("targets")}
+                  <a
+                    href="/targets"
+                    onClick={(e) => {
+                      if (isModifiedClick(e)) return;
+                      e.preventDefault();
+                      navigateToTab("targets");
+                    }}
                     className="rounded border border-slate-700 bg-slate-800/80 px-2 py-1 font-sans text-xs text-emerald-400 hover:bg-slate-700"
                   >
                     + Add Host
-                  </button>
+                  </a>
                 </div>
               </div>
 
@@ -4537,12 +4863,17 @@ export const App: React.FC = () => {
                       {overview?.scanner_summary?.online_hosts || 0} Active IPs
                     </div>
                   </div>
-                  <button
-                    onClick={() => setActiveTab("targets")}
+                  <a
+                    href="/targets"
+                    onClick={(e) => {
+                      if (isModifiedClick(e)) return;
+                      e.preventDefault();
+                      navigateToTab("targets");
+                    }}
                     className="rounded border border-slate-700 bg-slate-800/80 px-2 py-1 font-sans text-xs text-emerald-400 hover:bg-slate-700"
                   >
                     + Add Subnet
-                  </button>
+                  </a>
                 </div>
               </div>
 
@@ -4628,12 +4959,12 @@ export const App: React.FC = () => {
                       )}
                     </div>
                   )}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setActiveTab("settings");
-                      fetchServerInfo(false);
-                      fetchOverviewGraphOptions();
+                  <a
+                    href="/settings"
+                    onClick={(e) => {
+                      if (isModifiedClick(e)) return;
+                      e.preventDefault();
+                      navigateToTab("settings");
                     }}
                     className={`rounded border px-2 py-0.5 font-mono-tabular text-[11px] transition ${
                       isCustomOverviewSource
@@ -4645,12 +4976,27 @@ export const App: React.FC = () => {
                     {isCustomOverviewSource
                       ? `Source: ${overviewGraphSource?.summary || "Custom"}`
                       : "Source: Auto"}
-                  </button>
+                  </a>
                   <button
                     type="button"
-                    onClick={() => {
-                      setActiveTab("settings");
-                      fetchServerInfo(false);
+                    onClick={toggleOverviewScaleMode}
+                    className={`rounded border px-2 py-0.5 font-mono-tabular text-[11px] transition ${
+                      overviewScaleMode === "auto"
+                        ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:border-emerald-400/60"
+                        : "border-sky-500/40 bg-sky-500/10 text-sky-300 hover:border-sky-400/60"
+                    }`}
+                    title="Toggle between dynamic auto-scaled Y-axis (highlights live traffic fluctuations) and fixed ISP ceiling scaling"
+                  >
+                    {overviewScaleMode === "auto" || !ispCeilingBps
+                      ? "Scale: Auto"
+                      : `Scale: ISP (${ispCeilingMbps} Mbps)`}
+                  </button>
+                  <a
+                    href="/settings"
+                    onClick={(e) => {
+                      if (isModifiedClick(e)) return;
+                      e.preventDefault();
+                      navigateToTab("settings");
                     }}
                     className="rounded border border-slate-800 bg-[#090D16] px-2 py-0.5 font-mono-tabular text-[11px] text-slate-400 transition hover:border-slate-700 hover:text-slate-200"
                     title="Configure ISP Download/Upload Speed in Settings"
@@ -4659,8 +5005,8 @@ export const App: React.FC = () => {
                       ? `${ispConfig?.isp_name ? `${ispConfig.isp_name} • ` : "ISP: "}${
                           ispConfig?.download_mbps ?? 1000
                         }/${ispConfig?.upload_mbps ?? 1000} Mbps`
-                      : "Scale: Auto"}
-                  </button>
+                      : "ISP: Auto"}
+                  </a>
                   <div className="inline-flex items-center rounded-md border border-slate-800 bg-[#090D16] p-0.5 text-[11px] font-medium">
                     {(
                       [
@@ -4692,7 +5038,7 @@ export const App: React.FC = () => {
               </div>
               <DualAreaSparkChart
                 showYAxis={true}
-                fixedMaxBps={ispCeilingBps}
+                fixedMaxBps={overviewFixedMaxBps}
                 liveMode={isLiveOverview}
                 liveWindowMs={120_000}
                 windowMs={
@@ -4714,12 +5060,17 @@ export const App: React.FC = () => {
                   <h3 className="text-sm font-semibold text-white">
                     Polled SNMP Targets ({overview?.snmp_devices?.length || 0})
                   </h3>
-                  <button
-                    onClick={() => setActiveTab("targets")}
+                  <a
+                    href="/targets"
+                    onClick={(e) => {
+                      if (isModifiedClick(e)) return;
+                      e.preventDefault();
+                      navigateToTab("targets");
+                    }}
                     className="flex items-center gap-1 rounded border border-slate-700 bg-slate-800 px-2.5 py-1 text-xs text-slate-200 hover:bg-slate-700"
                   >
                     <Plus className="h-3.5 w-3.5" /> Manage SNMP Hosts & Secrets
-                  </button>
+                  </a>
                 </div>
                 <div className="overflow-x-auto">
                   <table className="w-full text-left text-xs">
@@ -4737,45 +5088,91 @@ export const App: React.FC = () => {
                         <tr>
                           <td colSpan={5} className="py-6 text-center font-sans text-slate-500">
                             No SNMP targets configured yet. Click{" "}
-                            <button
-                              onClick={() => setActiveTab("targets")}
+                            <a
+                              href="/targets"
+                              onClick={(e) => {
+                                if (isModifiedClick(e)) return;
+                                e.preventDefault();
+                                navigateToTab("targets");
+                              }}
                               className="text-emerald-400 underline"
                             >
                               Manage SNMP Hosts & Secrets
-                            </button>{" "}
+                            </a>{" "}
                             to add devices.
                           </td>
                         </tr>
                       ) : (
-                        overview!.snmp_devices.map((s) => (
-                          <tr
-                            key={s.device_ip}
-                            onClick={() => openDevicePage(s.device_ip)}
-                            className="cursor-pointer hover:bg-slate-800/40"
-                          >
-                            <td className="py-2.5 font-semibold text-emerald-400 underline">
-                              {s.device_ip}
-                            </td>
-                            <td className="py-2.5 font-sans text-slate-300">
-                              {s.sys_name || "—"}
-                            </td>
-                            <td className="py-2.5 text-slate-300">{s.interface_count}</td>
-                            <td className="py-2.5 text-slate-400">
-                              {s.last_poll_duration_ms.toFixed(0)} ms
-                            </td>
-                            <td className="py-2.5 text-right">
-                              <span
-                                className={`inline-block rounded px-1.5 py-0.5 text-[11px] ${
-                                  s.is_reachable
-                                    ? "bg-emerald-500/15 text-emerald-400"
-                                    : "bg-rose-500/15 text-rose-400"
-                                }`}
-                              >
-                                {s.is_reachable ? "reachable" : "timeout"}
-                              </span>
-                            </td>
-                          </tr>
-                        ))
+                        (overview?.snmp_devices || []).map((s) => {
+                          const stateDesc = s.is_reachable
+                            ? `Reachable — SNMP responded in ${s.last_poll_duration_ms.toFixed(0)} ms${
+                                s.last_polled
+                                  ? ` (${new Date(s.last_polled).toLocaleTimeString()})`
+                                  : ""
+                              }`
+                            : `Timeout — SNMP host did not respond to the last poll${
+                                s.last_polled
+                                  ? ` (${new Date(s.last_polled).toLocaleTimeString()})`
+                                  : ""
+                              }`;
+                          return (
+                            <tr
+                              key={s.device_ip}
+                              onClick={() => openDevicePage(s.device_ip, s.device_id)}
+                              className="cursor-pointer hover:bg-slate-800/40"
+                            >
+                              <td className="py-2.5 font-semibold text-emerald-400 underline">
+                                <a
+                                  href={getDeviceHref(s.device_ip, s.device_id)}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (isModifiedClick(e)) return;
+                                    e.preventDefault();
+                                    openDevicePage(s.device_ip, s.device_id);
+                                  }}
+                                  className="hover:text-emerald-300"
+                                >
+                                  {s.device_ip}
+                                </a>
+                              </td>
+                              <td className="py-2.5 font-sans text-slate-300">
+                                {s.sys_name || "—"}
+                              </td>
+                              <td className="py-2.5 text-slate-300">{s.interface_count}</td>
+                              <td className="py-2.5 text-slate-400">
+                                {s.last_poll_duration_ms.toFixed(0)} ms
+                              </td>
+                              <td className="py-2.5 text-right">
+                                <div className="group/state relative inline-flex items-center justify-end">
+                                  <span
+                                    tabIndex={0}
+                                    role="img"
+                                    aria-label={stateDesc}
+                                    title={stateDesc}
+                                    onClick={(e) => e.stopPropagation()}
+                                    className={`inline-flex h-6 w-6 items-center justify-center rounded-full border transition ${
+                                      s.is_reachable
+                                        ? "border-emerald-500/35 bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/25"
+                                        : "border-rose-500/35 bg-rose-500/15 text-rose-400 hover:bg-rose-500/25"
+                                    }`}
+                                  >
+                                    {s.is_reachable ? (
+                                      <Check className="h-3.5 w-3.5 stroke-[2.5]" aria-hidden="true" />
+                                    ) : (
+                                      <X className="h-3.5 w-3.5 stroke-[2.5]" aria-hidden="true" />
+                                    )}
+                                  </span>
+                                  <span
+                                    role="tooltip"
+                                    className="pointer-events-none invisible absolute right-full top-1/2 z-20 mr-2 -translate-y-1/2 whitespace-nowrap rounded-md border border-slate-700 bg-[#090D16] px-2.5 py-1 font-sans text-[11px] font-normal text-slate-200 opacity-0 shadow-lg transition-opacity duration-150 group-hover/state:visible group-hover/state:opacity-100 group-focus-within/state:visible group-focus-within/state:opacity-100"
+                                  >
+                                    {stateDesc}
+                                  </span>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })
                       )}
                     </tbody>
                   </table>
@@ -4787,15 +5184,17 @@ export const App: React.FC = () => {
                   <h3 className="text-sm font-semibold text-white">
                     Recently Discovered Devices ({allDevices.slice(0, 8).length})
                   </h3>
-                  <button
-                    onClick={() => {
-                      setSelectedDeviceDetailIp(null);
-                      setActiveTab("devices");
+                  <a
+                    href="/devices"
+                    onClick={(e) => {
+                      if (isModifiedClick(e)) return;
+                      e.preventDefault();
+                      navigateToTab("devices");
                     }}
                     className="rounded border border-slate-700 bg-slate-800 px-2.5 py-1 text-xs text-slate-200 hover:bg-slate-700"
                   >
                     Open Full Devices Page →
-                  </button>
+                  </a>
                 </div>
                 <div className="overflow-x-auto">
                   <table className="w-full text-left text-xs">
@@ -4812,12 +5211,17 @@ export const App: React.FC = () => {
                         <tr>
                           <td colSpan={4} className="py-6 text-center font-sans text-slate-500">
                             No devices discovered yet. Add a subnet in{" "}
-                            <button
-                              onClick={() => setActiveTab("targets")}
+                            <a
+                              href="/targets"
+                              onClick={(e) => {
+                                if (isModifiedClick(e)) return;
+                                e.preventDefault();
+                                navigateToTab("targets");
+                              }}
                               className="text-emerald-400 underline"
                             >
                               Targets & SNMP
-                            </button>{" "}
+                            </a>{" "}
                             to scan your network.
                           </td>
                         </tr>
@@ -4825,11 +5229,22 @@ export const App: React.FC = () => {
                         allDevices.slice(0, 8).map((d) => (
                           <tr
                             key={d.ip_address}
-                            onClick={() => openDevicePage(d.ip_address)}
+                            onClick={() => openDevicePage(d.ip_address, d.device_id)}
                             className="cursor-pointer hover:bg-slate-800/40"
                           >
                             <td className="py-2.5 font-semibold text-emerald-400 underline">
-                              {d.ip_address}
+                              <a
+                                href={getDeviceHref(d.ip_address, d.device_id)}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (isModifiedClick(e)) return;
+                                  e.preventDefault();
+                                  openDevicePage(d.ip_address, d.device_id);
+                                }}
+                                className="hover:text-emerald-300"
+                              >
+                                {d.ip_address}
+                              </a>
                             </td>
                             <td className="py-2.5 font-sans text-slate-200">{d.hostname}</td>
                             <td className="py-2.5 font-sans text-slate-400">
@@ -4859,7 +5274,7 @@ export const App: React.FC = () => {
         )}
 
         {/* ==================== VIEW 2: DEVICES PAGE & PER-DEVICE DETAIL PAGE ==================== */}
-        {activeTab === "devices" && !selectedDeviceDetailIp && (
+        {activeTab === "devices" && !selectedDeviceRef && (
           <div className="space-y-5">
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-800 bg-[#111827] p-4">
               <div className="flex flex-wrap items-center gap-3">
@@ -4867,7 +5282,7 @@ export const App: React.FC = () => {
                   <Search className="pointer-events-none absolute top-2 left-2.5 h-3.5 w-3.5 text-slate-500" />
                   <input
                     type="text"
-                    placeholder="Filter by IP, hostname, MAC, vendor, OS..."
+                    placeholder="Filter by ID, IP, hostname, MAC, vendor, OS..."
                     value={deviceSearch}
                     onChange={(e) => setDeviceSearch(e.target.value)}
                     className="w-72 rounded-md border border-slate-700 bg-[#090D16] py-1.5 pr-3 pl-8 text-xs text-white placeholder:text-slate-500"
@@ -4925,12 +5340,17 @@ export const App: React.FC = () => {
                   <RefreshCw className={`h-3.5 w-3.5 ${scanningNow ? "animate-spin" : ""}`} />
                   <span>{scanningNow ? "Scanning..." : "Rescan Subnets"}</span>
                 </button>
-                <button
-                  onClick={() => setActiveTab("targets")}
+                <a
+                  href="/targets"
+                  onClick={(e) => {
+                    if (isModifiedClick(e)) return;
+                    e.preventDefault();
+                    navigateToTab("targets");
+                  }}
                   className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
                 >
                   <Plus className="h-3.5 w-3.5" /> Add Host or Subnet
-                </button>
+                </a>
               </div>
             </div>
 
@@ -4942,7 +5362,7 @@ export const App: React.FC = () => {
                   </h2>
                   <p className="text-xs text-slate-400">
                     Click any column header to sort, or click any device row to open its full
-                    telemetry page.
+                    telemetry webpage.
                   </p>
                 </div>
                 {deviceFilter === "all" && (
@@ -4958,6 +5378,7 @@ export const App: React.FC = () => {
                     <tr className="border-b border-slate-800 text-slate-400">
                       {(
                         [
+                          { key: "device_id", label: "ID", alignRight: false },
                           { key: "status", label: "Status", alignRight: false },
                           { key: "ip_address", label: "IPv4 Address", alignRight: false },
                           { key: "hostname", label: "Hostname / sysName", alignRight: false },
@@ -5011,14 +5432,19 @@ export const App: React.FC = () => {
                   <tbody className="divide-y divide-slate-800/60 font-mono-tabular">
                     {filteredDevices.length === 0 ? (
                       <tr>
-                        <td colSpan={8} className="py-10 text-center font-sans text-slate-500">
+                        <td colSpan={9} className="py-10 text-center font-sans text-slate-500">
                           No devices match your current filter. Add a subnet or SNMP target in{" "}
-                          <button
-                            onClick={() => setActiveTab("targets")}
+                          <a
+                            href="/targets"
+                            onClick={(e) => {
+                              if (isModifiedClick(e)) return;
+                              e.preventDefault();
+                              navigateToTab("targets");
+                            }}
                             className="text-emerald-400 underline"
                           >
                             Targets & SNMP
-                          </button>
+                          </a>
                           .
                         </td>
                       </tr>
@@ -5026,9 +5452,12 @@ export const App: React.FC = () => {
                       filteredDevices.map((d) => (
                         <tr
                           key={d.ip_address}
-                          onClick={() => openDevicePage(d.ip_address)}
+                          onClick={() => openDevicePage(d.ip_address, d.device_id)}
                           className="cursor-pointer transition hover:bg-slate-800/50"
                         >
+                          <td className="py-3 text-slate-400">
+                            {d.device_id != null ? `#${d.device_id}` : "—"}
+                          </td>
                           <td className="py-3">
                             <span
                               className={`inline-flex items-center gap-1.5 rounded px-2 py-0.5 text-[11px] font-medium ${
@@ -5046,7 +5475,18 @@ export const App: React.FC = () => {
                             </span>
                           </td>
                           <td className="py-3 font-semibold text-emerald-400 underline">
-                            {d.ip_address}
+                            <a
+                              href={getDeviceHref(d.ip_address, d.device_id)}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (isModifiedClick(e)) return;
+                                e.preventDefault();
+                                openDevicePage(d.ip_address, d.device_id);
+                              }}
+                              className="hover:text-emerald-300"
+                            >
+                              {d.ip_address}
+                            </a>
                           </td>
                           <td className="py-3 font-sans font-medium text-white">
                             {d.hostname || d.ip_address}
@@ -5109,21 +5549,31 @@ export const App: React.FC = () => {
         )}
 
         {/* ==================== PER-DEVICE DETAILED TELEMETRY PAGE ==================== */}
-        {activeTab === "devices" && selectedDeviceDetailIp && (
+        {activeTab === "devices" && selectedDeviceRef && (
           <div className="space-y-6">
             {/* Top Bar with Back Button & Quick SNMP Actions */}
             <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-800 bg-[#111827] p-4">
               <div className="flex items-center gap-3">
-                <button
-                  onClick={() => setSelectedDeviceDetailIp(null)}
+                <a
+                  href="/devices"
+                  onClick={(e) => {
+                    if (isModifiedClick(e)) return;
+                    e.preventDefault();
+                    navigateToTab("devices");
+                  }}
                   className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800"
                 >
                   <ArrowLeft className="h-3.5 w-3.5" /> Back to Devices
-                </button>
+                </a>
                 <div>
-                  <div className="flex items-center gap-2.5">
+                  <div className="flex flex-wrap items-center gap-2.5">
+                    {resolvedDetailDeviceId != null && (
+                      <span className="rounded border border-sky-500/35 bg-sky-500/15 px-2 py-0.5 font-mono-tabular text-[11px] font-semibold text-sky-300">
+                        ID #{resolvedDetailDeviceId}
+                      </span>
+                    )}
                     <h2 className="font-mono-tabular text-base font-bold text-white">
-                      {selectedDeviceDetailIp}
+                      {activeDetailIp || `Device #${selectedDeviceRef}`}
                     </h2>
                     <span className="text-sm font-medium text-slate-300">
                       {deviceDetail?.resolved_identity?.hostname ||
@@ -5182,20 +5632,22 @@ export const App: React.FC = () => {
               <div className="flex items-center gap-2">
                 {!deviceDetail?.snmp_config ? (
                   <button
+                    disabled={!activeDetailIp}
                     onClick={() =>
+                      activeDetailIp &&
                       handleQuickEnableSnmpOnDevice(
-                        selectedDeviceDetailIp,
-                        deviceDetail?.discovered_host?.hostname || selectedDeviceDetailIp,
+                        activeDetailIp,
+                        deviceDetail?.discovered_host?.hostname || activeDetailIp,
                       )
                     }
-                    className="flex items-center gap-1.5 rounded-md bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-sky-500"
+                    className="flex items-center gap-1.5 rounded-md bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-sky-500 disabled:opacity-50"
                   >
                     <Plus className="h-3.5 w-3.5" /> Enable SNMP Polling on This Device
                   </button>
                 ) : (
                   <button
-                    onClick={() => handlePollSingleDeviceNow(selectedDeviceDetailIp)}
-                    disabled={pollingDeviceNow}
+                    onClick={() => activeDetailIp && handlePollSingleDeviceNow(activeDetailIp)}
+                    disabled={pollingDeviceNow || !activeDetailIp}
                     className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
                   >
                     <RefreshCw className={`h-3.5 w-3.5 ${pollingDeviceNow ? "animate-spin" : ""}`} />
@@ -5207,7 +5659,25 @@ export const App: React.FC = () => {
 
             {loadingDeviceDetail && !deviceDetail ? (
               <div className="rounded-xl border border-slate-800 bg-[#111827] p-10 text-center text-xs text-slate-400">
-                Loading polled telemetry for {selectedDeviceDetailIp}...
+                Loading polled telemetry for {activeDetailIp || `Device #${selectedDeviceRef}`}...
+              </div>
+            ) : deviceDetailError && !deviceDetail ? (
+              <div className="rounded-xl border border-rose-500/35 bg-[#111827] p-8 text-center">
+                <div className="text-sm font-semibold text-rose-300">{deviceDetailError}</div>
+                <p className="mt-1 text-xs text-slate-400">
+                  The requested device ID or IP address could not be loaded.
+                </p>
+                <a
+                  href="/devices"
+                  onClick={(e) => {
+                    if (isModifiedClick(e)) return;
+                    e.preventDefault();
+                    navigateToTab("devices");
+                  }}
+                  className="mt-4 inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800"
+                >
+                  <ArrowLeft className="h-3.5 w-3.5" /> Return to Devices
+                </a>
               </div>
             ) : (
               <>
@@ -5265,9 +5735,21 @@ export const App: React.FC = () => {
                       return (
                         <dl className="grid grid-cols-2 gap-y-3 text-xs">
                           <div>
+                            <dt className="text-slate-400">Device ID</dt>
+                            <dd className="mt-0.5 font-mono-tabular font-semibold text-sky-300">
+                              {resolvedDetailDeviceId != null ? `#${resolvedDetailDeviceId}` : "—"}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-400">Device Webpage</dt>
+                            <dd className="mt-0.5 font-mono-tabular text-emerald-400">
+                              /devices/{resolvedDetailDeviceId ?? selectedDeviceRef}
+                            </dd>
+                          </div>
+                          <div>
                             <dt className="text-slate-400">IPv4 Address</dt>
                             <dd className="mt-0.5 font-mono-tabular font-semibold text-white">
-                              {selectedDeviceDetailIp}
+                              {activeDetailIp || "—"}
                             </dd>
                           </div>
                           <div>
@@ -6457,7 +6939,7 @@ export const App: React.FC = () => {
                 {/* Device Recent Syslogs */}
                 <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
                   <h3 className="mb-3 text-sm font-semibold text-white">
-                    Syslog Messages from {selectedDeviceDetailIp} (
+                    Syslog Messages from {activeDetailIp || `Device #${selectedDeviceRef}`} (
                     {deviceDetail?.recent_logs?.length || 0})
                   </h3>
                   <div className="max-h-80 overflow-y-auto font-mono-tabular text-xs">
@@ -6474,7 +6956,8 @@ export const App: React.FC = () => {
                         {!deviceDetail?.recent_logs || deviceDetail.recent_logs.length === 0 ? (
                           <tr>
                             <td colSpan={4} className="py-6 text-center font-sans text-slate-500">
-                              No syslog events received from {selectedDeviceDetailIp} yet.
+                              No syslog events received from{" "}
+                              {activeDetailIp || `Device #${selectedDeviceRef}`} yet.
                             </td>
                           </tr>
                         ) : (
@@ -6546,13 +7029,17 @@ export const App: React.FC = () => {
                   {pollingAllSnmp ? "Polling SNMP..." : "Poll All SNMP Now"}
                 </button>
 
-                <button
-                  type="button"
-                  onClick={() => setActiveTab("targets")}
+                <a
+                  href="/targets"
+                  onClick={(e) => {
+                    if (isModifiedClick(e)) return;
+                    e.preventDefault();
+                    navigateToTab("targets");
+                  }}
                   className="flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-3 py-1.5 text-xs font-medium text-emerald-400 hover:bg-slate-700"
                 >
                   <Plus className="h-3.5 w-3.5" /> Add / Edit SNMP Hosts
-                </button>
+                </a>
               </div>
             </div>
 
@@ -6817,7 +7304,7 @@ export const App: React.FC = () => {
                       (snmpTelemetry?.targets || []).map((t) => (
                         <tr
                           key={t.device_ip}
-                          onClick={() => openDevicePage(t.device_ip)}
+                          onClick={() => openDevicePage(t.device_ip, t.device_id)}
                           className="cursor-pointer transition hover:bg-slate-800/40"
                         >
                           <td className="py-2.5">
@@ -6835,7 +7322,18 @@ export const App: React.FC = () => {
                           </td>
                           <td className="py-2.5">
                             <div className="font-mono-tabular font-semibold text-emerald-400 underline">
-                              {t.device_ip}
+                              <a
+                                href={getDeviceHref(t.device_ip, t.device_id)}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (isModifiedClick(e)) return;
+                                  e.preventDefault();
+                                  openDevicePage(t.device_ip, t.device_id);
+                                }}
+                                className="hover:text-emerald-300"
+                              >
+                                {t.device_ip}
+                              </a>
                             </div>
                             <div className="text-[11px] text-slate-400">{t.sys_name || "—"}</div>
                           </td>
@@ -6960,10 +7458,23 @@ export const App: React.FC = () => {
                       .map((intf) => (
                         <tr
                           key={`${intf.device_ip}-${intf.if_index}`}
-                          onClick={() => openDevicePage(intf.device_ip)}
+                          onClick={() => openDevicePage(intf.device_ip, intf.device_id)}
                           className="cursor-pointer hover:bg-slate-800/40"
                         >
-                          <td className="py-2.5 text-emerald-400 underline">{intf.device_ip}</td>
+                          <td className="py-2.5 text-emerald-400 underline">
+                            <a
+                              href={getDeviceHref(intf.device_ip, intf.device_id)}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (isModifiedClick(e)) return;
+                                e.preventDefault();
+                                openDevicePage(intf.device_ip, intf.device_id);
+                              }}
+                              className="hover:text-emerald-300"
+                            >
+                              {intf.device_ip}
+                            </a>
+                          </td>
                           <td className="py-2.5 text-slate-400">#{intf.if_index}</td>
                           <td className="py-2.5 font-semibold text-white">{intf.if_name}</td>
                           <td className="py-2.5 font-sans text-slate-400">
@@ -7016,12 +7527,17 @@ export const App: React.FC = () => {
                     {cidr}
                   </button>
                 ))}
-                <button
-                  onClick={() => setActiveTab("targets")}
+                <a
+                  href="/targets"
+                  onClick={(e) => {
+                    if (isModifiedClick(e)) return;
+                    e.preventDefault();
+                    navigateToTab("targets");
+                  }}
                   className="flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-2.5 py-1.5 text-xs font-medium text-emerald-400 hover:bg-slate-700"
                 >
                   <Plus className="h-3.5 w-3.5" /> Add / Manage Subnets
-                </button>
+                </a>
               </div>
 
               <button
@@ -7067,15 +7583,24 @@ export const App: React.FC = () => {
                         ? "bg-emerald-500 text-slate-950 font-semibold cursor-pointer hover:ring-2 hover:ring-white"
                         : "bg-amber-500/40 text-amber-200 cursor-pointer"
                       : "bg-[#090D16] text-slate-600 border border-slate-800/70";
-                    return (
+                    return match ? (
+                      <a
+                        key={octet}
+                        href={getDeviceHref(fullIp, match.device_id)}
+                        onClick={(e) => {
+                          if (isModifiedClick(e)) return;
+                          e.preventDefault();
+                          openDevicePage(fullIp, match.device_id);
+                        }}
+                        title={`${fullIp} • ${match.hostname || "host"} (${match.mac_address || "no MAC"})`}
+                        className={`flex h-6 items-center justify-center rounded-xs font-mono-tabular text-[10px] ${bgClass}`}
+                      >
+                        .{octet}
+                      </a>
+                    ) : (
                       <div
                         key={octet}
-                        onClick={() => match && openDevicePage(fullIp)}
-                        title={
-                          match
-                            ? `${fullIp} • ${match.hostname || "host"} (${match.mac_address || "no MAC"})`
-                            : `${fullIp} (Unused)`
-                        }
+                        title={`${fullIp} (Unused)`}
                         className={`flex h-6 items-center justify-center rounded-xs font-mono-tabular text-[10px] ${bgClass}`}
                       >
                         .{octet}
@@ -7107,11 +7632,22 @@ export const App: React.FC = () => {
                     {filteredHosts.map((h) => (
                       <tr
                         key={h.ip_address}
-                        onClick={() => openDevicePage(h.ip_address)}
+                        onClick={() => openDevicePage(h.ip_address, h.device_id)}
                         className="cursor-pointer hover:bg-slate-800/40"
                       >
                         <td className="py-2.5 font-semibold text-emerald-400 underline">
-                          {h.ip_address}
+                          <a
+                            href={getDeviceHref(h.ip_address, h.device_id)}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (isModifiedClick(e)) return;
+                              e.preventDefault();
+                              openDevicePage(h.ip_address, h.device_id);
+                            }}
+                            className="hover:text-emerald-300"
+                          >
+                            {h.ip_address}
+                          </a>
                         </td>
                         <td className="py-2.5 font-sans text-slate-200">{h.hostname || "—"}</td>
                         <td className="py-2.5 text-slate-300">{h.mac_address || "—"}</td>
@@ -7237,10 +7773,21 @@ export const App: React.FC = () => {
                               </span>
                             </td>
                             <td
-                              onClick={() => openDevicePage(l.source_ip)}
+                              onClick={() => openDevicePage(l.source_ip, l.device_id)}
                               className="cursor-pointer py-2 pr-3 whitespace-nowrap text-emerald-400 underline"
                             >
-                              {l.hostname || l.source_ip}
+                              <a
+                                href={getDeviceHref(l.source_ip, l.device_id)}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (isModifiedClick(e)) return;
+                                  e.preventDefault();
+                                  openDevicePage(l.source_ip, l.device_id);
+                                }}
+                                className="hover:text-emerald-300"
+                              >
+                                {l.hostname || l.source_ip}
+                              </a>
                             </td>
                             <td className="py-2 pr-3 whitespace-nowrap text-sky-400">
                               {l.app_name}
@@ -7713,10 +8260,21 @@ export const App: React.FC = () => {
                     {(config?.snmp_targets || []).map((t) => (
                       <tr key={t.id}>
                         <td
-                          onClick={() => openDevicePage(t.device_ip)}
+                          onClick={() => openDevicePage(t.device_ip, t.device_id)}
                           className="cursor-pointer py-2.5 font-semibold text-emerald-400 underline"
                         >
-                          {t.device_ip}
+                          <a
+                            href={getDeviceHref(t.device_ip, t.device_id)}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (isModifiedClick(e)) return;
+                              e.preventDefault();
+                              openDevicePage(t.device_ip, t.device_id);
+                            }}
+                            className="hover:text-emerald-300"
+                          >
+                            {t.device_ip}
+                          </a>
                         </td>
                         <td className="py-2.5 font-sans text-slate-300">{t.label || "—"}</td>
                         <td className="py-2.5 font-sans text-sky-400">
@@ -8617,13 +9175,17 @@ export const App: React.FC = () => {
                                     <span>
                                       No SNMP interfaces discovered yet for this device.
                                     </span>
-                                    <button
-                                      type="button"
-                                      onClick={() => openDevicePage(dev.device_ip)}
+                                    <a
+                                      href={getDeviceHref(dev.device_ip, dev.device_id)}
+                                      onClick={(e) => {
+                                        if (isModifiedClick(e)) return;
+                                        e.preventDefault();
+                                        openDevicePage(dev.device_ip, dev.device_id);
+                                      }}
                                       className="rounded border border-sky-500/30 bg-sky-500/10 px-2.5 py-1 text-[11px] font-medium text-sky-300 hover:bg-sky-500/20"
                                     >
                                       Open Device to Enable SNMP →
-                                    </button>
+                                    </a>
                                   </div>
                                 )}
                               </div>

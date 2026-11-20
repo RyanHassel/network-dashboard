@@ -12,7 +12,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
 import httpx
@@ -21,7 +21,11 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnec
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from app.db_schema import ensure_dynamic_config_tables, repair_implausible_snmp_spikes
+from app.db_schema import (
+    ensure_device_ids,
+    ensure_dynamic_config_tables,
+    repair_implausible_snmp_spikes,
+)
 from app.mib_catalog import (
     MIBS_DIR,
     VENDOR_CATALOG,
@@ -1467,13 +1471,22 @@ async def get_all_config() -> Dict[str, Any]:
             ORDER BY id ASC
             """
         )
+        target_id_map = await ensure_device_ids(
+            conn, [str(r["device_ip"]) for r in targets if r["device_ip"]]
+        )
+
+    targets_out = []
+    for r in targets:
+        d = dict(r)
+        d["device_id"] = target_id_map.get(str(r["device_ip"]))
+        targets_out.append(d)
 
     return {
         "onboarding": onboarding,
         "isp_settings": isp_settings,
         "overview_graph_settings": overview_graph_settings,
         "snmp_profiles": [dict(r) for r in profiles],
-        "snmp_targets": [dict(r) for r in targets],
+        "snmp_targets": targets_out,
         "subnets": [dict(r) for r in subnets],
         "unifi_controllers": [dict(r) for r in unifi_ctrls],
     }
@@ -1519,12 +1532,20 @@ async def get_overview_graph_options() -> Dict[str, Any]:
             ORDER BY device_ip, if_index, time DESC
             """
         )
+        opt_id_map = await ensure_device_ids(
+            conn,
+            [str(hr["ip_address"]).strip() for hr in host_rows if hr["ip_address"]]
+            + [str(tr["device_ip"]).strip() for tr in tgt_rows if tr["device_ip"]]
+            + [str(sr["device_ip"]).strip() for sr in snmp_rows if sr["device_ip"]]
+            + [str(ir["device_ip"]).strip() for ir in if_rows if ir["device_ip"]],
+        )
 
     dev_map: Dict[str, Dict[str, Any]] = {}
 
     def _ensure_dev(ip: str) -> Dict[str, Any]:
         if ip not in dev_map:
             dev_map[ip] = {
+                "device_id": opt_id_map.get(ip),
                 "device_ip": ip,
                 "hostname": ip,
                 "vendor": None,
@@ -1750,10 +1771,12 @@ async def complete_onboarding(payload: OnboardingPayload) -> Dict[str, Any]:
                 p.poll_interval,
             )
 
+        added_target_ips: List[str] = []
         for t in payload.snmp_targets:
             ip_val = t.device_ip.strip()
             if not ip_val:
                 continue
+            added_target_ips.append(ip_val)
             await conn.execute(
                 """
                 INSERT INTO snmp_targets_config (device_ip, label, profile_id, enabled)
@@ -1768,6 +1791,8 @@ async def complete_onboarding(payload: OnboardingPayload) -> Dict[str, Any]:
                 t.profile_id or default_profile_id,
                 t.enabled,
             )
+        if added_target_ips:
+            await ensure_device_ids(conn, added_target_ips)
 
         for s in payload.subnets:
             raw_cidr = s.subnet_cidr.strip()
@@ -1952,6 +1977,7 @@ async def create_snmp_target(payload: SNMPTargetPayload) -> Dict[str, Any]:
             ip_str,
             label_str or ip_str,
         )
+        await ensure_device_ids(conn, [ip_str])
     await _notify_worker("snmp_now")
     return await get_all_config()
 
@@ -1984,6 +2010,7 @@ async def update_snmp_target(target_id: int, payload: SNMPTargetPayload) -> Dict
             payload.enabled,
             target_id,
         )
+        await ensure_device_ids(conn, [ip_str])
     await _notify_worker("snmp_now")
     return await get_all_config()
 
@@ -2350,7 +2377,7 @@ async def get_pulse_overview(
 
         unifi_devs = await conn.fetch(
             """
-            SELECT mac, ip_address, name, model, device_type, firmware_version,
+            SELECT mac, ip_address, lan_ip, name, model, device_type, firmware_version,
                    status, uptime_sec, cpu_usage_pct, mem_usage_pct, temp_celsius,
                    poe_total_watts, poe_max_watts, num_sta, rx_bps, tx_bps, port_table, last_seen
             FROM unifi_devices
@@ -2386,6 +2413,14 @@ async def get_pulse_overview(
             """
         )
 
+        ov_ips = [str(s["device_ip"]).strip() for s in snmp_devs if s["device_ip"]]
+        for d in unifi_devs:
+            for cand in (d["lan_ip"], d["ip_address"]):
+                c_ip = str(cand or "").strip()
+                if c_ip:
+                    ov_ips.append(c_ip)
+        ov_id_map = await ensure_device_ids(conn, ov_ips)
+
     devices_list = []
     for d in unifi_devs:
         item = dict(d)
@@ -2395,11 +2430,14 @@ async def get_pulse_overview(
             except Exception:
                 item["port_table"] = []
         item["last_seen"] = item["last_seen"].isoformat() if item.get("last_seen") else None
+        unifi_key = str(item.get("lan_ip") or item.get("ip_address") or "").strip()
+        item["device_id"] = ov_id_map.get(unifi_key)
         devices_list.append(item)
 
     snmp_list = []
     for s in snmp_devs:
         item = dict(s)
+        item["device_id"] = ov_id_map.get(str(item.get("device_ip") or "").strip())
         item["last_polled"] = item["last_polled"].isoformat() if item.get("last_polled") else None
         snmp_list.append(item)
 
@@ -2488,9 +2526,13 @@ async def get_snmp_interfaces(device_ip: Optional[str] = None) -> Dict[str, Any]
                 ORDER BY device_ip, if_index, time DESC
                 """
             )
+        if_id_map = await ensure_device_ids(
+            conn, [str(r["device_ip"]).strip() for r in rows if r["device_ip"]]
+        )
     items = []
     for r in rows:
         d = dict(r)
+        d["device_id"] = if_id_map.get(str(d.get("device_ip") or "").strip())
         d["time"] = d["time"].isoformat() if d.get("time") else None
         items.append(d)
     return {"interfaces": items}
@@ -2662,6 +2704,9 @@ async def get_snmp_telemetry(
             )
             or 0
         )
+        telemetry_id_map = await ensure_device_ids(
+            conn, [str(r["device_ip"]).strip() for r in target_rows if r["device_ip"]]
+        )
 
     dev_stats_map = {str(r["device_ip"]): dict(r) for r in per_dev_stats_rows}
 
@@ -2736,6 +2781,7 @@ async def get_snmp_telemetry(
 
         targets_out.append(
             {
+                "device_id": telemetry_id_map.get(ip),
                 "device_ip": ip,
                 "sys_name": r.get("sys_name") or r.get("label") or ip,
                 "vendor_name": r.get("vendor_name") or "Standard SNMP Device",
@@ -3106,10 +3152,14 @@ async def get_discovered_hosts(subnet: Optional[str] = None) -> Dict[str, Any]:
             ORDER BY subnet_cidr, scan_time DESC
             """
         )
+        host_id_map = await ensure_device_ids(
+            conn, [str(r["ip_address"]).strip() for r in rows if r["ip_address"]]
+        )
 
     hosts = []
     for r in rows:
         d = dict(r)
+        d["device_id"] = host_id_map.get(str(d.get("ip_address") or "").strip())
         d["first_seen"] = d["first_seen"].isoformat() if d.get("first_seen") else None
         d["last_seen"] = d["last_seen"].isoformat() if d.get("last_seen") else None
         hosts.append(d)
@@ -3136,6 +3186,55 @@ async def trigger_subnet_scan() -> Dict[str, str]:
 # ==============================================================================
 # Unified Devices Inventory & Per-Device Detailed Telemetry Page Endpoints
 # ==============================================================================
+
+
+async def _resolve_device_ref(
+    conn: asyncpg.Connection, device_ref: str
+) -> Tuple[Optional[int], str]:
+    """Resolves either a numeric device_id or an IP address into (device_id, ip_address)."""
+    ref = str(device_ref or "").strip()
+    if not ref:
+        raise HTTPException(status_code=404, detail="Device reference is required.")
+
+    if ref.isdigit():
+        row = await conn.fetchrow(
+            "SELECT id, ip_address FROM device_registry WHERE id = $1",
+            int(ref),
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Device ID {ref} not found.")
+        return int(row["id"]), str(row["ip_address"])
+
+    try:
+        norm_ip = str(ipaddress.ip_address(ref))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=f"Unknown device reference: {ref}") from exc
+
+    existing_id = await conn.fetchval(
+        "SELECT id FROM device_registry WHERE ip_address = $1",
+        norm_ip,
+    )
+    if existing_id is not None:
+        return int(existing_id), norm_ip
+
+    known = await conn.fetchval(
+        """
+        SELECT (
+            EXISTS (SELECT 1 FROM discovered_hosts WHERE host(ip_address) = $1)
+            OR EXISTS (SELECT 1 FROM snmp_targets_config WHERE device_ip = $1)
+            OR EXISTS (SELECT 1 FROM snmp_devices WHERE device_ip = $1)
+            OR EXISTS (SELECT 1 FROM unifi_devices WHERE ip_address = $1 OR lan_ip = $1)
+            OR EXISTS (SELECT 1 FROM unifi_clients WHERE ip_address = $1)
+            OR EXISTS (SELECT 1 FROM device_logs WHERE source_ip = $1 AND time > NOW() - INTERVAL '30 days')
+        )
+        """,
+        norm_ip,
+    )
+    if known:
+        id_map = await ensure_device_ids(conn, [norm_ip])
+        return id_map.get(norm_ip), norm_ip
+
+    return None, norm_ip
 
 
 @app.get("/api/devices")
@@ -3203,11 +3302,35 @@ async def get_all_devices() -> Dict[str, Any]:
             """
         )
 
+        all_dev_ips: List[str] = []
+        for r in disc_rows:
+            if r["ip_address"]:
+                all_dev_ips.append(str(r["ip_address"]).strip())
+        for r in snmp_cfg_rows:
+            if r["device_ip"]:
+                all_dev_ips.append(str(r["device_ip"]).strip())
+        for r in snmp_dev_rows:
+            if r["device_ip"]:
+                all_dev_ips.append(str(r["device_ip"]).strip())
+        for r in unifi_dev_rows:
+            for cand_ip in (r["lan_ip"], r["ip_address"]):
+                c_ip = str(cand_ip or "").strip()
+                if c_ip:
+                    all_dev_ips.append(c_ip)
+        for r in unifi_cli_rows:
+            if r["ip_address"]:
+                all_dev_ips.append(str(r["ip_address"]).strip())
+        for r in log_counts:
+            if r["source_ip"]:
+                all_dev_ips.append(str(r["source_ip"]).strip())
+        dev_id_map = await ensure_device_ids(conn, all_dev_ips)
+
     by_ip: Dict[str, Dict[str, Any]] = {}
 
     def _ensure_ip(ip_str: str) -> Dict[str, Any]:
         if ip_str not in by_ip:
             by_ip[ip_str] = {
+                "device_id": dev_id_map.get(ip_str),
                 "ip_address": ip_str,
                 "hostname": ip_str,
                 "mac_address": None,
@@ -3380,11 +3503,12 @@ async def get_all_devices() -> Dict[str, Any]:
     return {"devices": devices_list}
 
 
-@app.get("/api/devices/{device_ip}")
-async def get_device_detail(device_ip: str) -> Dict[str, Any]:
-    """Returns all polled and correlated information for a specific device IP."""
+@app.get("/api/devices/{device_ref}")
+async def get_device_detail(device_ref: str) -> Dict[str, Any]:
+    """Returns all polled and correlated information for a specific device ID or IP."""
     pool = _get_pool()
     async with pool.acquire() as conn:
+        device_id, device_ip = await _resolve_device_ref(conn, device_ref)
         host_row = await conn.fetchrow(
             """
             SELECT host(ip_address) AS ip_address, subnet_cidr, mac_address,
@@ -3651,6 +3775,7 @@ async def get_device_detail(device_ip: str) -> Dict[str, Any]:
     )
 
     return {
+        "device_id": device_id,
         "ip_address": device_ip,
         "device_profile_type": device_profile_type,
         "discovered_host": host_dict,
@@ -3665,9 +3790,9 @@ async def get_device_detail(device_ip: str) -> Dict[str, Any]:
     }
 
 
-@app.get("/api/devices/{device_ip}/ups-history")
+@app.get("/api/devices/{device_ref}/ups-history")
 async def get_device_ups_history(
-    device_ip: str,
+    device_ref: str,
     range_key: str = Query(default="24h", alias="range"),
 ) -> Dict[str, Any]:
     """Returns time-series battery, load, runtime, voltage, and wattage telemetry for a UPS device."""
@@ -3688,6 +3813,7 @@ async def get_device_ups_history(
 
     pool = _get_pool()
     async with pool.acquire() as conn:
+        device_id, device_ip = await _resolve_device_ref(conn, device_ref)
         if bucket_size is None:
             rows = await conn.fetch(
                 f"""
@@ -3746,7 +3872,7 @@ async def get_device_ups_history(
         }
         for r in rows
     ]
-    return {"device_ip": device_ip, "range": rk, "series": series}
+    return {"device_id": device_id, "device_ip": device_ip, "range": rk, "series": series}
 
 
 @app.post("/api/devices/rematch-mibs")
@@ -3759,8 +3885,11 @@ async def trigger_rematch_all_device_mibs() -> Dict[str, str]:
     }
 
 
-@app.post("/api/devices/{device_ip}/poll")
-async def trigger_device_poll(device_ip: str) -> Dict[str, Any]:
+@app.post("/api/devices/{device_ref}/poll")
+async def trigger_device_poll(device_ref: str) -> Dict[str, Any]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        device_id, device_ip = await _resolve_device_ref(conn, device_ref)
     done_key = f"snmp:poll_done:{device_ip}"
     if redis_client:
         try:
@@ -3777,12 +3906,17 @@ async def trigger_device_poll(device_ip: str) -> Dict[str, Any]:
                     parsed = json.loads(raw_done)
                     return {
                         "status": "completed",
+                        "device_id": device_id,
                         "ok": bool(parsed.get("ok")),
                         "message": f"Completed targeted SNMP poll for {device_ip}.",
                     }
             except Exception:
                 break
-    return {"status": "triggered", "message": f"Immediate SNMP & MIB poll queued for {device_ip}."}
+    return {
+        "status": "triggered",
+        "device_id": device_id,
+        "message": f"Immediate SNMP & MIB poll queued for {device_ip}.",
+    }
 
 
 @app.get("/api/mibs")
@@ -3891,15 +4025,36 @@ async def get_device_logs(
             """
         )
 
+        log_ips = list(
+            dict.fromkeys(
+                [str(r["source_ip"]).strip() for r in rows if r["source_ip"]]
+                + [str(s["source_ip"]).strip() for s in sources if s["source_ip"]]
+            )
+        )
+        log_id_map: Dict[str, int] = {}
+        if log_ips:
+            reg_rows = await conn.fetch(
+                "SELECT id, ip_address FROM device_registry WHERE ip_address = ANY($1::text[])",
+                log_ips,
+            )
+            log_id_map = {str(reg["ip_address"]): int(reg["id"]) for reg in reg_rows}
+
     logs = []
     for r in rows:
         d = dict(r)
+        d["device_id"] = log_id_map.get(str(d.get("source_ip") or "").strip())
         d["time"] = d["time"].isoformat() if d.get("time") else None
         logs.append(d)
 
+    sources_out = []
+    for s in sources:
+        sd = dict(s)
+        sd["device_id"] = log_id_map.get(str(sd.get("source_ip") or "").strip())
+        sources_out.append(sd)
+
     return {
         "logs": logs,
-        "sources": [dict(s) for s in sources],
+        "sources": sources_out,
     }
 
 

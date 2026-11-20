@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import asyncpg
 import redis.asyncio as aioredis
 
+from app.db_schema import ensure_device_ids
 from app.mib_catalog import match_device_vendor_profile
 
 logger = logging.getLogger("netdash.snmp")
@@ -1428,6 +1429,7 @@ class SNMPPoller:
                     target,
                     label or target,
                 )
+                await ensure_device_ids(conn, [target], touch_last_seen=False)
                 try:
                     await conn.execute(
                         """
@@ -1834,6 +1836,7 @@ class SNMPPoller:
                 json.dumps(enrichment["extended_metrics"]),
                 poll_ms,
             )
+            await ensure_device_ids(conn, [target], touch_last_seen=True)
 
             if rows_to_insert:
                 await conn.executemany(
