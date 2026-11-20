@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import json
 import logging
 from typing import Any, Dict, List, Optional
@@ -13,7 +14,12 @@ class UniFiCollector:
 
     @staticmethod
     async def _fetch_endpoint(
-        client: httpx.AsyncClient, host: str, api_key: str, site: str, path: str
+        client: httpx.AsyncClient,
+        host: str,
+        api_key: str,
+        site: str,
+        path: str,
+        timeout: float = 12.0,
     ) -> List[Dict[str, Any]]:
         base_url = host if host.startswith("http") else f"https://{host}"
         base_url = base_url.rstrip("/")
@@ -29,7 +35,7 @@ class UniFiCollector:
 
         for url in urls:
             try:
-                resp = await client.get(url, headers=headers, timeout=12.0)
+                resp = await client.get(url, headers=headers, timeout=timeout)
                 if resp.status_code == 200:
                     payload = resp.json()
                     if isinstance(payload, dict) and "data" in payload:
@@ -348,3 +354,62 @@ class UniFiCollector:
             }
 
         return last_summary
+
+    async def poll_live_wan(
+        self,
+        controllers: List[Dict[str, Any]],
+        client_map: Dict[int, httpx.AsyncClient],
+    ) -> Optional[Dict[str, Any]]:
+        """Lightweight high-frequency WAN throughput & latency sampler for live streaming."""
+        if not controllers:
+            return None
+
+        total_rx_bps = 0.0
+        total_tx_bps = 0.0
+        latency_ms = 0.0
+        responded = 0
+
+        for ctrl in controllers:
+            ctrl_id = int(ctrl["id"])
+            host = str(ctrl["host"]).strip()
+            api_key = str(ctrl["api_key"]).strip()
+            site = str(ctrl.get("site_name") or "default").strip()
+            verify_ssl = bool(ctrl.get("verify_ssl", False))
+            if not host or not api_key:
+                continue
+
+            client = client_map.get(ctrl_id)
+            if client is None:
+                client = httpx.AsyncClient(verify=verify_ssl)
+                client_map[ctrl_id] = client
+
+            health_data = await self._fetch_endpoint(
+                client, host, api_key, site, "stat/health", timeout=3.0
+            )
+            if not health_data:
+                continue
+
+            subsystems = {
+                item.get("subsystem"): item for item in health_data if isinstance(item, dict)
+            }
+            wan_sub = subsystems.get("wan", {})
+            www_sub = subsystems.get("www", {})
+
+            total_rx_bps += float(wan_sub.get("rx_bytes-r", 0.0) or 0.0) * 8.0
+            total_tx_bps += float(wan_sub.get("tx_bytes-r", 0.0) or 0.0) * 8.0
+            lat = float(www_sub.get("latency", wan_sub.get("latency", 0.0)) or 0.0)
+            if lat > 0.0 and latency_ms == 0.0:
+                latency_ms = lat
+            responded += 1
+
+        if responded == 0:
+            return None
+
+        return {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "rx_bps": round(total_rx_bps, 1),
+            "tx_bps": round(total_tx_bps, 1),
+            "latency_ms": round(latency_ms, 2),
+            "source": "unifi",
+            "device_count": responded,
+        }

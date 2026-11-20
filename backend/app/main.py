@@ -363,6 +363,29 @@ async def _notify_worker(cmd: str) -> None:
             pass
 
 
+async def _read_live_traffic_series(limit: int = 120) -> List[Dict[str, Any]]:
+    """Reads cached 2s live traffic samples from Redis in ascending chronological order."""
+    if redis_client is None:
+        return []
+    try:
+        raw_items = await asyncio.wait_for(
+            redis_client.lrange("netdash:live:traffic", 0, max(0, limit - 1)),
+            timeout=1.0,
+        )
+    except Exception:
+        return []
+
+    series: List[Dict[str, Any]] = []
+    for raw in reversed(raw_items):
+        try:
+            item = json.loads(raw)
+            if isinstance(item, dict) and item.get("time"):
+                series.append(item)
+        except Exception:
+            continue
+    return series
+
+
 async def _inspect_git_update(do_fetch: bool = False) -> Dict[str, Any]:
     """Inspects /opt/netdash-repo for available commits on origin/main without auto-installing."""
     if not (REPO_MOUNT_DIR / ".git").exists():
@@ -924,6 +947,7 @@ async def get_system_info() -> Dict[str, Any]:
 
             loops = hb.get("loops") or {}
             loop_labels = [
+                ("live_traffic_streamer", "Live Traffic Streamer"),
                 ("snmp_poller", "SNMP Poller Loop"),
                 ("subnet_scanner", "Nmap Subnet Scanner Loop"),
                 ("unifi_collector", "UniFi Collector Loop"),
@@ -1691,11 +1715,19 @@ async def get_pulse_overview() -> Dict[str, Any]:
             }
             for r in wan_history
         ],
+        "live_series": await _read_live_traffic_series(120),
         "unifi_devices": devices_list,
         "snmp_devices": snmp_list,
         "scanner_summary": dict(host_counts) if host_counts else {"online_hosts": 0, "total_discovered": 0},
         "syslog_summary": dict(log_counts) if log_counts else {"total_24h": 0, "errors_24h": 0, "warnings_24h": 0},
     }
+
+
+@app.get("/api/overview/live")
+async def get_overview_live_series(
+    limit: int = Query(default=120, ge=10, le=180),
+) -> Dict[str, Any]:
+    return {"live_series": await _read_live_traffic_series(limit)}
 
 
 @app.get("/api/snmp/interfaces")
@@ -2508,13 +2540,14 @@ async def websocket_live(ws: WebSocket) -> None:
     await pubsub.subscribe("netdash:live")
     try:
         while True:
-            msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+            msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5)
             if msg and msg.get("data"):
                 raw = msg["data"]
                 if isinstance(raw, bytes):
                     raw = raw.decode("utf-8", errors="ignore")
                 await ws.send_text(raw)
-            await asyncio.sleep(0.25)
+            else:
+                await asyncio.sleep(0.05)
     except WebSocketDisconnect:
         pass
     except Exception as exc:

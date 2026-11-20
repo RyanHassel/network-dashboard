@@ -418,6 +418,15 @@ interface GatewayMetrics {
   online_devices: number;
 }
 
+interface LiveTrafficSample {
+  time: string;
+  rx_bps: number;
+  tx_bps: number;
+  latency_ms?: number;
+  source?: string;
+  device_count?: number;
+}
+
 interface OverviewPayload {
   gateway: GatewayMetrics | null;
   wan_series: Array<{
@@ -426,6 +435,7 @@ interface OverviewPayload {
     tx_bps: number;
     latency_ms: number;
   }>;
+  live_series?: LiveTrafficSample[];
   unifi_devices: Array<{
     mac: string;
     ip_address: string;
@@ -562,6 +572,14 @@ function formatChartAxisTimestamp(rawLabel: string, spanMs: number): string {
   if (!rawLabel) return "";
   const dt = new Date(rawLabel);
   if (Number.isNaN(dt.getTime())) return rawLabel;
+  // Short live-streaming windows (<= 10 minutes): include seconds
+  if (spanMs > 0 && spanMs <= 10 * 60 * 1000) {
+    return dt.toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  }
   // Multi-day spans (>36 hours): include Month & Day
   if (spanMs > 36 * 3600 * 1000) {
     if (spanMs > 14 * 86400 * 1000) {
@@ -716,18 +734,69 @@ function evalSplineY(
   );
 }
 
+function evalSplineAtX(
+  segments: SplineSegment[],
+  pts: Array<{ x: number; y: number }>,
+  targetX: number,
+): number {
+  if (pts.length === 0) return 0;
+  if (pts.length === 1 || segments.length === 0) return pts[0].y;
+  if (targetX <= pts[0].x) return pts[0].y;
+  if (targetX >= pts[pts.length - 1].x) return pts[pts.length - 1].y;
+
+  let lo = 0;
+  let hi = segments.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (segments[mid].x1 < targetX) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  const s = segments[lo];
+  const dx = s.x1 - s.x0;
+  const t = dx > 1e-6 ? Math.min(1, Math.max(0, (targetX - s.x0) / dx)) : 0;
+  const mt = 1 - t;
+  return (
+    mt * mt * mt * s.y0 +
+    3 * mt * mt * t * s.cp1y +
+    3 * mt * t * t * s.cp2y +
+    t * t * t * s.y1
+  );
+}
+
+interface ParsedSparkSample {
+  ts: number;
+  inVal: number;
+  outVal: number;
+  p95In: number;
+  label: string;
+}
+
 const DualAreaSparkChart: React.FC<{
   points: Array<{ label: string; inVal: number; outVal: number; p95In?: number }>;
   height?: number;
-}> = ({ points, height = 210 }) => {
+  liveMode?: boolean;
+  liveWindowMs?: number;
+}> = ({ points, height = 210, liveMode = false, liveWindowMs = 120_000 }) => {
   const rawId = useId();
   const gradPrefix = rawId.replace(/[^a-zA-Z0-9_-]/g, "");
   const rxGradId = `rxGrad-${gradPrefix}`;
   const txGradId = `txGrad-${gradPrefix}`;
+  const clipId = `plotClip-${gradPrefix}`;
   const plotRef = useRef<HTMLDivElement | null>(null);
   const enteredAtRef = useRef<number>(0);
+  const pointerRatioRef = useRef<number>(0.5);
+  const samplesRef = useRef<ParsedSparkSample[]>([]);
+  const lastLatestTsRef = useRef<number>(0);
+  const clockOffsetRef = useRef<number>(0);
+  const sampleGapRef = useRef<number>(2000);
+  const displayEndRef = useRef<number>(0);
+  const displayMaxRef = useRef<number>(1000);
   const [isHovering, setIsHovering] = useState(false);
   const [animateMove, setAnimateMove] = useState(false);
+  const [, setAnimFrame] = useState(0);
   const [hoverData, setHoverData] = useState<{
     ratio: number;
     inYFrac: number;
@@ -738,6 +807,134 @@ const DualAreaSparkChart: React.FC<{
     boxX: number;
     boxY: number;
   } | null>(null);
+
+  useEffect(() => {
+    const parsed: ParsedSparkSample[] = [];
+    for (const pt of points) {
+      const ts = new Date(pt.label).getTime();
+      if (Number.isNaN(ts)) continue;
+      parsed.push({
+        ts,
+        inVal: Math.max(0, pt.inVal || 0),
+        outVal: Math.max(0, pt.outVal || 0),
+        p95In: Math.max(0, pt.p95In || 0),
+        label: pt.label,
+      });
+    }
+    parsed.sort((a, b) => a.ts - b.ts);
+    samplesRef.current = parsed;
+
+    if (!liveMode || parsed.length === 0) return;
+
+    const latestTs = parsed[parsed.length - 1].ts;
+    const prevLatestTs = lastLatestTsRef.current;
+    if (latestTs > prevLatestTs || prevLatestTs === 0) {
+      const measuredOffset = latestTs - Date.now();
+      clockOffsetRef.current =
+        prevLatestTs === 0
+          ? measuredOffset
+          : clockOffsetRef.current * 0.8 + measuredOffset * 0.2;
+
+      if (prevLatestTs > 0) {
+        const delta = latestTs - prevLatestTs;
+        if (delta >= 500 && delta <= 15000) {
+          sampleGapRef.current = sampleGapRef.current * 0.7 + delta * 0.3;
+        }
+      } else if (parsed.length >= 2) {
+        const recentGap = parsed[parsed.length - 1].ts - parsed[parsed.length - 2].ts;
+        if (recentGap >= 500 && recentGap <= 15000) {
+          sampleGapRef.current = recentGap;
+        }
+      }
+      lastLatestTsRef.current = latestTs;
+    }
+
+    if (displayEndRef.current === 0 || Math.abs(latestTs - displayEndRef.current) > 30000) {
+      const lagMs = Math.min(8000, Math.max(1500, sampleGapRef.current * 1.15));
+      displayEndRef.current = Math.max(parsed[0].ts, latestTs - lagMs);
+    }
+  }, [points, liveMode]);
+
+  useEffect(() => {
+    if (!liveMode) {
+      lastLatestTsRef.current = 0;
+      clockOffsetRef.current = 0;
+      displayEndRef.current = 0;
+      displayMaxRef.current = 1000;
+      return;
+    }
+
+    const reducedMotion =
+      typeof window !== "undefined" &&
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    const minFrameGapMs = reducedMotion ? 1000 : 0;
+
+    let rafId = 0;
+    let lastFrameWallMs = performance.now();
+    let lastDrawWallMs = 0;
+
+    const step = (nowWallMs: number) => {
+      rafId = window.requestAnimationFrame(step);
+      if (typeof document !== "undefined" && document.hidden) {
+        lastFrameWallMs = nowWallMs;
+        return;
+      }
+
+      const dtMs = Math.max(0, nowWallMs - lastFrameWallMs);
+      lastFrameWallMs = nowWallMs;
+
+      if (minFrameGapMs > 0 && nowWallMs - lastDrawWallMs < minFrameGapMs) {
+        return;
+      }
+
+      const samples = samplesRef.current;
+      if (samples.length < 2) return;
+
+      const earliestTs = samples[0].ts;
+      const latestTs = samples[samples.length - 1].ts;
+      const estServerNow = Date.now() + clockOffsetRef.current;
+      const lagMs = Math.min(8000, Math.max(1500, sampleGapRef.current * 1.15));
+      const targetEnd = Math.min(latestTs, Math.max(earliestTs, estServerNow - lagMs));
+
+      if (
+        displayEndRef.current === 0 ||
+        dtMs > 2500 ||
+        Math.abs(targetEnd - displayEndRef.current) > 12000
+      ) {
+        displayEndRef.current = targetEnd;
+      } else if (targetEnd > displayEndRef.current) {
+        const lagDiff = targetEnd - displayEndRef.current;
+        const speed = 1 + Math.min(2.0, lagDiff / 1500);
+        displayEndRef.current = Math.min(targetEnd, displayEndRef.current + dtMs * speed);
+      }
+
+      const winEnd = displayEndRef.current;
+      const winStart = winEnd - liveWindowMs;
+      let visMax = 1000;
+      for (let i = 0; i < samples.length; i++) {
+        const s = samples[i];
+        if (s.ts < winStart - sampleGapRef.current) continue;
+        if (s.ts > winEnd + sampleGapRef.current) break;
+        const m = Math.max(s.inVal, s.outVal, s.p95In);
+        if (m > visMax) visMax = m;
+      }
+      const targetMax = Math.max(1000, visMax * 1.12);
+      const alpha = Math.min(1, 1 - Math.exp(-dtMs / 420));
+      if (displayMaxRef.current <= 1000 && targetMax > 1000) {
+        displayMaxRef.current = targetMax;
+      } else {
+        displayMaxRef.current += (targetMax - displayMaxRef.current) * alpha;
+      }
+
+      lastDrawWallMs = nowWallMs;
+      setAnimFrame((n) => (n + 1) & 0x3fffffff);
+    };
+
+    rafId = window.requestAnimationFrame(step);
+    return () => {
+      window.cancelAnimationFrame(rafId);
+    };
+  }, [liveMode, liveWindowMs]);
 
   if (!points.length) {
     return (
@@ -754,88 +951,208 @@ const DualAreaSparkChart: React.FC<{
   const topPad = 12;
   const baselineY = height - 18;
   const plotSpanY = Math.max(1, baselineY - topPad);
-  const maxVal = Math.max(
-    1000,
-    ...points.map((p) => Math.max(p.inVal, p.outVal, p.p95In || 0)),
-  );
 
-  const firstTs = new Date(points[0].label).getTime();
-  const lastTs = new Date(points[points.length - 1].label).getTime();
-  const spanMs =
-    !Number.isNaN(firstTs) && !Number.isNaN(lastTs) ? Math.max(0, lastTs - firstTs) : 0;
+  const liveSamples: ParsedSparkSample[] = liveMode
+    ? points
+        .map((pt) => ({
+          ts: new Date(pt.label).getTime(),
+          inVal: Math.max(0, pt.inVal || 0),
+          outVal: Math.max(0, pt.outVal || 0),
+          p95In: Math.max(0, pt.p95In || 0),
+          label: pt.label,
+        }))
+        .filter((s) => !Number.isNaN(s.ts))
+        .sort((a, b) => a.ts - b.ts)
+    : [];
+  const useLiveRender = liveMode && liveSamples.length >= 2;
 
-  const tickCount = Math.min(6, points.length);
-  const tickIndices: number[] = [];
-  if (tickCount === 1) {
-    tickIndices.push(0);
-  } else {
-    for (let t = 0; t < tickCount; t++) {
-      const idx = Math.round((t / (tickCount - 1)) * (points.length - 1));
-      if (!tickIndices.includes(idx)) tickIndices.push(idx);
+  let maxVal = 1000;
+  let spanMs = 0;
+  let inPts: Array<{ x: number; y: number }> = [];
+  let outPts: Array<{ x: number; y: number }> = [];
+  let tickXPositions: number[] = [];
+  let axisLabels: string[] = [];
+  let liveWindowStart = 0;
+
+  if (useLiveRender) {
+    const latestTs = liveSamples[liveSamples.length - 1].ts;
+    const fallbackLag = Math.min(8000, Math.max(1500, sampleGapRef.current * 1.15));
+    const windowEnd =
+      displayEndRef.current > 0
+        ? Math.min(latestTs, displayEndRef.current)
+        : Math.max(liveSamples[0].ts, latestTs - fallbackLag);
+    liveWindowStart = windowEnd - liveWindowMs;
+    spanMs = liveWindowMs;
+
+    let startIdx = 0;
+    for (let i = 0; i < liveSamples.length; i++) {
+      if (liveSamples[i].ts < liveWindowStart) {
+        startIdx = i;
+      } else {
+        break;
+      }
     }
-  }
+    const visibleSlice = liveSamples.slice(startIdx);
 
-  const toPts = (vals: number[]) =>
-    vals.map((v, i) => ({
-      x: points.length === 1 ? width / 2 : (i / (points.length - 1)) * width,
-      y: baselineY - (Math.min(Math.max(0, v), maxVal) / maxVal) * plotSpanY,
+    let peakNow = 1000;
+    for (const s of visibleSlice) {
+      const m = Math.max(s.inVal, s.outVal, s.p95In);
+      if (m > peakNow) peakNow = m;
+    }
+    maxVal = displayMaxRef.current > 1000 ? displayMaxRef.current : Math.max(1000, peakNow * 1.12);
+
+    inPts = visibleSlice.map((s) => ({
+      x: ((s.ts - liveWindowStart) / liveWindowMs) * width,
+      y: baselineY - (Math.min(Math.max(0, s.inVal), maxVal) / maxVal) * plotSpanY,
+    }));
+    outPts = visibleSlice.map((s) => ({
+      x: ((s.ts - liveWindowStart) / liveWindowMs) * width,
+      y: baselineY - (Math.min(Math.max(0, s.outVal), maxVal) / maxVal) * plotSpanY,
     }));
 
-  const inPts = toPts(points.map((p) => p.inVal));
-  const outPts = toPts(points.map((p) => p.outVal));
+    const liveTicks = 6;
+    for (let t = 0; t < liveTicks; t++) {
+      const frac = t / (liveTicks - 1);
+      tickXPositions.push(frac * width);
+      const tickTs = liveWindowStart + frac * liveWindowMs;
+      axisLabels.push(
+        new Date(tickTs).toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        }),
+      );
+    }
+  } else {
+    maxVal = Math.max(
+      1000,
+      ...points.map((p) => Math.max(p.inVal, p.outVal, p.p95In || 0)),
+    );
+    const firstTs = new Date(points[0].label).getTime();
+    const lastTs = new Date(points[points.length - 1].label).getTime();
+    spanMs =
+      !Number.isNaN(firstTs) && !Number.isNaN(lastTs) ? Math.max(0, lastTs - firstTs) : 0;
+
+    const tickCount = Math.min(6, points.length);
+    const tickIndices: number[] = [];
+    if (tickCount === 1) {
+      tickIndices.push(0);
+    } else {
+      for (let t = 0; t < tickCount; t++) {
+        const idx = Math.round((t / (tickCount - 1)) * (points.length - 1));
+        if (!tickIndices.includes(idx)) tickIndices.push(idx);
+      }
+    }
+    tickXPositions = tickIndices.map((idx) =>
+      points.length === 1 ? width / 2 : (idx / (points.length - 1)) * width,
+    );
+    axisLabels = tickIndices.map((idx) => formatChartAxisTimestamp(points[idx].label, spanMs));
+
+    const toPts = (vals: number[]) =>
+      vals.map((v, i) => ({
+        x: points.length === 1 ? width / 2 : (i / (points.length - 1)) * width,
+        y: baselineY - (Math.min(Math.max(0, v), maxVal) / maxVal) * plotSpanY,
+      }));
+    inPts = toPts(points.map((p) => p.inVal));
+    outPts = toPts(points.map((p) => p.outVal));
+  }
+
   const inSpline = buildMonotoneSpline(inPts, topPad, baselineY);
   const outSpline = buildMonotoneSpline(outPts, topPad, baselineY);
+  const minCurveX = inPts.length > 0 ? Math.max(0, inPts[0].x) : 0;
+  const maxCurveX = inPts.length > 0 ? Math.min(width, inPts[inPts.length - 1].x) : width;
+
+  const headX = useLiveRender ? maxCurveX : 0;
+  const headInY = useLiveRender ? evalSplineAtX(inSpline.segments, inPts, headX) : 0;
+  const headOutY = useLiveRender ? evalSplineAtX(outSpline.segments, outPts, headX) : 0;
+
+  const buildHoverSnapshot = (ratioInput: number) => {
+    const rect = plotRef.current?.getBoundingClientRect();
+    const rectW = rect && rect.width > 0 ? rect.width : width;
+    const rectH = rect && rect.height > 0 ? rect.height : height;
+
+    let ratio = Math.min(1, Math.max(0, ratioInput));
+    let inY: number;
+    let outY: number;
+    let timeText = "—";
+
+    if (useLiveRender) {
+      const rawX = ratio * width;
+      const targetX =
+        maxCurveX >= minCurveX
+          ? Math.min(maxCurveX, Math.max(minCurveX, rawX))
+          : maxCurveX;
+      ratio = targetX / width;
+      inY = evalSplineAtX(inSpline.segments, inPts, targetX);
+      outY = evalSplineAtX(outSpline.segments, outPts, targetX);
+      const tsMs = liveWindowStart + ratio * liveWindowMs;
+      timeText = formatChartTooltipTimestamp(tsMs, "", liveWindowMs);
+    } else {
+      ratio = points.length === 1 ? 0.5 : ratio;
+      inY = evalSplineY(inSpline.segments, inPts, ratio);
+      outY = evalSplineY(outSpline.segments, outPts, ratio);
+
+      if (points.length === 1) {
+        timeText = formatChartTooltipTimestamp(
+          new Date(points[0].label).getTime(),
+          points[0].label,
+          spanMs,
+        );
+      } else {
+        const exactIdx = ratio * (points.length - 1);
+        const i0 = Math.min(points.length - 2, Math.max(0, Math.floor(exactIdx)));
+        const t = exactIdx - i0;
+        const ts0 = new Date(points[i0].label).getTime();
+        const ts1 = new Date(points[i0 + 1].label).getTime();
+        if (!Number.isNaN(ts0) && !Number.isNaN(ts1)) {
+          timeText = formatChartTooltipTimestamp(
+            ts0 + t * (ts1 - ts0),
+            points[i0].label,
+            spanMs,
+          );
+        } else {
+          const nearest = points[Math.min(points.length - 1, Math.max(0, Math.round(exactIdx)))];
+          timeText = formatChartTooltipTimestamp(
+            new Date(nearest.label).getTime(),
+            nearest.label,
+            spanMs,
+          );
+        }
+      }
+    }
+
+    const inVal = Math.max(0, ((baselineY - inY) / plotSpanY) * maxVal);
+    const outVal = Math.max(0, ((baselineY - outY) / plotSpanY) * maxVal);
+
+    const tooltipW = 204;
+    const tooltipH = 82;
+    const cursorX = ratio * rectW;
+    const rightX = cursorX + 14;
+    const leftX = cursorX - tooltipW - 14;
+    const rawBoxX = rightX + tooltipW <= rectW - 4 ? rightX : leftX;
+    const boxX = Math.min(Math.max(4, rawBoxX), Math.max(4, rectW - tooltipW - 4));
+    const topDotY = (Math.min(inY, outY) / height) * rectH;
+    const boxY = Math.min(Math.max(4, topDotY - 20), Math.max(4, rectH - tooltipH - 4));
+
+    return {
+      ratio,
+      inYFrac: inY / height,
+      outYFrac: outY / height,
+      inVal,
+      outVal,
+      timeText,
+      boxX,
+      boxY,
+    };
+  };
 
   const updateHoverFromEvent = (e: React.PointerEvent<HTMLDivElement>, isEntry: boolean) => {
     const rect = plotRef.current?.getBoundingClientRect();
     if (!rect || rect.width <= 0) return;
 
     const px = Math.min(rect.width, Math.max(0, e.clientX - rect.left));
-    const ratio = points.length === 1 ? 0.5 : px / rect.width;
-
-    const inY = evalSplineY(inSpline.segments, inPts, ratio);
-    const outY = evalSplineY(outSpline.segments, outPts, ratio);
-    const inVal = Math.max(0, ((baselineY - inY) / plotSpanY) * maxVal);
-    const outVal = Math.max(0, ((baselineY - outY) / plotSpanY) * maxVal);
-
-    let timeText = "—";
-    if (points.length === 1) {
-      timeText = formatChartTooltipTimestamp(
-        new Date(points[0].label).getTime(),
-        points[0].label,
-        spanMs,
-      );
-    } else {
-      const exactIdx = ratio * (points.length - 1);
-      const i0 = Math.min(points.length - 2, Math.max(0, Math.floor(exactIdx)));
-      const t = exactIdx - i0;
-      const ts0 = new Date(points[i0].label).getTime();
-      const ts1 = new Date(points[i0 + 1].label).getTime();
-      if (!Number.isNaN(ts0) && !Number.isNaN(ts1)) {
-        timeText = formatChartTooltipTimestamp(
-          ts0 + t * (ts1 - ts0),
-          points[i0].label,
-          spanMs,
-        );
-      } else {
-        const nearest = points[Math.min(points.length - 1, Math.max(0, Math.round(exactIdx)))];
-        timeText = formatChartTooltipTimestamp(
-          new Date(nearest.label).getTime(),
-          nearest.label,
-          spanMs,
-        );
-      }
-    }
-
-    const tooltipW = 204;
-    const tooltipH = 82;
-    const cursorX = ratio * rect.width;
-    const rightX = cursorX + 14;
-    const leftX = cursorX - tooltipW - 14;
-    const rawBoxX = rightX + tooltipW <= rect.width - 4 ? rightX : leftX;
-    const boxX = Math.min(Math.max(4, rawBoxX), Math.max(4, rect.width - tooltipW - 4));
-    const topDotY = (Math.min(inY, outY) / height) * rect.height;
-    const boxY = Math.min(Math.max(4, topDotY - 20), Math.max(4, rect.height - tooltipH - 4));
+    const ratio = !useLiveRender && points.length === 1 ? 0.5 : px / rect.width;
+    pointerRatioRef.current = ratio;
 
     if (isEntry) {
       enteredAtRef.current = performance.now();
@@ -848,21 +1165,16 @@ const DualAreaSparkChart: React.FC<{
       }
     }
 
-    setHoverData({
-      ratio,
-      inYFrac: inY / height,
-      outYFrac: outY / height,
-      inVal,
-      outVal,
-      timeText,
-      boxX,
-      boxY,
-    });
+    setHoverData(buildHoverSnapshot(ratio));
   };
 
   const handlePointerLeave = () => {
     setIsHovering(false);
   };
+
+  const displayedHover =
+    useLiveRender && isHovering ? buildHoverSnapshot(pointerRatioRef.current) : hoverData;
+  const smoothPosTransition = !useLiveRender && animateMove;
 
   return (
     <div className="relative w-full overflow-visible rounded-lg border border-slate-800/80 bg-[#0B101B] p-3">
@@ -901,6 +1213,9 @@ const DualAreaSparkChart: React.FC<{
               <stop offset="0%" stopColor="#38BDF8" stopOpacity="0.26" />
               <stop offset="100%" stopColor="#38BDF8" stopOpacity="0.0" />
             </linearGradient>
+            <clipPath id={clipId}>
+              <rect x={0} y={0} width={width} height={height} />
+            </clipPath>
           </defs>
           {[0.25, 0.5, 0.75].map((r) => (
             <line
@@ -922,55 +1237,73 @@ const DualAreaSparkChart: React.FC<{
             stroke="#1E293B"
             strokeWidth="1"
           />
-          {tickIndices.map((idx) => {
-            const x = points.length === 1 ? width / 2 : (idx / (points.length - 1)) * width;
-            return (
-              <line
-                key={idx}
-                x1={x}
-                y1={baselineY}
-                x2={x}
-                y2={baselineY + 7}
-                stroke="#334155"
-                strokeWidth="1"
+          {tickXPositions.map((x, idx) => (
+            <line
+              key={idx}
+              x1={x}
+              y1={baselineY}
+              x2={x}
+              y2={baselineY + 7}
+              stroke="#334155"
+              strokeWidth="1"
+            />
+          ))}
+          <g clipPath={`url(#${clipId})`}>
+            {inSpline.areaPath && <path d={inSpline.areaPath} fill={`url(#${rxGradId})`} />}
+            {outSpline.areaPath && <path d={outSpline.areaPath} fill={`url(#${txGradId})`} />}
+            {inSpline.linePath && (
+              <path
+                d={inSpline.linePath}
+                fill="none"
+                stroke="#10B981"
+                strokeWidth="2.2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                vectorEffect="non-scaling-stroke"
               />
-            );
-          })}
-          {inSpline.areaPath && <path d={inSpline.areaPath} fill={`url(#${rxGradId})`} />}
-          {outSpline.areaPath && <path d={outSpline.areaPath} fill={`url(#${txGradId})`} />}
-          {inSpline.linePath && (
-            <path
-              d={inSpline.linePath}
-              fill="none"
-              stroke="#10B981"
-              strokeWidth="2.2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              vectorEffect="non-scaling-stroke"
-            />
-          )}
-          {outSpline.linePath && (
-            <path
-              d={outSpline.linePath}
-              fill="none"
-              stroke="#38BDF8"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              vectorEffect="non-scaling-stroke"
-            />
-          )}
+            )}
+            {outSpline.linePath && (
+              <path
+                d={outSpline.linePath}
+                fill="none"
+                stroke="#38BDF8"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                vectorEffect="non-scaling-stroke"
+              />
+            )}
+          </g>
         </svg>
 
-        {hoverData && (
+        {useLiveRender && !isHovering && (
+          <>
+            <div
+              className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-emerald-400 ring-2 ring-[#0B101B] shadow-[0_0_10px_rgba(16,185,129,0.9)]"
+              style={{
+                left: `${((headX / width) * 100).toFixed(3)}%`,
+                top: `${((headInY / height) * 100).toFixed(3)}%`,
+              }}
+            />
+            <div
+              className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-sky-400 ring-2 ring-[#0B101B] shadow-[0_0_10px_rgba(56,189,248,0.9)]"
+              style={{
+                left: `${((headX / width) * 100).toFixed(3)}%`,
+                top: `${((headOutY / height) * 100).toFixed(3)}%`,
+              }}
+            />
+          </>
+        )}
+
+        {displayedHover && (
           <>
             {/* Vertical crosshair line */}
             <div
               className="pointer-events-none absolute top-0 bottom-4 w-px bg-slate-400/55 motion-reduce:transition-none"
               style={{
-                left: `${(hoverData.ratio * 100).toFixed(3)}%`,
+                left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
                 opacity: isHovering ? 1 : 0,
-                transition: animateMove
+                transition: smoothPosTransition
                   ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
                   : "opacity 180ms ease-out",
               }}
@@ -980,10 +1313,10 @@ const DualAreaSparkChart: React.FC<{
             <div
               className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-emerald-400 ring-2 ring-[#0B101B] shadow-[0_0_8px_rgba(16,185,129,0.85)] motion-reduce:transition-none"
               style={{
-                left: `${(hoverData.ratio * 100).toFixed(3)}%`,
-                top: `${(hoverData.inYFrac * 100).toFixed(3)}%`,
+                left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
+                top: `${(displayedHover.inYFrac * 100).toFixed(3)}%`,
                 opacity: isHovering ? 1 : 0,
-                transition: animateMove
+                transition: smoothPosTransition
                   ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
                   : "opacity 180ms ease-out",
               }}
@@ -991,10 +1324,10 @@ const DualAreaSparkChart: React.FC<{
             <div
               className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-sky-400 ring-2 ring-[#0B101B] shadow-[0_0_8px_rgba(56,189,248,0.85)] motion-reduce:transition-none"
               style={{
-                left: `${(hoverData.ratio * 100).toFixed(3)}%`,
-                top: `${(hoverData.outYFrac * 100).toFixed(3)}%`,
+                left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
+                top: `${(displayedHover.outYFrac * 100).toFixed(3)}%`,
                 opacity: isHovering ? 1 : 0,
-                transition: animateMove
+                transition: smoothPosTransition
                   ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
                   : "opacity 180ms ease-out",
               }}
@@ -1004,8 +1337,8 @@ const DualAreaSparkChart: React.FC<{
             <div
               className="pointer-events-none absolute top-0 left-0 z-20 w-[204px] will-change-transform motion-reduce:transition-none"
               style={{
-                transform: `translate3d(${hoverData.boxX.toFixed(1)}px, ${hoverData.boxY.toFixed(1)}px, 0)`,
-                transition: animateMove
+                transform: `translate3d(${displayedHover.boxX.toFixed(1)}px, ${displayedHover.boxY.toFixed(1)}px, 0)`,
+                transition: smoothPosTransition
                   ? "transform 95ms cubic-bezier(0.22, 1, 0.36, 1)"
                   : "none",
               }}
@@ -1018,7 +1351,7 @@ const DualAreaSparkChart: React.FC<{
                 }`}
               >
                 <div className="mb-1.5 border-b border-slate-800/80 pb-1 font-mono-tabular text-[11px] text-slate-400">
-                  {hoverData.timeText}
+                  {displayedHover.timeText}
                 </div>
                 <div className="space-y-1">
                   <div className="flex items-center justify-between gap-2">
@@ -1027,7 +1360,7 @@ const DualAreaSparkChart: React.FC<{
                       Download
                     </span>
                     <span className="font-mono-tabular font-semibold text-emerald-400">
-                      {formatBps(hoverData.inVal)}
+                      {formatBps(displayedHover.inVal)}
                     </span>
                   </div>
                   <div className="flex items-center justify-between gap-2">
@@ -1036,7 +1369,7 @@ const DualAreaSparkChart: React.FC<{
                       Upload
                     </span>
                     <span className="font-mono-tabular font-semibold text-sky-400">
-                      {formatBps(hoverData.outVal)}
+                      {formatBps(displayedHover.outVal)}
                     </span>
                   </div>
                 </div>
@@ -1047,8 +1380,8 @@ const DualAreaSparkChart: React.FC<{
       </div>
 
       <div className="mt-1 flex items-center justify-between border-t border-slate-800/70 pt-1.5 font-mono-tabular text-[11px] text-slate-400">
-        {tickIndices.map((idx) => (
-          <span key={idx}>{formatChartAxisTimestamp(points[idx].label, spanMs)}</span>
+        {axisLabels.map((lbl, idx) => (
+          <span key={idx}>{lbl}</span>
         ))}
       </div>
     </div>
@@ -1180,6 +1513,8 @@ export const App: React.FC = () => {
 
   // Domain Telemetry State
   const [overview, setOverview] = useState<OverviewPayload | null>(null);
+  const [overviewGraphMode, setOverviewGraphMode] = useState<"live" | "1h">("live");
+  const [liveTrafficSeries, setLiveTrafficSeries] = useState<LiveTrafficSample[]>([]);
   const [interfaces, setInterfaces] = useState<SNMPInterface[]>([]);
   const [selectedDeviceIp, setSelectedDeviceIp] = useState<string>("");
   const [selectedIfIndex, setSelectedIfIndex] = useState<number>(1);
@@ -1844,10 +2179,34 @@ export const App: React.FC = () => {
     }
   };
 
+  const mergeLiveTrafficSamples = (
+    prev: LiveTrafficSample[],
+    incoming: LiveTrafficSample[],
+  ): LiveTrafficSample[] => {
+    if (!incoming || incoming.length === 0) return prev;
+    const byTime = new Map<string, LiveTrafficSample>();
+    for (const s of prev) {
+      if (s && s.time) byTime.set(s.time, s);
+    }
+    for (const s of incoming) {
+      if (s && s.time) byTime.set(s.time, s);
+    }
+    const merged = Array.from(byTime.values()).sort(
+      (a, b) => new Date(a.time).getTime() - new Date(b.time).getTime(),
+    );
+    return merged.slice(-180);
+  };
+
   const fetchOverview = async () => {
     try {
       const r = await fetch("/api/overview");
-      if (r.ok) setOverview(await r.json());
+      if (r.ok) {
+        const data: OverviewPayload = await r.json();
+        setOverview(data);
+        if (data.live_series && data.live_series.length > 0) {
+          setLiveTrafficSeries((prev) => mergeLiveTrafficSamples(prev, data.live_series!));
+        }
+      }
     } catch {
       // ignore
     }
@@ -2140,6 +2499,9 @@ export const App: React.FC = () => {
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data);
+          if (msg.type === "traffic_tick" && msg.data?.time) {
+            setLiveTrafficSeries((prev) => mergeLiveTrafficSamples(prev, [msg.data]));
+          }
           if (msg.type === "unifi_update") {
             fetchOverview();
             fetchAllDevices();
@@ -2168,6 +2530,28 @@ export const App: React.FC = () => {
     };
   }, []);
 
+  useEffect(() => {
+    if (wsConnected || activeTab !== "pulse" || overviewGraphMode !== "live") return;
+    let cancelled = false;
+    const pollLive = async () => {
+      try {
+        const r = await fetch("/api/overview/live?limit=120", { cache: "no-store" });
+        if (!r.ok || cancelled) return;
+        const data = await r.json();
+        if (Array.isArray(data.live_series) && data.live_series.length > 0) {
+          setLiveTrafficSeries((prev) => mergeLiveTrafficSamples(prev, data.live_series));
+        }
+      } catch {
+        // ignore
+      }
+    };
+    const timer = setInterval(pollLive, 2500);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [wsConnected, activeTab, overviewGraphMode]);
+
   const isUpdateActive = Boolean(
     installingUpdate ||
       (updateProgress &&
@@ -2187,6 +2571,21 @@ export const App: React.FC = () => {
   };
 
   const gw = overview?.gateway;
+  const isLiveOverview = overviewGraphMode === "live" && liveTrafficSeries.length >= 2;
+  const activeOverviewSeries = isLiveOverview
+    ? liveTrafficSeries
+    : overview?.wan_series || [];
+  const latestLiveSample =
+    liveTrafficSeries.length > 0 ? liveTrafficSeries[liveTrafficSeries.length - 1] : null;
+  const latestWanSample =
+    overview?.wan_series && overview.wan_series.length > 0
+      ? overview.wan_series[overview.wan_series.length - 1]
+      : null;
+  const currentRxBps =
+    latestLiveSample?.rx_bps ?? gw?.wan_rx_bps ?? latestWanSample?.rx_bps ?? null;
+  const currentTxBps =
+    latestLiveSample?.tx_bps ?? gw?.wan_tx_bps ?? latestWanSample?.tx_bps ?? null;
+  const currentLatencyMs = latestLiveSample?.latency_ms ?? gw?.wan_latency_ms ?? null;
   const filteredHosts = selectedSubnet
     ? hosts.filter((h) => h.subnet_cidr === selectedSubnet)
     : hosts;
@@ -3125,29 +3524,77 @@ export const App: React.FC = () => {
               </div>
             </div>
 
-            {/* Network Throughput Overview Graph with Time Axis */}
+            {/* Network Throughput Overview Graph with Live Streaming & Time Axis */}
             <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
-              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <h3 className="text-sm font-semibold text-white">
-                    Network Traffic Overview (Last 60 Minutes)
-                  </h3>
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-sm font-semibold text-white">
+                      {overviewGraphMode === "live"
+                        ? "Network Traffic Overview (Live Stream)"
+                        : "Network Traffic Overview (Last 60 Minutes)"}
+                    </h3>
+                    {overviewGraphMode === "live" && (
+                      <span className="inline-flex items-center gap-1 rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 font-mono-tabular text-[10px] font-semibold text-emerald-400">
+                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                        LIVE
+                      </span>
+                    )}
+                  </div>
                   <p className="text-xs text-slate-400">
                     {gw
-                      ? `UniFi Gateway (${gw.gateway_name} • ${gw.wan_ip || "WAN"}) real-time throughput`
-                      : "Aggregated inbound & outbound traffic across all polled SNMP network interfaces"}
+                      ? `UniFi Gateway (${gw.gateway_name} • ${gw.wan_ip || "WAN"}) ${
+                          overviewGraphMode === "live"
+                            ? "real-time 2s traffic stream"
+                            : "60-minute throughput history"
+                        }`
+                      : overviewGraphMode === "live"
+                        ? "Aggregated real-time 2s traffic across all polled SNMP interfaces"
+                        : "Aggregated inbound & outbound traffic across all polled SNMP network interfaces"}
                   </p>
                 </div>
-                {gw && (
-                  <div className="flex items-center gap-4 font-mono-tabular text-xs">
-                    <span className="text-emerald-400">RX: {formatBps(gw.wan_rx_bps)}</span>
-                    <span className="text-sky-400">TX: {formatBps(gw.wan_tx_bps)}</span>
-                    <span className="text-slate-400">Latency: {gw.wan_latency_ms.toFixed(1)} ms</span>
+                <div className="flex flex-wrap items-center gap-3">
+                  {currentRxBps !== null && currentTxBps !== null && (
+                    <div className="flex items-center gap-3 font-mono-tabular text-xs">
+                      <span className="text-emerald-400">RX: {formatBps(currentRxBps)}</span>
+                      <span className="text-sky-400">TX: {formatBps(currentTxBps)}</span>
+                      {currentLatencyMs !== null && currentLatencyMs > 0 && (
+                        <span className="text-slate-400">
+                          Latency: {currentLatencyMs.toFixed(1)} ms
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  <div className="inline-flex items-center rounded-md border border-slate-800 bg-[#090D16] p-0.5 text-[11px] font-medium">
+                    <button
+                      type="button"
+                      onClick={() => setOverviewGraphMode("live")}
+                      className={`rounded px-2 py-0.5 transition ${
+                        overviewGraphMode === "live"
+                          ? "bg-emerald-500/20 text-emerald-300"
+                          : "text-slate-400 hover:text-slate-200"
+                      }`}
+                    >
+                      Live (2m)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setOverviewGraphMode("1h")}
+                      className={`rounded px-2 py-0.5 transition ${
+                        overviewGraphMode === "1h"
+                          ? "bg-slate-800 text-white"
+                          : "text-slate-400 hover:text-slate-200"
+                      }`}
+                    >
+                      1h
+                    </button>
                   </div>
-                )}
+                </div>
               </div>
               <DualAreaSparkChart
-                points={(overview?.wan_series || []).map((pt) => ({
+                liveMode={isLiveOverview}
+                liveWindowMs={120_000}
+                points={activeOverviewSeries.map((pt) => ({
                   label: pt.time,
                   inVal: pt.rx_bps,
                   outVal: pt.tx_bps,

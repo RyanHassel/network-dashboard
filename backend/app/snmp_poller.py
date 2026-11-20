@@ -1,9 +1,10 @@
 import asyncio
+from datetime import datetime, timezone
 import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import asyncpg
 import redis.asyncio as aioredis
@@ -67,6 +68,10 @@ class SNMPPoller:
         self.default_version = os.getenv("SNMP_VERSION", "v2c").strip().lower()
         self.default_community = os.getenv("SNMP_COMMUNITY", "public").strip() or "public"
         self.default_port = int(os.getenv("SNMP_PORT", "161") or 161)
+        # Isolated in-memory state for 2s live streaming (never shares Redis snmp:prev:* with 60s polls)
+        self._live_prev_counters: Dict[Tuple[str, int], Tuple[float, int, int]] = {}
+        self._live_device_rates: Dict[str, Tuple[float, float, float]] = {}
+        self._live_ignore_indices: Dict[str, Set[int]] = {}
 
     @staticmethod
     def _build_auth_args(profile: Dict[str, Any]) -> List[str]:
@@ -103,16 +108,23 @@ class SNMPPoller:
         return ["-v2c", "-c", community]
 
     async def _snmp_walk_oid(
-        self, target: str, port: int, auth_args: List[str], base_oid: str, timeout: float = 5.0
+        self,
+        target: str,
+        port: int,
+        auth_args: List[str],
+        base_oid: str,
+        timeout: float = 5.0,
+        snmp_timeout: int = 2,
+        retries: int = 1,
     ) -> Dict[str, str]:
         cmd = [
             "snmpbulkwalk",
             "-On",
             "-Oq",
             "-t",
-            "2",
+            str(snmp_timeout),
             "-r",
-            "1",
+            str(retries),
             *auth_args,
             f"{target}:{port}",
             base_oid,
@@ -653,9 +665,12 @@ class SNMPPoller:
         )
 
         rows_to_insert: List[Tuple[Any, ...]] = []
+        loopback_indices: Set[int] = set()
         for idx in all_indices:
             k = str(idx)
             name = if_names.get(k) or if_descrs.get(k) or f"if{idx}"
+            if name.strip().lower() in ("lo", "loopback", "null0"):
+                loopback_indices.add(idx)
             descr = if_descrs.get(k) or name
             alias = if_aliases.get(k, "")
             high_speed_mbps = int(if_speeds.get(k, "0") or 0) if if_speeds.get(k, "0").isdigit() else 0
@@ -719,6 +734,7 @@ class SNMPPoller:
                 )
             )
 
+        self._live_ignore_indices[target] = loopback_indices
         poll_ms = round((time.perf_counter() - start_ts) * 1000.0, 2)
 
         async with pool.acquire() as conn:
@@ -975,3 +991,123 @@ class SNMPPoller:
             elif isinstance(res, Exception):
                 logger.warning("SNMP poll exception: %s", res)
         return valid
+
+    async def _snmp_walk_oid_fast(
+        self, target: str, port: int, auth_args: List[str], base_oid: str, timeout: float = 1.8
+    ) -> Dict[str, str]:
+        """Short-timeout SNMP bulkwalk for sub-2s live traffic sampling."""
+        return await self._snmp_walk_oid(
+            target,
+            port,
+            auth_args,
+            base_oid,
+            timeout=timeout,
+            snmp_timeout=1,
+            retries=0,
+        )
+
+    async def poll_live_traffic(
+        self,
+        targets: List[Dict[str, Any]],
+        db_ignore_indices: Optional[Dict[str, Set[int]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Walks only 64-bit interface octets concurrently to compute real-time aggregate bps."""
+        if not targets:
+            self._live_prev_counters.clear()
+            self._live_device_rates.clear()
+            return None
+
+        sem = asyncio.Semaphore(16)
+        active_ips = {str(t["device_ip"]).strip() for t in targets if t.get("device_ip")}
+
+        async def _sample_target(target_cfg: Dict[str, Any]) -> None:
+            ip = str(target_cfg.get("device_ip") or "").strip()
+            if not ip:
+                return
+            port = int(target_cfg.get("port") or self.default_port)
+            auth_args = self._build_auth_args(target_cfg)
+
+            async with sem:
+                hc_in, hc_out = await asyncio.gather(
+                    self._snmp_walk_oid_fast(ip, port, auth_args, OID_IF_HC_IN_OCTETS),
+                    self._snmp_walk_oid_fast(ip, port, auth_args, OID_IF_HC_OUT_OCTETS),
+                )
+
+            if not hc_in and not hc_out:
+                return
+
+            now_epoch = time.time()
+            ignore = self._live_ignore_indices.get(ip, set())
+            if db_ignore_indices:
+                ignore = ignore | db_ignore_indices.get(ip, set())
+
+            all_indices = sorted(
+                {int(k) for k in (set(hc_in.keys()) | set(hc_out.keys())) if k.isdigit()}
+            )
+            dev_rx = 0.0
+            dev_tx = 0.0
+            has_delta = False
+
+            for idx in all_indices:
+                if idx in ignore:
+                    continue
+                k = str(idx)
+                in_raw = hc_in.get(k, "0") or "0"
+                out_raw = hc_out.get(k, "0") or "0"
+                in_oct = int(in_raw) if in_raw.isdigit() else 0
+                out_oct = int(out_raw) if out_raw.isdigit() else 0
+
+                prev = self._live_prev_counters.get((ip, idx))
+                if prev is not None:
+                    prev_ts, prev_in, prev_out = prev
+                    dt = now_epoch - prev_ts
+                    if dt >= 0.4:
+                        d_in = in_oct - prev_in
+                        d_out = out_oct - prev_out
+                        if d_in >= 0:
+                            rate_in = (d_in * 8.0) / dt
+                            if rate_in <= 100_000_000_000.0:
+                                dev_rx += rate_in
+                            has_delta = True
+                        if d_out >= 0:
+                            rate_out = (d_out * 8.0) / dt
+                            if rate_out <= 100_000_000_000.0:
+                                dev_tx += rate_out
+                            has_delta = True
+
+                self._live_prev_counters[(ip, idx)] = (now_epoch, in_oct, out_oct)
+
+            if has_delta:
+                self._live_device_rates[ip] = (now_epoch, dev_rx, dev_tx)
+
+        await asyncio.gather(*[_sample_target(t) for t in targets], return_exceptions=True)
+
+        # Prune removed targets from in-memory caches
+        stale_keys = [k for k in self._live_prev_counters if k[0] not in active_ips]
+        for k in stale_keys:
+            del self._live_prev_counters[k]
+        stale_ips = [ip for ip in self._live_device_rates if ip not in active_ips]
+        for ip in stale_ips:
+            del self._live_device_rates[ip]
+
+        now_agg = time.time()
+        total_rx = 0.0
+        total_tx = 0.0
+        active_count = 0
+        for ip, (ts, rx_val, tx_val) in list(self._live_device_rates.items()):
+            if now_agg - ts <= 15.0:
+                total_rx += rx_val
+                total_tx += tx_val
+                active_count += 1
+
+        if active_count == 0:
+            return None
+
+        return {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "rx_bps": round(total_rx, 1),
+            "tx_bps": round(total_tx, 1),
+            "latency_ms": 0.0,
+            "source": "snmp",
+            "device_count": active_count,
+        }
