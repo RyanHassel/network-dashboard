@@ -1414,6 +1414,11 @@ export const App: React.FC = () => {
   const updateDialogRef = useRef<HTMLDialogElement | null>(null);
   const updateStartTimeRef = useRef<number>(0);
   const finishingUpdateRef = useRef<boolean>(false);
+  const initialBundleSrcRef = useRef<string>("");
+  const sawUpdatingRef = useRef<boolean>(false);
+  const installRequestInFlightRef = useRef<boolean>(false);
+  const latestProgressRef = useRef<UpdateProgressState | null>(null);
+  latestProgressRef.current = updateProgress;
   const highWaterRef = useRef<{
     target: string;
     overall: number;
@@ -2015,32 +2020,61 @@ export const App: React.FC = () => {
     }
   };
 
-  const fetchUpdateProgress = async (): Promise<UpdateProgressState | null> => {
+  const getCurrentBundleSrc = (): string => {
+    if (typeof document === "undefined") return "";
+    return document.querySelector('script[type="module"]')?.getAttribute("src") || "";
+  };
+
+  const fetchWithTimeout = async (
+    url: string,
+    options: RequestInit = {},
+    timeoutMs = 2500,
+  ): Promise<Response> => {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const r = await fetch(`/update-progress.json?t=${Date.now()}`, { cache: "no-store" });
+      return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+      window.clearTimeout(timer);
+    }
+  };
+
+  const fetchUpdateProgress = async (): Promise<UpdateProgressState | null> => {
+    // 1. Try API endpoint first so backend _reconcile_update_progress() handles legacy scripts & completed states
+    try {
+      const r = await fetchWithTimeout(
+        `/api/system/update/progress?t=${Date.now()}`,
+        { cache: "no-store" },
+        2500,
+      );
       if (r.ok) {
         const d: UpdateProgressState = await r.json();
-        if (d && d.status) {
-          if (d.status === "updating" && d.updated_at) {
-            const ageMs = Date.now() - new Date(d.updated_at).getTime();
+        if (d && d.status) return d;
+      }
+    } catch {
+      // fall through to static nginx file while API container restarts
+    }
+    // 2. Fallback to static Nginx /update-progress.json while backend API is restarting
+    try {
+      const r2 = await fetchWithTimeout(
+        `/update-progress.json?t=${Date.now()}`,
+        { cache: "no-store" },
+        2500,
+      );
+      if (r2.ok) {
+        const d2: UpdateProgressState = await r2.json();
+        if (d2 && d2.status) {
+          if (d2.status === "updating" && d2.updated_at) {
+            const ageMs = Date.now() - new Date(d2.updated_at).getTime();
             if (!Number.isNaN(ageMs) && ageMs > 15 * 60 * 1000) {
-              return { ...d, status: "idle", overall_pct: 0 };
+              return { ...d2, status: "idle", overall_pct: 0 };
             }
           }
-          return d;
+          return d2;
         }
       }
     } catch {
-      // fall through to API fallback
-    }
-    try {
-      const r2 = await fetch("/api/system/update/progress", { cache: "no-store" });
-      if (r2.ok) {
-        const d2: UpdateProgressState = await r2.json();
-        if (d2 && d2.status) return d2;
-      }
-    } catch {
-      // ignore while API is restarting
+      // ignore if edge proxy is reloading
     }
     return null;
   };
@@ -2073,7 +2107,10 @@ export const App: React.FC = () => {
   };
 
   const handleDismissUpdateProgress = async () => {
+    const wasCompleted = latestProgressRef.current?.status === "completed";
     finishingUpdateRef.current = false;
+    sawUpdatingRef.current = false;
+    installRequestInFlightRef.current = false;
     highWaterRef.current = { target: "", overall: 0, compPcts: {} };
     setInstallingUpdate(false);
     setUpdateProgress(null);
@@ -2084,9 +2121,12 @@ export const App: React.FC = () => {
       // ignore
     }
     try {
-      await fetch("/api/system/update/dismiss", { method: "POST" });
+      await fetchWithTimeout("/api/system/update/dismiss", { method: "POST" }, 2000);
     } catch {
       // ignore
+    }
+    if (wasCompleted) {
+      window.location.reload();
     }
   };
 
@@ -2100,6 +2140,9 @@ export const App: React.FC = () => {
     const targetVer = updateInfo?.remote_version || targetSha;
     updateStartTimeRef.current = Date.now();
     finishingUpdateRef.current = false;
+    initialBundleSrcRef.current = getCurrentBundleSrc();
+    sawUpdatingRef.current = false;
+    installRequestInFlightRef.current = true;
     highWaterRef.current = { target: targetSha, overall: 1, compPcts: { git: 10 } };
 
     setUpdateMinimized(false);
@@ -2157,11 +2200,16 @@ export const App: React.FC = () => {
       if (resp.ok) {
         const body = await resp.json().catch(() => null);
         if (body?.progress) {
+          if (body.progress.status === "updating") {
+            sawUpdatingRef.current = true;
+          }
           setUpdateProgress(mergeMonotonicProgress(body.progress));
         }
       }
     } catch {
-      // Progress poller continues watching /update-progress.json
+      // Progress poller continues watching update status
+    } finally {
+      installRequestInFlightRef.current = false;
     }
   };
 
@@ -2375,9 +2423,11 @@ export const App: React.FC = () => {
   }, [navMenuOpen]);
 
   useEffect(() => {
+    initialBundleSrcRef.current = getCurrentBundleSrc();
     fetchUpdateProgress().then((p) => {
       if (!p) return;
       if (p.status === "updating") {
+        sawUpdatingRef.current = true;
         setUpdateProgress(mergeMonotonicProgress(p));
         setInstallingUpdate(true);
         try {
@@ -2399,6 +2449,7 @@ export const App: React.FC = () => {
     let cancelled = false;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
     let finishTimer: ReturnType<typeof setInterval> | null = null;
+    let lastBundleProbeAt = 0;
 
     const completeAndReload = async (completedState: UpdateProgressState) => {
       if (cancelled || finishingUpdateRef.current) return;
@@ -2409,44 +2460,105 @@ export const App: React.FC = () => {
       }
       setUpdateProgress(mergeMonotonicProgress(completedState));
 
-      const checkReadyAndReload = async (): Promise<boolean> => {
-        if (cancelled) return true;
-        try {
-          const [feResp, apiResp] = await Promise.all([
-            fetch(`/?t=${Date.now()}`, { method: "HEAD", cache: "no-store" }),
-            fetch(`/api/health?t=${Date.now()}`, { cache: "no-store" }),
-          ]);
-          const feReady = feResp.ok && feResp.headers.get("X-NetDash-Updating-Page") !== "1";
-          const apiReady = apiResp.ok;
-          if (!feReady || !apiReady) return false;
-        } catch {
-          return false;
-        }
+      let reloadTriggered = false;
+      let checking = false;
+      const completedAt = Date.now();
 
-        if (finishTimer) {
-          clearInterval(finishTimer);
-          finishTimer = null;
-        }
+      const checkReadyAndReload = async (): Promise<boolean> => {
+        if (cancelled || reloadTriggered || checking) return false;
+        checking = true;
         try {
-          await fetch("/api/system/update/dismiss", { method: "POST" });
-        } catch {
-          // ignore
+          let feReady = false;
+          let apiReady = false;
+          try {
+            const [feResp, apiResp] = await Promise.all([
+              fetchWithTimeout(`/?t=${Date.now()}`, { method: "HEAD", cache: "no-store" }, 4000),
+              fetchWithTimeout(`/api/health?t=${Date.now()}`, { cache: "no-store" }, 4000),
+            ]);
+            feReady = feResp.ok && feResp.headers.get("X-NetDash-Updating-Page") !== "1";
+            apiReady = apiResp.ok;
+          } catch {
+            return false;
+          }
+
+          const timedWait = Date.now() - completedAt > 12000;
+          if (!((feReady && apiReady) || (apiReady && timedWait))) {
+            return false;
+          }
+
+          reloadTriggered = true;
+          if (finishTimer) {
+            clearInterval(finishTimer);
+            finishTimer = null;
+          }
+          try {
+            await fetchWithTimeout("/api/system/update/dismiss", { method: "POST" }, 2000);
+          } catch {
+            // ignore
+          }
+          try {
+            sessionStorage.removeItem("netdash_update_minimized");
+          } catch {
+            // ignore
+          }
+          setTimeout(() => {
+            if (!cancelled) window.location.reload();
+          }, 1000);
+          return true;
+        } finally {
+          checking = false;
         }
-        try {
-          sessionStorage.removeItem("netdash_update_minimized");
-        } catch {
-          // ignore
-        }
-        setTimeout(() => {
-          if (!cancelled) window.location.reload();
-        }, 1200);
-        return true;
       };
 
       const readyNow = await checkReadyAndReload();
-      if (!readyNow && !cancelled) {
+      if (!readyNow && !cancelled && !reloadTriggered) {
         finishTimer = setInterval(checkReadyAndReload, 1000);
       }
+    };
+
+    const detectCompletedViaLiveBundle = async (): Promise<boolean> => {
+      try {
+        const [htmlResp, updResp] = await Promise.all([
+          fetchWithTimeout(`/?t=${Date.now()}`, { cache: "no-store" }, 3000),
+          fetchWithTimeout(`/api/system/update?t=${Date.now()}`, { cache: "no-store" }, 3000),
+        ]);
+        if (!htmlResp.ok || !updResp.ok) return false;
+        if (htmlResp.headers.get("X-NetDash-Updating-Page") === "1") return false;
+        const [htmlText, updData] = await Promise.all([
+          htmlResp.text(),
+          updResp.json().catch(() => null),
+        ]);
+        const matchMod =
+          htmlText.match(/<script[^>]*type=["']module["'][^>]*src=["']([^"']+)["']/i) ||
+          htmlText.match(/<script[^>]*src=["']([^"']+)["'][^>]*type=["']module["']/i);
+        const liveSrc = matchMod ? matchMod[1] : "";
+        return Boolean(
+          liveSrc &&
+            initialBundleSrcRef.current &&
+            liveSrc !== initialBundleSrcRef.current &&
+            updData &&
+            !updData.update_available &&
+            updData.status !== "updating",
+        );
+      } catch {
+        return false;
+      }
+    };
+
+    const buildSyntheticCompleted = (base: UpdateProgressState): UpdateProgressState => {
+      const doneComps = (base.components || []).map((c) => ({
+        ...c,
+        status: "completed",
+        pct: 100,
+      }));
+      return {
+        ...base,
+        status: "completed",
+        overall_pct: 100,
+        phase: "completed",
+        message: "Update installed — reloading dashboard...",
+        components: doneComps,
+      };
     };
 
     const tick = async () => {
@@ -2454,13 +2566,71 @@ export const App: React.FC = () => {
       const p = await fetchUpdateProgress();
       if (cancelled || finishingUpdateRef.current || !p) return;
 
-      if (p.status === "updating") {
-        setUpdateProgress(mergeMonotonicProgress(p));
-        return;
-      }
+      const elapsedMs =
+        updateStartTimeRef.current > 0 ? Date.now() - updateStartTimeRef.current : 0;
 
       if (p.status === "completed") {
         await completeAndReload(p);
+        return;
+      }
+
+      if (p.status === "updating") {
+        sawUpdatingRef.current = true;
+        setUpdateProgress(mergeMonotonicProgress(p));
+        if (
+          elapsedMs > 8000 &&
+          (p.phase === "queued" || p.phase === "legacy_build" || (p.overall_pct || 0) <= 25) &&
+          Date.now() - lastBundleProbeAt >= 3000
+        ) {
+          lastBundleProbeAt = Date.now();
+          if (await detectCompletedViaLiveBundle()) {
+            await completeAndReload(buildSyntheticCompleted(p));
+          }
+        }
+        return;
+      }
+
+      if (p.status === "idle") {
+        if (
+          installRequestInFlightRef.current ||
+          (updateStartTimeRef.current > 0 && elapsedMs < 6000)
+        ) {
+          return;
+        }
+        if (sawUpdatingRef.current) {
+          await completeAndReload(buildSyntheticCompleted(latestProgressRef.current || p));
+          return;
+        }
+        try {
+          const rUpd = await fetchWithTimeout(
+            `/api/system/update?t=${Date.now()}`,
+            { cache: "no-store" },
+            2500,
+          );
+          if (rUpd.ok) {
+            const upd = await rUpd.json();
+            if (!upd.update_available) {
+              await completeAndReload(buildSyntheticCompleted(latestProgressRef.current || p));
+              return;
+            }
+            if (elapsedMs >= 20000 && upd.status !== "updating") {
+              if (pollTimer) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+              }
+              setInstallingUpdate(false);
+              setUpdateProgress({
+                ...(latestProgressRef.current || p),
+                status: "error",
+                phase: "error",
+                message:
+                  "Host updater did not start within 20s. Run 'sudo netdash-update' on the server or check 'systemctl status netdash-updater.path'.",
+              });
+            }
+          }
+        } catch {
+          // wait for API if restarting
+        }
         return;
       }
 

@@ -31,17 +31,17 @@ resolve_commit_version() {
     | awk -F'|' -v sha="${target_sha}" '
         {
           cnt[$2]++
-          if ($1 == sha) {
+          if (!found && $1 == sha) {
             split($2, d, "-")
             if (length(d) == 3) {
-              printf "%s.%s.%s.%d\n", d[1], d[2], d[3], cnt[$2]
+              res = sprintf("%s.%s.%s.%d", d[1], d[2], d[3], cnt[$2])
               found = 1
-              exit
             }
           }
         }
         END {
-          if (!found) printf "%s\n", sha
+          if (found) print res
+          else print sha
         }
       '
 }
@@ -163,7 +163,7 @@ run_compose_build() {
   local export_re='exporting[[:space:]]+(to[[:space:]]+image|layers)|writing[[:space:]]+image'
   local done_re='naming[[:space:]]+to[[:space:]]+.*(done|DONE)'
 
-  exec 3< <("${COMPOSE_CMD[@]}" build --progress=plain "$@" 2>&1)
+  exec 3< <(BUILDKIT_PROGRESS=plain "${COMPOSE_CMD[@]}" build "$@" 2>&1)
   local build_pid=$!
 
   while IFS= read -r line <&3; do
@@ -228,7 +228,9 @@ run_compose_build() {
   done
 
   exec 3<&-
-  wait "${build_pid}"
+  local build_rc=0
+  wait "${build_pid}" || build_rc=$?
+  return "${build_rc}"
 }
 
 # Stage 1: Fetch & apply Git commits
@@ -330,9 +332,16 @@ if [[ -f backend/Dockerfile && -f frontend/Dockerfile ]]; then
   MESSAGE="Verifying Backend API & service health..."
   write_progress
 
+  local web_port="${WEB_PORT:-}"
+  if [[ -z "${web_port}" && -f "${INSTALL_DIR}/.env" ]]; then
+    web_port="$(awk -F'=' '$1=="WEB_PORT"{sub(/^[^=]*=/,"");print;exit}' "${INSTALL_DIR}/.env" 2>/dev/null || true)"
+  fi
+  web_port="${web_port:-8080}"
+
   api_healthy=0
   for i in $(seq 1 35); do
-    if curl -fsS --max-time 2 http://127.0.0.1:8000/api/health >/dev/null 2>&1; then
+    if curl -fsS --max-time 2 http://127.0.0.1:8000/api/health >/dev/null 2>&1 \
+      || curl -fsS --max-time 2 "http://127.0.0.1:${web_port}/api/health" >/dev/null 2>&1; then
       api_healthy=1
       break
     fi

@@ -127,6 +127,8 @@ async def _compute_git_version_map(ref: str = "origin/main") -> Dict[str, str]:
         try:
             proc = await asyncio.create_subprocess_exec(
                 "git",
+                "-c",
+                f"safe.directory={REPO_MOUNT_DIR}",
                 "-C",
                 str(REPO_MOUNT_DIR),
                 "log",
@@ -199,6 +201,7 @@ async def _reconcile_update_progress() -> Dict[str, Any]:
 
     trigger_exists = (REPO_MOUNT_DIR / ".trigger-update").exists()
     target_sha = str(data.get("target_sha") or "").strip()
+    from_sha = str(data.get("from_sha") or "").strip()
     started_at_str = data.get("started_at")
     started_dt: Optional[datetime] = None
     if isinstance(started_at_str, str) and started_at_str:
@@ -207,51 +210,95 @@ async def _reconcile_update_progress() -> Dict[str, Any]:
         except Exception:
             started_dt = None
 
-    # Only mark complete if trigger file is gone AND this API process actually started AFTER the update began
-    if (
-        not trigger_exists
-        and target_sha
-        and started_dt is not None
-        and API_START_TIME > started_dt
-        and (REPO_MOUNT_DIR / ".git").exists()
-    ):
+    async def _run_git_safe(*args: str) -> str:
         try:
             proc = await asyncio.create_subprocess_exec(
                 "git",
+                "-c",
+                f"safe.directory={REPO_MOUNT_DIR}",
                 "-C",
                 str(REPO_MOUNT_DIR),
-                "rev-parse",
-                "--short=7",
-                "HEAD",
+                *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
-            head_sha = out.decode("utf-8", errors="ignore").strip()
-            if head_sha and head_sha == target_sha:
-                target_ver = str(data.get("target_version") or target_sha)
-                completed = {
-                    **data,
+            return out.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            return ""
+
+    async def _mark_completed(resolved_sha: str) -> Dict[str, Any]:
+        ver_map = await _compute_git_version_map("HEAD")
+        target_ver = ver_map.get(resolved_sha, str(data.get("target_version") or resolved_sha))
+        completed = {
+            **data,
+            "target_sha": resolved_sha,
+            "target_version": target_ver,
+            "status": "completed",
+            "overall_pct": 100,
+            "phase": "completed",
+            "message": f"Update to {target_ver} installed successfully!",
+            "updated_at": now.isoformat(),
+            "components": [
+                {
+                    "id": c.get("id", ""),
+                    "name": c.get("name", ""),
                     "status": "completed",
-                    "overall_pct": 100,
-                    "phase": "completed",
-                    "message": f"Update to {target_ver} installed successfully!",
+                    "pct": 100,
+                    "detail": f"Updated to {target_ver}",
+                }
+                for c in (data.get("components") or [])
+            ],
+        }
+        _write_update_progress(completed)
+        return completed
+
+    if not trigger_exists and (REPO_MOUNT_DIR / ".git").exists():
+        head_sha = await _run_git_safe("rev-parse", "--short=7", "HEAD")
+        behind_str = await _run_git_safe("rev-list", "HEAD..origin/main", "--count")
+        commits_behind = int(behind_str) if behind_str.isdigit() else -1
+        git_updated = bool(head_sha) and (
+            (target_sha and head_sha == target_sha)
+            or (from_sha and head_sha != from_sha and commits_behind == 0)
+        )
+
+        if git_updated:
+            # Fast-path completion if API restarted after update started
+            if started_dt is not None and API_START_TIME > started_dt:
+                return await _mark_completed(head_sha)
+
+            # Fallback for legacy host netdash-update scripts (or frontend-only updates where API wasn't recreated)
+            if data.get("phase") == "queued":
+                if age_sec >= 65.0:
+                    return await _mark_completed(head_sha)
+                legacy_pct = min(85, max(20, int(20 + age_sec)))
+                step_pct = min(90, max(25, int(25 + age_sec)))
+                ver_map = await _compute_git_version_map("HEAD")
+                resolved_ver = ver_map.get(
+                    head_sha, str(data.get("target_version") or head_sha)
+                )
+                return {
+                    **data,
+                    "phase": "legacy_build",
+                    "overall_pct": legacy_pct,
+                    "target_sha": head_sha,
+                    "target_version": resolved_ver,
+                    "message": f"Source updated to {resolved_ver} — rebuilding containers on host...",
                     "updated_at": now.isoformat(),
                     "components": [
                         {
-                            "id": c.get("id", ""),
-                            "name": c.get("name", ""),
-                            "status": "completed",
-                            "pct": 100,
-                            "detail": f"Updated to {target_ver}",
+                            **c,
+                            "status": "completed" if c.get("id") == "git" else "running",
+                            "pct": 100 if c.get("id") == "git" else step_pct,
+                            "detail": (
+                                f"Source updated to {resolved_ver}"
+                                if c.get("id") == "git"
+                                else "Rebuilding & restarting container..."
+                            ),
                         }
                         for c in (data.get("components") or [])
                     ],
                 }
-                _write_update_progress(completed)
-                return completed
-        except Exception:
-            pass
 
     return data
 
