@@ -2088,10 +2088,16 @@ class SNMPPoller:
             retries=0,
         )
 
+    def reset_live_cache(self) -> None:
+        """Clears cached live counter deltas when overview source selection changes."""
+        self._live_prev_counters.clear()
+        self._live_device_rates.clear()
+
     async def poll_live_traffic(
         self,
         targets: List[Dict[str, Any]],
         db_ignore_indices: Optional[Dict[str, Set[int]]] = None,
+        include_indices: Optional[Dict[str, Optional[Set[int]]]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Walks only 64-bit interface octets concurrently to compute real-time aggregate bps."""
         if not targets:
@@ -2108,6 +2114,7 @@ class SNMPPoller:
                 return
             port = int(target_cfg.get("port") or self.default_port)
             auth_args = self._build_auth_args(target_cfg)
+            allowed_set = include_indices.get(ip) if include_indices is not None else None
 
             used_bits = 64
             async with sem:
@@ -2140,7 +2147,10 @@ class SNMPPoller:
             has_delta = False
 
             for idx in all_indices:
-                if idx in ignore:
+                if allowed_set is not None:
+                    if idx not in allowed_set:
+                        continue
+                elif idx in ignore:
                     continue
                 k = str(idx)
                 has_in = k in hc_in

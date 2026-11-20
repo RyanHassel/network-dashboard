@@ -216,6 +216,49 @@ interface ISPSettings {
   upload_mbps: number;
 }
 
+interface OverviewGraphSelection {
+  device_ip: string;
+  if_indices: number[];
+}
+
+interface OverviewGraphSettings {
+  mode: "auto" | "custom";
+  selections: OverviewGraphSelection[];
+}
+
+interface OverviewGraphSourceMeta {
+  mode: "auto" | "custom";
+  source: string;
+  device_count: number;
+  interface_count: number;
+  has_all_interfaces_device: boolean;
+  summary: string;
+}
+
+interface OverviewGraphOptionInterface {
+  if_index: number;
+  if_name: string;
+  if_descr: string;
+  if_alias: string;
+  if_speed_bps: number;
+  if_oper_status: number;
+  in_bps: number;
+  out_bps: number;
+}
+
+interface OverviewGraphOptionDevice {
+  device_ip: string;
+  hostname: string;
+  vendor: string | null;
+  device_category: string | null;
+  device_profile_type: string;
+  is_online: boolean;
+  snmp_enabled: boolean;
+  snmp_reachable: boolean | null;
+  subnet_cidr: string | null;
+  interfaces: OverviewGraphOptionInterface[];
+}
+
 type OverviewRangeKey = "live" | "1h" | "12h" | "1d" | "7d" | "1m";
 
 interface AllConfigPayload {
@@ -224,6 +267,7 @@ interface AllConfigPayload {
     skipped: boolean;
   };
   isp_settings?: ISPSettings;
+  overview_graph_settings?: OverviewGraphSettings;
   snmp_profiles: SNMPProfile[];
   snmp_targets: SNMPTargetConfig[];
   subnets: SubnetConfig[];
@@ -599,6 +643,8 @@ interface OverviewPayload {
   }>;
   series_range?: string;
   isp_settings?: ISPSettings;
+  overview_graph_settings?: OverviewGraphSettings;
+  overview_graph_source?: OverviewGraphSourceMeta;
   live_series?: LiveTrafficSample[];
   unifi_devices: Array<{
     mac: string;
@@ -807,6 +853,29 @@ function formatChartTooltipTimestamp(tsMs: number, fallbackLabel: string, spanMs
   });
 }
 
+function rangeKeyToWindowMs(rk: string): number | null {
+  switch ((rk || "").trim().toLowerCase()) {
+    case "1h":
+      return 3_600_000;
+    case "6h":
+      return 6 * 3_600_000;
+    case "12h":
+      return 12 * 3_600_000;
+    case "24h":
+    case "1d":
+      return 24 * 3_600_000;
+    case "7d":
+      return 7 * 86_400_000;
+    case "30d":
+    case "1m":
+      return 30 * 86_400_000;
+    case "1y":
+      return 365 * 86_400_000;
+    default:
+      return null;
+  }
+}
+
 interface SplineSegment {
   x0: number;
   y0: number;
@@ -965,6 +1034,7 @@ const DualAreaSparkChart: React.FC<{
   height?: number;
   liveMode?: boolean;
   liveWindowMs?: number;
+  windowMs?: number | null;
   showYAxis?: boolean;
   fixedMaxBps?: number | null;
   primaryLabel?: string;
@@ -983,6 +1053,7 @@ const DualAreaSparkChart: React.FC<{
   height = 210,
   liveMode = false,
   liveWindowMs = 120_000,
+  windowMs = null,
   showYAxis = false,
   fixedMaxBps = null,
   primaryLabel = "Download (RX)",
@@ -1021,6 +1092,7 @@ const DualAreaSparkChart: React.FC<{
   const [isHovering, setIsHovering] = useState(false);
   const [animateMove, setAnimateMove] = useState(false);
   const [, setAnimFrame] = useState(0);
+  const [, setWindowClockTick] = useState(0);
   const [hoverData, setHoverData] = useState<{
     ratio: number;
     inYFrac: number;
@@ -1165,7 +1237,16 @@ const DualAreaSparkChart: React.FC<{
     };
   }, [liveMode, liveWindowMs]);
 
-  if (!points.length) {
+  useEffect(() => {
+    if (liveMode || !(windowMs && windowMs > 0)) return;
+    const id = window.setInterval(() => {
+      setWindowClockTick((n) => (n + 1) & 0x3fffffff);
+    }, 30000);
+    return () => window.clearInterval(id);
+  }, [liveMode, windowMs]);
+
+  const hasFixedWindow = Boolean(windowMs && windowMs > 0);
+  if (!points.length && !hasFixedWindow) {
     return (
       <div
         style={{ height }}
@@ -1181,19 +1262,22 @@ const DualAreaSparkChart: React.FC<{
   const baselineY = height - 18;
   const plotSpanY = Math.max(1, baselineY - topPad);
 
-  const liveSamples: ParsedSparkSample[] = liveMode
-    ? points
-        .map((pt) => ({
-          ts: new Date(pt.label).getTime(),
-          inVal: Math.max(0, pt.inVal || 0),
-          outVal: Math.max(0, pt.outVal || 0),
-          p95In: Math.max(0, pt.p95In || 0),
-          label: pt.label,
-        }))
-        .filter((s) => !Number.isNaN(s.ts))
-        .sort((a, b) => a.ts - b.ts)
-    : [];
+  const parsedSortedSamples: ParsedSparkSample[] =
+    liveMode || hasFixedWindow
+      ? points
+          .map((pt) => ({
+            ts: new Date(pt.label).getTime(),
+            inVal: Math.max(0, pt.inVal || 0),
+            outVal: Math.max(0, pt.outVal || 0),
+            p95In: Math.max(0, pt.p95In || 0),
+            label: pt.label,
+          }))
+          .filter((s) => !Number.isNaN(s.ts))
+          .sort((a, b) => a.ts - b.ts)
+      : [];
+  const liveSamples = liveMode ? parsedSortedSamples : [];
   const useLiveRender = liveMode && liveSamples.length >= 2;
+  const useFixedWindow = !useLiveRender && hasFixedWindow;
 
   let observedPeakBps = 0;
   let maxVal = 1000;
@@ -1203,6 +1287,9 @@ const DualAreaSparkChart: React.FC<{
   let tickXPositions: number[] = [];
   let axisLabels: string[] = [];
   let liveWindowStart = 0;
+  let fixedWindowStart = 0;
+  let fixedWindowSpanMs = 0;
+  let hasVisibleSamples = points.length > 0;
 
   if (useLiveRender) {
     const latestTs = liveSamples[liveSamples.length - 1].ts;
@@ -1223,6 +1310,7 @@ const DualAreaSparkChart: React.FC<{
       }
     }
     const visibleSlice = liveSamples.slice(startIdx);
+    hasVisibleSamples = visibleSlice.length > 0;
 
     let peakNow = 0;
     for (const s of visibleSlice) {
@@ -1258,6 +1346,76 @@ const DualAreaSparkChart: React.FC<{
           second: "2-digit",
         }),
       );
+    }
+  } else if (useFixedWindow) {
+    fixedWindowSpanMs = windowMs || 0;
+    const nowMs = Date.now();
+    const latestPtTs =
+      parsedSortedSamples.length > 0
+        ? parsedSortedSamples[parsedSortedSamples.length - 1].ts
+        : nowMs;
+    const fixedWindowEnd = Math.max(nowMs, latestPtTs);
+    fixedWindowStart = fixedWindowEnd - fixedWindowSpanMs;
+    spanMs = fixedWindowSpanMs;
+
+    let firstInRangeIdx = parsedSortedSamples.findIndex((s) => s.ts >= fixedWindowStart);
+    let windowedSlice: ParsedSparkSample[] = [];
+    if (firstInRangeIdx !== -1) {
+      const startSliceIdx = firstInRangeIdx > 0 ? firstInRangeIdx - 1 : firstInRangeIdx;
+      windowedSlice = parsedSortedSamples.slice(startSliceIdx);
+    }
+    hasVisibleSamples = windowedSlice.length > 0;
+
+    let peakNow = 0;
+    for (const s of windowedSlice) {
+      const m = hideSecondary ? s.inVal : Math.max(s.inVal, s.outVal, s.p95In);
+      if (m > peakNow) peakNow = m;
+    }
+    observedPeakBps = peakNow;
+    maxVal =
+      fixedMaxBps && fixedMaxBps > 0
+        ? fixedMaxBps
+        : isDefaultBps
+          ? Math.max(1000, observedPeakBps)
+          : Math.max(1, observedPeakBps * 1.1);
+
+    inPts = windowedSlice.map((s) => ({
+      x: ((s.ts - fixedWindowStart) / fixedWindowSpanMs) * width,
+      y: baselineY - (Math.min(Math.max(0, s.inVal), maxVal) / maxVal) * plotSpanY,
+    }));
+    outPts = windowedSlice.map((s) => ({
+      x: ((s.ts - fixedWindowStart) / fixedWindowSpanMs) * width,
+      y: baselineY - (Math.min(Math.max(0, s.outVal), maxVal) / maxVal) * plotSpanY,
+    }));
+
+    const isApproxDaySpan =
+      fixedWindowSpanMs >= 18 * 3_600_000 && fixedWindowSpanMs <= 36 * 3_600_000;
+    const startDateStr = new Date(fixedWindowStart).toDateString();
+    const endDateStr = new Date(fixedWindowEnd).toDateString();
+    const fixedTicks = 6;
+    for (let t = 0; t < fixedTicks; t++) {
+      const frac = t / (fixedTicks - 1);
+      tickXPositions.push(frac * width);
+      const tickTs = fixedWindowStart + frac * fixedWindowSpanMs;
+      if (isApproxDaySpan) {
+        const dt = new Date(tickTs);
+        if (t === 0 && startDateStr !== endDateStr) {
+          axisLabels.push(
+            dt.toLocaleString([], {
+              month: "short",
+              day: "numeric",
+              hour: "2-digit",
+              minute: "2-digit",
+            }),
+          );
+        } else {
+          axisLabels.push(dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+        }
+      } else {
+        axisLabels.push(
+          formatChartAxisTimestamp(new Date(tickTs).toISOString(), fixedWindowSpanMs),
+        );
+      }
     }
   } else {
     observedPeakBps = Math.max(
@@ -1303,6 +1461,8 @@ const DualAreaSparkChart: React.FC<{
   const outSpline = buildMonotoneSpline(outPts, topPad, baselineY);
   const minCurveX = inPts.length > 0 ? Math.max(0, inPts[0].x) : 0;
   const maxCurveX = inPts.length > 0 ? Math.min(width, inPts[inPts.length - 1].x) : width;
+  const showEndpointMarkers =
+    inPts.length === 1 || (useFixedWindow && inPts.length > 0 && maxCurveX - minCurveX < 6);
 
   const buildHoverSnapshot = (ratioInput: number) => {
     const rect = plotRef.current?.getBoundingClientRect();
@@ -1314,7 +1474,9 @@ const DualAreaSparkChart: React.FC<{
     let outY: number;
     let timeText = "—";
 
-    if (useLiveRender) {
+    if (useLiveRender || useFixedWindow) {
+      const winStart = useLiveRender ? liveWindowStart : fixedWindowStart;
+      const winSpan = useLiveRender ? liveWindowMs : fixedWindowSpanMs;
       const rawX = ratio * width;
       const targetX =
         maxCurveX >= minCurveX
@@ -1323,8 +1485,8 @@ const DualAreaSparkChart: React.FC<{
       ratio = targetX / width;
       inY = evalSplineAtX(inSpline.segments, inPts, targetX);
       outY = evalSplineAtX(outSpline.segments, outPts, targetX);
-      const tsMs = liveWindowStart + ratio * liveWindowMs;
-      timeText = formatChartTooltipTimestamp(tsMs, "", liveWindowMs);
+      const tsMs = winStart + ratio * winSpan;
+      timeText = formatChartTooltipTimestamp(tsMs, "", winSpan);
     } else {
       ratio = points.length === 1 ? 0.5 : ratio;
       inY = evalSplineY(inSpline.segments, inPts, ratio);
@@ -1385,11 +1547,13 @@ const DualAreaSparkChart: React.FC<{
   };
 
   const updateHoverFromEvent = (e: React.PointerEvent<HTMLDivElement>, isEntry: boolean) => {
+    if (inPts.length === 0) return;
     const rect = plotRef.current?.getBoundingClientRect();
     if (!rect || rect.width <= 0) return;
 
     const px = Math.min(rect.width, Math.max(0, e.clientX - rect.left));
-    const ratio = !useLiveRender && points.length === 1 ? 0.5 : px / rect.width;
+    const ratio =
+      !useLiveRender && !useFixedWindow && points.length === 1 ? 0.5 : px / rect.width;
     pointerRatioRef.current = ratio;
 
     if (isEntry) {
@@ -1411,7 +1575,11 @@ const DualAreaSparkChart: React.FC<{
   };
 
   const displayedHover =
-    useLiveRender && isHovering ? buildHoverSnapshot(pointerRatioRef.current) : hoverData;
+    inPts.length === 0
+      ? null
+      : useLiveRender && isHovering
+        ? buildHoverSnapshot(pointerRatioRef.current)
+        : hoverData;
   const smoothPosTransition = !useLiveRender && animateMove;
 
   return (
@@ -1441,7 +1609,7 @@ const DualAreaSparkChart: React.FC<{
           )}
         </div>
         <span className="font-mono-tabular text-slate-300">
-          Peak: {formatVal(observedPeakBps)}
+          Peak: {hasVisibleSamples ? formatVal(observedPeakBps) : "—"}
           {fixedMaxBps && fixedMaxBps > 0
             ? isDefaultBps
               ? ` / ${formatAxisMbps(fixedMaxBps)} Mbps`
@@ -1552,10 +1720,38 @@ const DualAreaSparkChart: React.FC<{
                     vectorEffect="non-scaling-stroke"
                   />
                 )}
+                {showEndpointMarkers && (
+                  <>
+                    <circle
+                      cx={Math.min(width - 4, Math.max(4, inPts[inPts.length - 1].x))}
+                      cy={inPts[inPts.length - 1].y}
+                      r="3.5"
+                      fill={primaryColor}
+                      stroke="#0B101B"
+                      strokeWidth="1.5"
+                    />
+                    {!hideSecondary && outPts.length > 0 && (
+                      <circle
+                        cx={Math.min(width - 4, Math.max(4, outPts[outPts.length - 1].x))}
+                        cy={outPts[outPts.length - 1].y}
+                        r="3.5"
+                        fill={secondaryColor}
+                        stroke="#0B101B"
+                        strokeWidth="1.5"
+                      />
+                    )}
+                  </>
+                )}
               </g>
             </svg>
 
-            {displayedHover && (
+            {inPts.length === 0 && (
+              <div className="pointer-events-none absolute inset-0 flex items-center justify-center pb-4 text-xs text-slate-500">
+                {emptyMessage}
+              </div>
+            )}
+
+            {displayedHover && inPts.length > 0 && (
               <>
                 {/* Vertical crosshair line */}
                 <div
@@ -1719,6 +1915,22 @@ export const App: React.FC = () => {
   const [ispUploadInput, setIspUploadInput] = useState("1000");
   const [savingIsp, setSavingIsp] = useState(false);
   const ispFormInitializedRef = useRef(false);
+
+  // Overview Dashboard Graph Source Configuration State
+  const [overviewGraphOptions, setOverviewGraphOptions] = useState<OverviewGraphOptionDevice[]>([]);
+  const [loadingOverviewGraphOptions, setLoadingOverviewGraphOptions] = useState(false);
+  const [overviewGraphModeInput, setOverviewGraphModeInput] = useState<"auto" | "custom">("auto");
+  const [overviewGraphSelectionsInput, setOverviewGraphSelectionsInput] = useState<
+    OverviewGraphSelection[]
+  >([]);
+  const overviewGraphFormInitializedRef = useRef(false);
+  const [overviewGraphSearch, setOverviewGraphSearch] = useState("");
+  const [overviewGraphSnmpOnly, setOverviewGraphSnmpOnly] = useState(false);
+  const [expandedOverviewDeviceIps, setExpandedOverviewDeviceIps] = useState<
+    Record<string, boolean>
+  >({});
+  const [interfaceSearchByIp, setInterfaceSearchByIp] = useState<Record<string, string>>({});
+  const [savingOverviewGraph, setSavingOverviewGraph] = useState(false);
 
   // Onboarding Wizard Draft Inputs
   const [obSubnetInput, setObSubnetInput] = useState("10.1.3.0/24");
@@ -1891,6 +2103,20 @@ export const App: React.FC = () => {
       setIspUploadInput(String(data.isp_settings.upload_mbps ?? 1000));
       ispFormInitializedRef.current = true;
     }
+    if (!overviewGraphFormInitializedRef.current && data.overview_graph_settings) {
+      const modeVal = data.overview_graph_settings.mode === "custom" ? "custom" : "auto";
+      const sels = Array.isArray(data.overview_graph_settings.selections)
+        ? data.overview_graph_settings.selections
+        : [];
+      setOverviewGraphModeInput(modeVal);
+      setOverviewGraphSelectionsInput(sels);
+      const expandedInit: Record<string, boolean> = {};
+      for (const s of sels) {
+        expandedInit[s.device_ip] = true;
+      }
+      setExpandedOverviewDeviceIps((prev) => ({ ...expandedInit, ...prev }));
+      overviewGraphFormInitializedRef.current = true;
+    }
     if (data.snmp_profiles.length > 0) {
       const exists = data.snmp_profiles.some((p) => p.id === newHostProfileId);
       if (!exists) {
@@ -1960,6 +2186,106 @@ export const App: React.FC = () => {
       flashFeedback("err", "Network error saving ISP settings.");
     } finally {
       setSavingIsp(false);
+    }
+  };
+
+  const fetchOverviewGraphOptions = async () => {
+    setLoadingOverviewGraphOptions(true);
+    try {
+      const r = await fetch("/api/config/overview-graph/options");
+      if (r.ok) {
+        const data = await r.json();
+        setOverviewGraphOptions(data.devices || []);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setLoadingOverviewGraphOptions(false);
+    }
+  };
+
+  const toggleOverviewDevice = (ip: string) => {
+    const exists = overviewGraphSelectionsInput.some((s) => s.device_ip === ip);
+    if (exists) {
+      setOverviewGraphSelectionsInput((prev) => prev.filter((s) => s.device_ip !== ip));
+    } else {
+      setOverviewGraphSelectionsInput((prev) => [...prev, { device_ip: ip, if_indices: [] }]);
+      setExpandedOverviewDeviceIps((prev) => ({ ...prev, [ip]: true }));
+    }
+  };
+
+  const setOverviewDeviceAllInterfaces = (ip: string) => {
+    setOverviewGraphSelectionsInput((prev) => {
+      const exists = prev.some((s) => s.device_ip === ip);
+      if (!exists) return [...prev, { device_ip: ip, if_indices: [] }];
+      return prev.map((s) => (s.device_ip === ip ? { ...s, if_indices: [] } : s));
+    });
+  };
+
+  const toggleOverviewDeviceInterface = (ip: string, ifIndex: number) => {
+    setOverviewGraphSelectionsInput((prev) => {
+      const existing = prev.find((s) => s.device_ip === ip);
+      if (!existing) {
+        return [...prev, { device_ip: ip, if_indices: [ifIndex] }];
+      }
+      const nextIdxs = existing.if_indices.includes(ifIndex)
+        ? existing.if_indices.filter((idx) => idx !== ifIndex)
+        : [...existing.if_indices, ifIndex].sort((a, b) => a - b);
+      return prev.map((s) => (s.device_ip === ip ? { ...s, if_indices: nextIdxs } : s));
+    });
+  };
+
+  const removeOverviewSelectionChip = (ip: string, ifIndex?: number) => {
+    if (ifIndex == null) {
+      setOverviewGraphSelectionsInput((prev) => prev.filter((s) => s.device_ip !== ip));
+      return;
+    }
+    setOverviewGraphSelectionsInput((prev) =>
+      prev.flatMap((s) => {
+        if (s.device_ip !== ip) return [s];
+        const nextIdxs = s.if_indices.filter((idx) => idx !== ifIndex);
+        if (nextIdxs.length === 0) return [];
+        return [{ ...s, if_indices: nextIdxs }];
+      }),
+    );
+  };
+
+  const handleSaveOverviewGraphSettings = async () => {
+    if (overviewGraphModeInput === "custom" && overviewGraphSelectionsInput.length === 0) {
+      flashFeedback("err", "Select at least one device when using Custom mode.");
+      return;
+    }
+    setSavingOverviewGraph(true);
+    try {
+      const r = await fetch("/api/config/overview-graph", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode: overviewGraphModeInput,
+          selections: overviewGraphModeInput === "custom" ? overviewGraphSelectionsInput : [],
+        }),
+      });
+      if (r.ok) {
+        const updated: AllConfigPayload = await r.json();
+        syncConfigState(updated);
+        if (updated.overview_graph_settings) {
+          setOverviewGraphModeInput(updated.overview_graph_settings.mode);
+          setOverviewGraphSelectionsInput(updated.overview_graph_settings.selections);
+        }
+        setLiveTrafficSeries([]);
+        fetchOverview();
+        if (overviewGraphMode !== "live") {
+          fetchOverviewTraffic(overviewGraphMode, true);
+        }
+        flashFeedback("ok", "Overview Dashboard graph source saved.");
+      } else {
+        const errBody = await r.json().catch(() => null);
+        flashFeedback("err", errBody?.detail || "Failed to save Overview graph source.");
+      }
+    } catch {
+      flashFeedback("err", "Network error saving Overview graph source.");
+    } finally {
+      setSavingOverviewGraph(false);
     }
   };
 
@@ -2055,6 +2381,8 @@ export const App: React.FC = () => {
   const openDevicePage = (ip: string) => {
     setSelectedDeviceDetailIp(ip);
     setDetailIfIndex(0);
+    setDetailTrendRange("24h");
+    setUpsHistoryRange("24h");
     setUpsHistory([]);
     setUpsChartMode("battery_load");
     setActiveTab("devices");
@@ -2629,7 +2957,7 @@ export const App: React.FC = () => {
       if (r.ok) {
         const data: OverviewPayload = await r.json();
         setOverview(data);
-        if (overviewGraphMode === "1h" || overviewHistorySeries.length === 0) {
+        if (overviewGraphMode === "1d" || overviewHistorySeries.length === 0) {
           setOverviewHistorySeries(data.wan_series || []);
         }
         if (data.live_series && data.live_series.length > 0) {
@@ -2824,6 +3152,12 @@ export const App: React.FC = () => {
   useEffect(() => {
     fetchSnmpTelemetry(snmpTelemetryRange);
   }, [snmpTelemetryRange]);
+
+  useEffect(() => {
+    if (activeTab === "settings") {
+      fetchOverviewGraphOptions();
+    }
+  }, [activeTab]);
 
   useEffect(() => {
     if (
@@ -3194,6 +3528,8 @@ export const App: React.FC = () => {
   };
 
   const gw = overview?.gateway;
+  const overviewGraphSource = overview?.overview_graph_source;
+  const isCustomOverviewSource = overviewGraphSource?.mode === "custom";
   const ispConfig = overview?.isp_settings || config?.isp_settings;
   const ispCeilingMbps = Math.max(
     Number(ispConfig?.download_mbps ?? 1000),
@@ -3215,11 +3551,15 @@ export const App: React.FC = () => {
     overview?.wan_series && overview.wan_series.length > 0
       ? overview.wan_series[overview.wan_series.length - 1]
       : null;
-  const currentRxBps =
-    latestLiveSample?.rx_bps ?? gw?.wan_rx_bps ?? latestWanSample?.rx_bps ?? null;
-  const currentTxBps =
-    latestLiveSample?.tx_bps ?? gw?.wan_tx_bps ?? latestWanSample?.tx_bps ?? null;
-  const currentLatencyMs = latestLiveSample?.latency_ms ?? gw?.wan_latency_ms ?? null;
+  const currentRxBps = isCustomOverviewSource
+    ? (latestLiveSample?.rx_bps ?? latestWanSample?.rx_bps ?? null)
+    : (latestLiveSample?.rx_bps ?? gw?.wan_rx_bps ?? latestWanSample?.rx_bps ?? null);
+  const currentTxBps = isCustomOverviewSource
+    ? (latestLiveSample?.tx_bps ?? latestWanSample?.tx_bps ?? null)
+    : (latestLiveSample?.tx_bps ?? gw?.wan_tx_bps ?? latestWanSample?.tx_bps ?? null);
+  const currentLatencyMs = isCustomOverviewSource
+    ? null
+    : (latestLiveSample?.latency_ms ?? gw?.wan_latency_ms ?? null);
   const filteredHosts = selectedSubnet
     ? hosts.filter((h) => h.subnet_cidr === selectedSubnet)
     : hosts;
@@ -4259,15 +4599,21 @@ export const App: React.FC = () => {
                     )}
                   </div>
                   <p className="text-xs text-slate-400">
-                    {gw
-                      ? `UniFi Gateway (${gw.gateway_name} • ${gw.wan_ip || "WAN"}) ${
+                    {isCustomOverviewSource
+                      ? `Custom Source: ${overviewGraphSource?.summary || "Selected Interfaces"} — ${
                           overviewGraphMode === "live"
                             ? "real-time 2s traffic stream"
                             : "historical throughput"
                         }`
-                      : overviewGraphMode === "live"
-                        ? "Aggregated real-time 2s traffic across all polled SNMP interfaces"
-                        : "Aggregated inbound & outbound traffic across all polled SNMP network interfaces"}
+                      : gw
+                        ? `UniFi Gateway (${gw.gateway_name} • ${gw.wan_ip || "WAN"}) ${
+                            overviewGraphMode === "live"
+                              ? "real-time 2s traffic stream"
+                              : "historical throughput"
+                          }`
+                        : overviewGraphMode === "live"
+                          ? "Aggregated real-time 2s traffic across all polled SNMP interfaces"
+                          : "Aggregated inbound & outbound traffic across all polled SNMP network interfaces"}
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-3">
@@ -4282,6 +4628,24 @@ export const App: React.FC = () => {
                       )}
                     </div>
                   )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveTab("settings");
+                      fetchServerInfo(false);
+                      fetchOverviewGraphOptions();
+                    }}
+                    className={`rounded border px-2 py-0.5 font-mono-tabular text-[11px] transition ${
+                      isCustomOverviewSource
+                        ? "border-sky-500/40 bg-sky-500/10 text-sky-300 hover:border-sky-400/60"
+                        : "border-slate-800 bg-[#090D16] text-slate-400 hover:border-slate-700 hover:text-slate-200"
+                    }`}
+                    title="Choose devices & interfaces displayed on Overview Dashboard in Settings"
+                  >
+                    {isCustomOverviewSource
+                      ? `Source: ${overviewGraphSource?.summary || "Custom"}`
+                      : "Source: Auto"}
+                  </button>
                   <button
                     type="button"
                     onClick={() => {
@@ -4331,6 +4695,11 @@ export const App: React.FC = () => {
                 fixedMaxBps={ispCeilingBps}
                 liveMode={isLiveOverview}
                 liveWindowMs={120_000}
+                windowMs={
+                  isLiveOverview
+                    ? null
+                    : rangeKeyToWindowMs(overviewGraphMode === "live" ? "1d" : overviewGraphMode)
+                }
                 points={activeOverviewSeries.map((pt) => ({
                   label: pt.time,
                   inVal: pt.rx_bps,
@@ -5536,6 +5905,7 @@ export const App: React.FC = () => {
                           {activeUpsChartMode === "battery_load" && (
                             <DualAreaSparkChart
                               showYAxis
+                              windowMs={rangeKeyToWindowMs(upsHistoryRange)}
                               fixedMaxBps={100}
                               primaryLabel="Battery Charge (%)"
                               secondaryLabel="UPS Load (%)"
@@ -5557,6 +5927,7 @@ export const App: React.FC = () => {
                           {activeUpsChartMode === "voltage" && (
                             <DualAreaSparkChart
                               showYAxis
+                              windowMs={rangeKeyToWindowMs(upsHistoryRange)}
                               primaryLabel="Utility Input (VAC)"
                               secondaryLabel="UPS Output (VAC)"
                               primaryShortLabel="Input"
@@ -5578,6 +5949,7 @@ export const App: React.FC = () => {
                             <DualAreaSparkChart
                               showYAxis
                               hideSecondary
+                              windowMs={rangeKeyToWindowMs(upsHistoryRange)}
                               primaryLabel="Estimated Runtime (min)"
                               primaryShortLabel="Runtime"
                               primaryColor="#10B981"
@@ -5599,6 +5971,7 @@ export const App: React.FC = () => {
                             <DualAreaSparkChart
                               showYAxis
                               hideSecondary
+                              windowMs={rangeKeyToWindowMs(upsHistoryRange)}
                               primaryLabel="Output Power (W)"
                               primaryShortLabel="Power"
                               primaryColor="#F59E0B"
@@ -6009,6 +6382,7 @@ export const App: React.FC = () => {
                     </div>
 
                     <DualAreaSparkChart
+                      windowMs={rangeKeyToWindowMs(detailTrendRange)}
                       points={detailTrendSeries.map((pt) => ({
                         label: pt.time,
                         inVal: pt.avg_in_bps,
@@ -6323,6 +6697,7 @@ export const App: React.FC = () => {
               {snmpChartMode === "ingestion" && (
                 <DualAreaSparkChart
                   showYAxis
+                  windowMs={rangeKeyToWindowMs(snmpTelemetryRange)}
                   primaryLabel="OIDs Ingested"
                   secondaryLabel="Interface Samples"
                   primaryShortLabel="OIDs"
@@ -6346,6 +6721,7 @@ export const App: React.FC = () => {
               {snmpChartMode === "latency" && (
                 <DualAreaSparkChart
                   showYAxis
+                  windowMs={rangeKeyToWindowMs(snmpTelemetryRange)}
                   primaryLabel="Avg Latency (ms)"
                   secondaryLabel="Peak Latency (ms)"
                   primaryShortLabel="Avg"
@@ -6367,6 +6743,7 @@ export const App: React.FC = () => {
               {snmpChartMode === "polls" && (
                 <DualAreaSparkChart
                   showYAxis
+                  windowMs={rangeKeyToWindowMs(snmpTelemetryRange)}
                   primaryLabel="Successful Polls"
                   secondaryLabel="Failed Polls"
                   primaryShortLabel="OK"
@@ -7839,6 +8216,449 @@ export const App: React.FC = () => {
                     {mbps} Mbps
                   </button>
                 ))}
+              </div>
+            </div>
+
+            {/* 2b. Overview Dashboard Graph Source Selector */}
+            <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
+                    <Network className="h-4 w-4 text-sky-400" />
+                    Overview Dashboard Graph Source
+                  </h3>
+                  <p className="mt-0.5 text-xs text-slate-400">
+                    Choose <strong className="text-slate-200">Auto</strong> (UniFi WAN or all SNMP
+                    interfaces) or pick one or more discovered devices and specific interfaces (or all
+                    ports) to display on the main Overview Dashboard graph.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`rounded border px-2.5 py-1 font-mono-tabular text-xs ${
+                      overviewGraphSource?.mode === "custom"
+                        ? "border-sky-500/40 bg-sky-500/10 text-sky-300"
+                        : "border-slate-700 bg-[#090D16] text-emerald-400"
+                    }`}
+                  >
+                    {overviewGraphSource?.summary || "Auto"}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={fetchOverviewGraphOptions}
+                    disabled={loadingOverviewGraphOptions}
+                    className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#090D16] px-2.5 py-1 text-xs font-medium text-slate-200 hover:bg-slate-800 disabled:opacity-50"
+                  >
+                    <RefreshCw
+                      className={`h-3.5 w-3.5 ${loadingOverviewGraphOptions ? "animate-spin" : ""}`}
+                    />
+                    Refresh Devices
+                  </button>
+                </div>
+              </div>
+
+              {/* Mode Toggle */}
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setOverviewGraphModeInput("auto")}
+                  className={`rounded-md border px-3 py-1.5 text-xs font-medium transition ${
+                    overviewGraphModeInput === "auto"
+                      ? "border-emerald-500/50 bg-emerald-600 text-white"
+                      : "border-slate-700 bg-[#090D16] text-slate-300 hover:bg-slate-800"
+                  }`}
+                >
+                  Auto (UniFi WAN / All SNMP)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOverviewGraphModeInput("custom");
+                    if (overviewGraphOptions.length === 0) fetchOverviewGraphOptions();
+                  }}
+                  className={`rounded-md border px-3 py-1.5 text-xs font-medium transition ${
+                    overviewGraphModeInput === "custom"
+                      ? "border-sky-500/50 bg-sky-600 text-white"
+                      : "border-slate-700 bg-[#090D16] text-slate-300 hover:bg-slate-800"
+                  }`}
+                >
+                  Custom Devices &amp; Interfaces
+                </button>
+              </div>
+
+              {overviewGraphModeInput === "custom" && (
+                <div className="mt-4 space-y-3">
+                  {/* Selected Summary Chips */}
+                  <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                    <div className="mb-2 flex items-center justify-between gap-2 text-[11px] text-slate-400">
+                      <span>
+                        Selected Sources ({overviewGraphSelectionsInput.length} device
+                        {overviewGraphSelectionsInput.length === 1 ? "" : "s"})
+                      </span>
+                      {overviewGraphSelectionsInput.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => setOverviewGraphSelectionsInput([])}
+                          className="text-rose-400 hover:text-rose-300"
+                        >
+                          Clear All
+                        </button>
+                      )}
+                    </div>
+                    {overviewGraphSelectionsInput.length === 0 ? (
+                      <div className="text-xs text-slate-500">
+                        No devices selected yet. Pick one or more devices/interfaces below.
+                      </div>
+                    ) : (
+                      <div className="flex flex-wrap gap-1.5">
+                        {overviewGraphSelectionsInput.map((sel) => {
+                          const devInfo = overviewGraphOptions.find(
+                            (d) => d.device_ip === sel.device_ip,
+                          );
+                          const devLabel =
+                            devInfo?.hostname && devInfo.hostname !== sel.device_ip
+                              ? `${devInfo.hostname} (${sel.device_ip})`
+                              : sel.device_ip;
+                          if (sel.if_indices.length === 0) {
+                            return (
+                              <span
+                                key={`${sel.device_ip}-all`}
+                                className="inline-flex items-center gap-1.5 rounded border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 font-mono-tabular text-[11px] text-sky-200"
+                              >
+                                {devLabel}: All Interfaces
+                                <button
+                                  type="button"
+                                  onClick={() => removeOverviewSelectionChip(sel.device_ip)}
+                                  className="text-slate-400 hover:text-white"
+                                  aria-label={`Remove ${sel.device_ip}`}
+                                >
+                                  <X className="h-3 w-3" />
+                                </button>
+                              </span>
+                            );
+                          }
+                          return sel.if_indices.map((ifIdx) => {
+                            const iface = devInfo?.interfaces.find((i) => i.if_index === ifIdx);
+                            return (
+                              <span
+                                key={`${sel.device_ip}-${ifIdx}`}
+                                className="inline-flex items-center gap-1.5 rounded border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 font-mono-tabular text-[11px] text-emerald-200"
+                              >
+                                {devLabel} • #{ifIdx} {iface?.if_name || "if"}
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    removeOverviewSelectionChip(sel.device_ip, ifIdx)
+                                  }
+                                  className="text-slate-400 hover:text-white"
+                                  aria-label={`Remove ${sel.device_ip} interface ${ifIdx}`}
+                                >
+                                  <X className="h-3 w-3" />
+                                </button>
+                              </span>
+                            );
+                          });
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Filter Bar */}
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="relative min-w-[240px] flex-1">
+                      <Search className="pointer-events-none absolute top-2 left-2.5 h-3.5 w-3.5 text-slate-500" />
+                      <input
+                        type="text"
+                        value={overviewGraphSearch}
+                        onChange={(e) => setOverviewGraphSearch(e.target.value)}
+                        placeholder="Filter discovered devices by IP, hostname, vendor, or interface..."
+                        className="w-full rounded-md border border-slate-700 bg-[#090D16] py-1.5 pr-3 pl-8 text-xs text-white placeholder-slate-500"
+                      />
+                    </div>
+                    <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={overviewGraphSnmpOnly}
+                        onChange={(e) => setOverviewGraphSnmpOnly(e.target.checked)}
+                        className="rounded border-slate-600 bg-[#090D16] text-emerald-500"
+                      />
+                      <span>SNMP-polled interfaces only</span>
+                    </label>
+                  </div>
+
+                  {/* Scrollable Device & Interface Checklist */}
+                  <div className="max-h-[420px] space-y-2 overflow-y-auto pr-1">
+                    {(() => {
+                      const q = overviewGraphSearch.trim().toLowerCase();
+                      const visibleDevices = overviewGraphOptions.filter((dev) => {
+                        if (overviewGraphSnmpOnly && dev.interfaces.length === 0) return false;
+                        if (!q) return true;
+                        const devMatch =
+                          dev.device_ip.toLowerCase().includes(q) ||
+                          (dev.hostname || "").toLowerCase().includes(q) ||
+                          (dev.vendor || "").toLowerCase().includes(q);
+                        if (devMatch) return true;
+                        return dev.interfaces.some(
+                          (intf) =>
+                            intf.if_name.toLowerCase().includes(q) ||
+                            intf.if_alias.toLowerCase().includes(q) ||
+                            intf.if_descr.toLowerCase().includes(q),
+                        );
+                      });
+                      if (visibleDevices.length === 0) {
+                        return (
+                          <div className="rounded-lg border border-slate-800 bg-[#090D16] p-4 text-center text-xs text-slate-500">
+                            {loadingOverviewGraphOptions
+                              ? "Loading discovered devices and SNMP interfaces..."
+                              : "No discovered devices match your filter."}
+                          </div>
+                        );
+                      }
+                      return visibleDevices.map((dev) => {
+                        const selObj = overviewGraphSelectionsInput.find(
+                          (s) => s.device_ip === dev.device_ip,
+                        );
+                        const isSelected = Boolean(selObj);
+                        const isExpanded =
+                          isSelected || Boolean(expandedOverviewDeviceIps[dev.device_ip]);
+                        const ifQuery = (interfaceSearchByIp[dev.device_ip] || "")
+                          .trim()
+                          .toLowerCase();
+                        const shownInterfaces = ifQuery
+                          ? dev.interfaces.filter(
+                              (intf) =>
+                                intf.if_name.toLowerCase().includes(ifQuery) ||
+                                intf.if_alias.toLowerCase().includes(ifQuery) ||
+                                intf.if_descr.toLowerCase().includes(ifQuery) ||
+                                `#${intf.if_index}`.includes(ifQuery),
+                            )
+                          : dev.interfaces;
+
+                        return (
+                          <div
+                            key={dev.device_ip}
+                            className={`rounded-lg border transition ${
+                              isSelected
+                                ? "border-sky-500/40 bg-[#090D16]"
+                                : "border-slate-800 bg-[#090D16]/70"
+                            }`}
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5">
+                              <div className="flex min-w-0 items-center gap-2.5">
+                                <input
+                                  type="checkbox"
+                                  checked={isSelected}
+                                  onChange={() => toggleOverviewDevice(dev.device_ip)}
+                                  className="h-3.5 w-3.5 rounded border-slate-600 bg-[#111827] text-sky-500"
+                                />
+                                <span
+                                  className={`h-2 w-2 shrink-0 rounded-full ${
+                                    dev.is_online ? "bg-emerald-400" : "bg-slate-600"
+                                  }`}
+                                />
+                                <span className="font-mono-tabular text-xs font-semibold text-white">
+                                  {dev.device_ip}
+                                </span>
+                                {dev.hostname && dev.hostname !== dev.device_ip && (
+                                  <span className="truncate text-xs text-slate-300">
+                                    {dev.hostname}
+                                  </span>
+                                )}
+                                {dev.vendor && (
+                                  <span className="hidden truncate text-[11px] text-slate-500 sm:inline">
+                                    • {dev.vendor}
+                                  </span>
+                                )}
+                              </div>
+
+                              <div className="flex items-center gap-2">
+                                <span
+                                  className={`rounded px-2 py-0.5 font-mono-tabular text-[10px] ${
+                                    dev.interfaces.length > 0
+                                      ? "bg-emerald-500/10 text-emerald-300"
+                                      : "bg-slate-800 text-slate-400"
+                                  }`}
+                                >
+                                  {dev.interfaces.length > 0
+                                    ? `${dev.interfaces.length} interface${
+                                        dev.interfaces.length === 1 ? "" : "s"
+                                      }`
+                                    : "No SNMP interfaces yet"}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setExpandedOverviewDeviceIps((prev) => ({
+                                      ...prev,
+                                      [dev.device_ip]: !prev[dev.device_ip],
+                                    }))
+                                  }
+                                  className="rounded border border-slate-700 bg-[#111827] px-2 py-0.5 text-[11px] text-slate-300 hover:bg-slate-800"
+                                >
+                                  {isExpanded ? "Hide" : "Expand"}
+                                </button>
+                              </div>
+                            </div>
+
+                            {isExpanded && (
+                              <div className="border-t border-slate-800/80 px-3 py-2.5">
+                                {dev.interfaces.length > 0 ? (
+                                  <div className="space-y-2.5">
+                                    <div className="flex flex-wrap items-center justify-between gap-2">
+                                      <div className="flex items-center gap-1.5">
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            setOverviewDeviceAllInterfaces(dev.device_ip)
+                                          }
+                                          className={`rounded border px-2 py-0.5 text-[11px] font-medium transition ${
+                                            isSelected && (selObj?.if_indices.length ?? 0) === 0
+                                              ? "border-sky-500/50 bg-sky-600 text-white"
+                                              : "border-slate-700 bg-[#111827] text-slate-300 hover:bg-slate-800"
+                                          }`}
+                                        >
+                                          All Interfaces
+                                        </button>
+                                        <span
+                                          className={`rounded border px-2 py-0.5 text-[11px] font-medium ${
+                                            isSelected && (selObj?.if_indices.length ?? 0) > 0
+                                              ? "border-emerald-500/50 bg-emerald-600/20 text-emerald-300"
+                                              : "border-slate-800 bg-[#111827] text-slate-400"
+                                          }`}
+                                        >
+                                          Specific Interface(s):{" "}
+                                          {selObj ? selObj.if_indices.length : 0}
+                                        </span>
+                                      </div>
+
+                                      {dev.interfaces.length > 8 && (
+                                        <input
+                                          type="text"
+                                          value={interfaceSearchByIp[dev.device_ip] || ""}
+                                          onChange={(e) =>
+                                            setInterfaceSearchByIp((prev) => ({
+                                              ...prev,
+                                              [dev.device_ip]: e.target.value,
+                                            }))
+                                          }
+                                          placeholder="Filter ports..."
+                                          className="w-44 rounded border border-slate-700 bg-[#111827] px-2 py-0.5 text-[11px] text-white placeholder-slate-500"
+                                        />
+                                      )}
+                                    </div>
+
+                                    <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+                                      {shownInterfaces.map((intf) => {
+                                        const ifChecked = Boolean(
+                                          selObj?.if_indices.includes(intf.if_index),
+                                        );
+                                        return (
+                                          <label
+                                            key={intf.if_index}
+                                            className={`flex cursor-pointer items-center justify-between gap-2 rounded border px-2.5 py-1.5 text-[11px] transition ${
+                                              ifChecked
+                                                ? "border-emerald-500/40 bg-emerald-500/10"
+                                                : "border-slate-800 bg-[#111827]/70 hover:border-slate-700"
+                                            }`}
+                                          >
+                                            <div className="flex min-w-0 items-center gap-2">
+                                              <input
+                                                type="checkbox"
+                                                checked={ifChecked}
+                                                onChange={() =>
+                                                  toggleOverviewDeviceInterface(
+                                                    dev.device_ip,
+                                                    intf.if_index,
+                                                  )
+                                                }
+                                                className="h-3 w-3 rounded border-slate-600 bg-[#090D16] text-emerald-500"
+                                              />
+                                              <span className="font-mono-tabular text-slate-400">
+                                                #{intf.if_index}
+                                              </span>
+                                              <span className="truncate font-mono-tabular font-semibold text-white">
+                                                {intf.if_name}
+                                              </span>
+                                              {(intf.if_alias || intf.if_descr) && (
+                                                <span className="truncate text-slate-400">
+                                                  ({intf.if_alias || intf.if_descr})
+                                                </span>
+                                              )}
+                                            </div>
+                                            <div className="flex shrink-0 items-center gap-1.5 font-mono-tabular">
+                                              {intf.if_speed_bps > 0 && (
+                                                <span className="text-[10px] text-slate-400">
+                                                  {formatBps(intf.if_speed_bps)}
+                                                </span>
+                                              )}
+                                              <span className="text-[10px] text-emerald-400">
+                                                ↓{formatBps(intf.in_bps)}
+                                              </span>
+                                              <span className="text-[10px] text-sky-400">
+                                                ↑{formatBps(intf.out_bps)}
+                                              </span>
+                                              <span
+                                                className={`rounded px-1 py-0.2 text-[10px] ${
+                                                  intf.if_oper_status === 1
+                                                    ? "bg-emerald-500/15 text-emerald-400"
+                                                    : "bg-slate-800 text-slate-500"
+                                                }`}
+                                              >
+                                                {intf.if_oper_status === 1 ? "UP" : "DOWN"}
+                                              </span>
+                                            </div>
+                                          </label>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
+                                    <span>
+                                      No SNMP interfaces discovered yet for this device.
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() => openDevicePage(dev.device_ip)}
+                                      className="rounded border border-sky-500/30 bg-sky-500/10 px-2.5 py-1 text-[11px] font-medium text-sky-300 hover:bg-sky-500/20"
+                                    >
+                                      Open Device to Enable SNMP →
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      });
+                    })()}
+                  </div>
+                </div>
+              )}
+
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-slate-800/80 pt-3">
+                <span className="text-[11px] text-slate-400">
+                  {overviewGraphModeInput === "auto"
+                    ? "Auto mode tracks UniFi Gateway WAN when enabled, or all non-loopback SNMP ports."
+                    : `Custom mode sums live and historical RX/TX across ${overviewGraphSelectionsInput.length} selected device${
+                        overviewGraphSelectionsInput.length === 1 ? "" : "s"
+                      }.`}
+                </span>
+                <button
+                  type="button"
+                  onClick={handleSaveOverviewGraphSettings}
+                  disabled={
+                    savingOverviewGraph ||
+                    (overviewGraphModeInput === "custom" &&
+                      overviewGraphSelectionsInput.length === 0)
+                  }
+                  className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
+                >
+                  <Check className="h-3.5 w-3.5" />
+                  <span>
+                    {savingOverviewGraph ? "Saving..." : "Save Overview Graph Source"}
+                  </span>
+                </button>
               </div>
             </div>
 

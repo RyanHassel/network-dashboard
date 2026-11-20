@@ -234,12 +234,16 @@ async def live_traffic_loop(
     unifi_controllers: List[Dict[str, Any]] = []
     snmp_targets: List[Dict[str, Any]] = []
     db_ignore_indices: Dict[str, Set[int]] = {}
+    custom_graph_mode: bool = False
+    custom_include_indices: Dict[str, Optional[Set[int]]] = {}
+    graph_signature: str = ""
     client_map: Dict[int, httpx.AsyncClient] = {}
     config_signature: str = ""
     last_cfg_refresh = 0.0
 
     async def _refresh_targets() -> None:
         nonlocal unifi_controllers, snmp_targets, db_ignore_indices, config_signature
+        nonlocal custom_graph_mode, custom_include_indices, graph_signature
         async with pool.acquire() as conn:
             u_rows = await conn.fetch(
                 """
@@ -264,7 +268,7 @@ async def live_traffic_loop(
                 LEFT JOIN snmp_profiles p ON p.id = t.profile_id
                 WHERE t.enabled = TRUE
                 ORDER BY t.id ASC
-                LIMIT 50
+                LIMIT 200
                 """
             )
             lo_rows = await conn.fetch(
@@ -274,6 +278,9 @@ async def live_traffic_loop(
                 WHERE time > NOW() - INTERVAL '24 hours'
                   AND COALESCE(LOWER(if_name), '') IN ('lo', 'loopback', 'null0')
                 """
+            )
+            raw_graph = await conn.fetchval(
+                "SELECT value FROM app_settings WHERE key = 'overview_graph_settings'"
             )
 
         new_unifi = [dict(r) for r in u_rows]
@@ -290,6 +297,54 @@ async def live_traffic_loop(
             client_map.clear()
             config_signature = new_sig
 
+        parsed_graph: Dict[str, Any] = {}
+        if isinstance(raw_graph, str):
+            try:
+                parsed_graph = json.loads(raw_graph)
+            except Exception:
+                parsed_graph = {}
+        elif isinstance(raw_graph, dict):
+            parsed_graph = dict(raw_graph)
+
+        graph_mode = str(parsed_graph.get("mode") or "auto").strip().lower()
+        new_custom_map: Dict[str, Optional[Set[int]]] = {}
+        raw_sels = parsed_graph.get("selections")
+        if isinstance(raw_sels, list):
+            for entry in raw_sels:
+                if not isinstance(entry, dict):
+                    continue
+                ip = str(entry.get("device_ip") or "").strip()
+                if not ip:
+                    continue
+                raw_idxs = entry.get("if_indices")
+                if isinstance(raw_idxs, list) and len(raw_idxs) > 0:
+                    valid_idxs: Set[int] = set()
+                    for v in raw_idxs:
+                        try:
+                            iv = int(v)
+                            if iv > 0:
+                                valid_idxs.add(iv)
+                        except Exception:
+                            continue
+                    new_custom_map[ip] = valid_idxs if valid_idxs else None
+                else:
+                    new_custom_map[ip] = None
+
+        new_custom_mode = graph_mode == "custom" and len(new_custom_map) > 0
+        new_graph_sig = json.dumps(
+            {
+                "mode": new_custom_mode,
+                "map": {
+                    ip: (sorted(v) if v is not None else None)
+                    for ip, v in sorted(new_custom_map.items())
+                },
+            },
+            sort_keys=True,
+        )
+        if new_graph_sig != graph_signature:
+            snmp_poller.reset_live_cache()
+            graph_signature = new_graph_sig
+
         unifi_controllers = new_unifi
         snmp_targets = [dict(r) for r in s_rows]
         ignores: Dict[str, Set[int]] = {}
@@ -297,6 +352,8 @@ async def live_traffic_loop(
             ip = str(r["device_ip"])
             ignores.setdefault(ip, set()).add(int(r["if_index"]))
         db_ignore_indices = ignores
+        custom_graph_mode = new_custom_mode
+        custom_include_indices = new_custom_map
 
     try:
         while not stop_event.is_set():
@@ -314,10 +371,25 @@ async def live_traffic_loop(
 
             try:
                 sample = None
-                if unifi_controllers:
-                    sample = await unifi_collector.poll_live_wan(unifi_controllers, client_map)
-                if sample is None and snmp_targets:
-                    sample = await snmp_poller.poll_live_traffic(snmp_targets, db_ignore_indices)
+                if custom_graph_mode:
+                    selected_targets = [
+                        t
+                        for t in snmp_targets
+                        if str(t.get("device_ip") or "").strip() in custom_include_indices
+                    ]
+                    if selected_targets:
+                        sample = await snmp_poller.poll_live_traffic(
+                            selected_targets,
+                            db_ignore_indices,
+                            include_indices=custom_include_indices,
+                        )
+                        if sample is not None:
+                            sample["source"] = "custom_snmp"
+                else:
+                    if unifi_controllers:
+                        sample = await unifi_collector.poll_live_wan(unifi_controllers, client_map)
+                    if sample is None and snmp_targets:
+                        sample = await snmp_poller.poll_live_traffic(snmp_targets, db_ignore_indices)
 
                 if sample is not None:
                     encoded = json.dumps(sample)
@@ -328,7 +400,11 @@ async def live_traffic_loop(
 
                     loop_info["status"] = "running"
                     loop_info["last_run"] = sample["time"]
-                    if sample.get("source") == "unifi":
+                    if sample.get("source") == "custom_snmp":
+                        loop_info["detail"] = (
+                            f"Streaming custom overview source ({sample.get('device_count', 0)} host(s)) every {LIVE_TRAFFIC_INTERVAL:g}s"
+                        )
+                    elif sample.get("source") == "unifi":
                         loop_info["detail"] = f"Streaming UniFi WAN every {LIVE_TRAFFIC_INTERVAL:g}s"
                     else:
                         loop_info["detail"] = (
@@ -338,7 +414,10 @@ async def live_traffic_loop(
                     loop_info["status"] = "running"
                     loop_info["detail"] = (
                         "Priming live counters..."
-                        if (unifi_controllers or snmp_targets)
+                        if (
+                            (custom_graph_mode and snmp_targets)
+                            or (not custom_graph_mode and (unifi_controllers or snmp_targets))
+                        )
                         else "Idle (no active traffic sources)"
                     )
             except Exception as exc:
@@ -417,7 +496,7 @@ async def command_listener_loop(
                     snmp_trigger.set()
                 if raw in ("unifi_now", "reload_all"):
                     unifi_trigger.set()
-                if raw in ("snmp_now", "unifi_now", "reload_all"):
+                if raw in ("snmp_now", "unifi_now", "reload_all", "live_reload"):
                     live_reload_trigger.set()
             await asyncio.sleep(0.2)
     finally:

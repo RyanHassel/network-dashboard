@@ -366,6 +366,16 @@ class ISPSettingsPayload(BaseModel):
     upload_mbps: float = 1000.0
 
 
+class OverviewGraphDeviceSelection(BaseModel):
+    device_ip: str
+    if_indices: List[int] = []
+
+
+class OverviewGraphSettingsPayload(BaseModel):
+    mode: str = "auto"
+    selections: List[OverviewGraphDeviceSelection] = []
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_pool, redis_client
@@ -1243,6 +1253,177 @@ async def _read_isp_settings(conn: asyncpg.Connection) -> Dict[str, Any]:
     }
 
 
+def _normalize_overview_graph_settings(raw: Any) -> Dict[str, Any]:
+    parsed: Dict[str, Any] = {}
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = {}
+    elif isinstance(raw, dict):
+        parsed = dict(raw)
+
+    mode = str(parsed.get("mode") or "auto").strip().lower()
+    if mode not in ("auto", "custom"):
+        mode = "auto"
+
+    selections: List[Dict[str, Any]] = []
+    by_ip: Dict[str, Dict[str, Any]] = {}
+    raw_sels = parsed.get("selections")
+    if isinstance(raw_sels, list):
+        for entry in raw_sels:
+            if not isinstance(entry, dict):
+                continue
+            ip = str(entry.get("device_ip") or "").strip()
+            if not ip:
+                continue
+            raw_idxs = entry.get("if_indices")
+            clean_idxs: List[int] = []
+            if isinstance(raw_idxs, list):
+                seen_idx = set()
+                for v in raw_idxs:
+                    try:
+                        iv = int(v)
+                        if iv > 0 and iv not in seen_idx:
+                            seen_idx.add(iv)
+                            clean_idxs.append(iv)
+                    except Exception:
+                        continue
+            clean_idxs.sort()
+            if ip not in by_ip:
+                obj = {"device_ip": ip, "if_indices": clean_idxs}
+                by_ip[ip] = obj
+                selections.append(obj)
+            else:
+                if not by_ip[ip]["if_indices"] or not clean_idxs:
+                    by_ip[ip]["if_indices"] = []
+                else:
+                    merged = sorted(set(by_ip[ip]["if_indices"]) | set(clean_idxs))
+                    by_ip[ip]["if_indices"] = merged
+
+    if mode == "custom" and not selections:
+        mode = "auto"
+
+    return {"mode": mode, "selections": selections}
+
+
+async def _read_overview_graph_settings(conn: asyncpg.Connection) -> Dict[str, Any]:
+    raw = await conn.fetchval(
+        "SELECT value FROM app_settings WHERE key = 'overview_graph_settings'"
+    )
+    return _normalize_overview_graph_settings(raw)
+
+
+async def _describe_overview_graph_source(
+    conn: asyncpg.Connection,
+    graph_settings: Dict[str, Any],
+    has_unifi_gw: bool,
+) -> Dict[str, Any]:
+    mode = graph_settings.get("mode", "auto")
+    selections = graph_settings.get("selections") or []
+    if mode == "custom" and selections:
+        sel_ips = [s["device_ip"] for s in selections if s.get("device_ip")]
+        host_rows = await conn.fetch(
+            """
+            SELECT ip_address AS ip, COALESCE(NULLIF(hostname, ''), ip_address) AS name
+            FROM discovered_hosts
+            WHERE ip_address = ANY($1::text[])
+            """,
+            sel_ips,
+        )
+        snmp_rows = await conn.fetch(
+            """
+            SELECT device_ip AS ip, COALESCE(NULLIF(sys_name, ''), device_ip) AS name
+            FROM snmp_devices
+            WHERE device_ip = ANY($1::text[])
+            """,
+            sel_ips,
+        )
+        tgt_rows = await conn.fetch(
+            """
+            SELECT device_ip AS ip, COALESCE(NULLIF(label, ''), device_ip) AS name
+            FROM snmp_targets_config
+            WHERE device_ip = ANY($1::text[])
+            """,
+            sel_ips,
+        )
+        name_map: Dict[str, str] = {}
+        for row in host_rows:
+            name_map[str(row["ip"])] = str(row["name"])
+        for row in tgt_rows:
+            if row["name"] and str(row["name"]) != str(row["ip"]):
+                name_map[str(row["ip"])] = str(row["name"])
+        for row in snmp_rows:
+            if row["name"] and str(row["name"]) != str(row["ip"]):
+                name_map[str(row["ip"])] = str(row["name"])
+
+        if_rows = await conn.fetch(
+            """
+            SELECT DISTINCT ON (device_ip, if_index)
+                device_ip, if_index, COALESCE(NULLIF(if_name, ''), NULLIF(if_descr, ''), 'if' || if_index::text) AS if_name
+            FROM snmp_metrics_raw
+            WHERE device_ip = ANY($1::text[])
+              AND time > NOW() - INTERVAL '7 days'
+            ORDER BY device_ip, if_index, time DESC
+            """,
+            sel_ips,
+        )
+        if_map: Dict[tuple[str, int], str] = {
+            (str(r["device_ip"]), int(r["if_index"])): str(r["if_name"]) for r in if_rows
+        }
+
+        total_spec_ifs = 0
+        has_all_if = False
+        parts: List[str] = []
+        for s in selections:
+            ip = str(s["device_ip"])
+            idxs = [int(i) for i in (s.get("if_indices") or [])]
+            d_label = name_map.get(ip, ip)
+            if d_label != ip:
+                d_disp = f"{d_label} ({ip})"
+            else:
+                d_disp = ip
+            if not idxs:
+                has_all_if = True
+                parts.append(f"{d_disp}: All Interfaces")
+            else:
+                total_spec_ifs += len(idxs)
+                if_names = [if_map.get((ip, idx), f"#{idx}") for idx in idxs[:3]]
+                if len(idxs) > 3:
+                    if_names.append(f"+{len(idxs) - 3}")
+                parts.append(f"{d_disp}: {', '.join(if_names)}")
+
+        if len(selections) == 1:
+            summary = parts[0]
+        else:
+            if total_spec_ifs > 0 and not has_all_if:
+                summary = f"{len(selections)} devices • {total_spec_ifs} interface{'s' if total_spec_ifs != 1 else ''}"
+            elif total_spec_ifs > 0:
+                summary = f"{len(selections)} devices ({total_spec_ifs} specific + all-ports)"
+            else:
+                summary = f"{len(selections)} devices (All Interfaces)"
+
+        return {
+            "mode": "custom",
+            "source": "custom_snmp",
+            "device_count": len(selections),
+            "interface_count": total_spec_ifs,
+            "has_all_interfaces_device": has_all_if,
+            "summary": summary,
+        }
+
+    return {
+        "mode": "auto",
+        "source": "unifi" if has_unifi_gw else "snmp_all",
+        "device_count": 0,
+        "interface_count": 0,
+        "has_all_interfaces_device": False,
+        "summary": "Auto (UniFi Gateway WAN)"
+        if has_unifi_gw
+        else "Auto (All Polled SNMP Interfaces)",
+    }
+
+
 @app.get("/api/config")
 async def get_all_config() -> Dict[str, Any]:
     pool = _get_pool()
@@ -1250,6 +1431,7 @@ async def get_all_config() -> Dict[str, Any]:
         ob_val = await conn.fetchval("SELECT value FROM app_settings WHERE key = 'onboarding'")
         onboarding = json.loads(ob_val) if isinstance(ob_val, str) else (ob_val or {"completed": False, "skipped": False})
         isp_settings = await _read_isp_settings(conn)
+        overview_graph_settings = await _read_overview_graph_settings(conn)
 
         profiles = await conn.fetch(
             """
@@ -1289,11 +1471,210 @@ async def get_all_config() -> Dict[str, Any]:
     return {
         "onboarding": onboarding,
         "isp_settings": isp_settings,
+        "overview_graph_settings": overview_graph_settings,
         "snmp_profiles": [dict(r) for r in profiles],
         "snmp_targets": [dict(r) for r in targets],
         "subnets": [dict(r) for r in subnets],
         "unifi_controllers": [dict(r) for r in unifi_ctrls],
     }
+
+
+@app.get("/api/config/overview-graph/options")
+async def get_overview_graph_options() -> Dict[str, Any]:
+    """Returns all discovered & SNMP-configured devices alongside their polled interfaces."""
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        host_rows = await conn.fetch(
+            """
+            SELECT ip_address, hostname, vendor, is_online, subnet_cidr
+            FROM discovered_hosts
+            """
+        )
+        tgt_rows = await conn.fetch(
+            """
+            SELECT device_ip, label, enabled
+            FROM snmp_targets_config
+            """
+        )
+        snmp_rows = await conn.fetch(
+            """
+            SELECT device_ip, sys_name, sys_descr, vendor_name, device_category,
+                   matched_mibs, is_reachable,
+                   (extended_metrics ? 'ups_telemetry') AS has_ups_telemetry
+            FROM snmp_devices
+            """
+        )
+        if_rows = await conn.fetch(
+            """
+            SELECT DISTINCT ON (device_ip, if_index)
+                device_ip, if_index, if_name, if_descr, if_alias,
+                if_speed_bps, if_oper_status, in_bps, out_bps
+            FROM snmp_metrics_raw
+            WHERE time > NOW() - INTERVAL '7 days'
+              AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+            ORDER BY device_ip, if_index, time DESC
+            """
+        )
+
+    dev_map: Dict[str, Dict[str, Any]] = {}
+
+    def _ensure_dev(ip: str) -> Dict[str, Any]:
+        if ip not in dev_map:
+            dev_map[ip] = {
+                "device_ip": ip,
+                "hostname": ip,
+                "vendor": None,
+                "device_category": None,
+                "device_profile_type": "network",
+                "is_online": False,
+                "snmp_enabled": False,
+                "snmp_reachable": None,
+                "subnet_cidr": None,
+                "interfaces": [],
+                "_raw_snmp": None,
+            }
+        return dev_map[ip]
+
+    for hr in host_rows:
+        ip = str(hr["ip_address"]).strip()
+        if not ip:
+            continue
+        d = _ensure_dev(ip)
+        if hr["hostname"]:
+            d["hostname"] = str(hr["hostname"]).strip()
+        if hr["vendor"]:
+            d["vendor"] = str(hr["vendor"]).strip()
+        d["is_online"] = bool(hr["is_online"])
+        if hr["subnet_cidr"]:
+            d["subnet_cidr"] = str(hr["subnet_cidr"])
+
+    for tr in tgt_rows:
+        ip = str(tr["device_ip"]).strip()
+        if not ip:
+            continue
+        d = _ensure_dev(ip)
+        d["snmp_enabled"] = bool(tr["enabled"])
+        if tr["label"] and (not d["hostname"] or d["hostname"] == ip):
+            d["hostname"] = str(tr["label"]).strip()
+
+    for sr in snmp_rows:
+        ip = str(sr["device_ip"]).strip()
+        if not ip:
+            continue
+        d = _ensure_dev(ip)
+        raw_snmp = dict(sr)
+        d["_raw_snmp"] = raw_snmp
+        if sr["sys_name"] and str(sr["sys_name"]).strip() and str(sr["sys_name"]).strip() != ip:
+            d["hostname"] = str(sr["sys_name"]).strip()
+        if sr["vendor_name"]:
+            d["vendor"] = str(sr["vendor_name"]).strip()
+        if sr["device_category"]:
+            d["device_category"] = str(sr["device_category"]).strip()
+        if sr["is_reachable"] is not None:
+            d["snmp_reachable"] = bool(sr["is_reachable"])
+            if sr["is_reachable"]:
+                d["is_online"] = True
+
+    for ir in if_rows:
+        ip = str(ir["device_ip"]).strip()
+        if not ip:
+            continue
+        d = _ensure_dev(ip)
+        d["interfaces"].append(
+            {
+                "if_index": int(ir["if_index"]),
+                "if_name": str(ir["if_name"] or f"if{ir['if_index']}"),
+                "if_descr": str(ir["if_descr"] or ""),
+                "if_alias": str(ir["if_alias"] or ""),
+                "if_speed_bps": int(ir["if_speed_bps"] or 0),
+                "if_oper_status": int(ir["if_oper_status"] or 0),
+                "in_bps": round(float(ir["in_bps"] or 0.0), 1),
+                "out_bps": round(float(ir["out_bps"] or 0.0), 1),
+            }
+        )
+
+    devices_out: List[Dict[str, Any]] = []
+    for d in dev_map.values():
+        raw_snmp = d.pop("_raw_snmp", None)
+        if isinstance(raw_snmp, dict) and isinstance(raw_snmp.get("matched_mibs"), str):
+            try:
+                raw_snmp["matched_mibs"] = json.loads(raw_snmp["matched_mibs"])
+            except Exception:
+                raw_snmp["matched_mibs"] = []
+        d["device_profile_type"] = _classify_device_profile(
+            raw_snmp,
+            None,
+            {"sys_name": d["hostname"], "vendor_name": d["vendor"]},
+        )
+        d["interfaces"].sort(
+            key=lambda x: (
+                0 if x["if_oper_status"] == 1 else 1,
+                -(x["in_bps"] + x["out_bps"]),
+                x["if_index"],
+            )
+        )
+        devices_out.append(d)
+
+    def _dev_sort_key(item: Dict[str, Any]) -> tuple:
+        ip = str(item.get("device_ip") or "")
+        try:
+            ip_key = (0, int(ipaddress.IPv4Address(ip)))
+        except Exception:
+            ip_key = (1, ip)
+        return (
+            0 if item["interfaces"] else 1,
+            0 if item["snmp_enabled"] else 1,
+            0 if item["is_online"] else 1,
+            ip_key,
+        )
+
+    devices_out.sort(key=_dev_sort_key)
+    return {"devices": devices_out}
+
+
+@app.put("/api/config/overview-graph")
+async def save_overview_graph_settings(
+    payload: OverviewGraphSettingsPayload,
+) -> Dict[str, Any]:
+    raw_mode = (payload.mode or "auto").strip().lower()
+    if raw_mode not in ("auto", "custom"):
+        raise HTTPException(status_code=400, detail="Mode must be 'auto' or 'custom'.")
+
+    normalized = _normalize_overview_graph_settings(
+        {
+            "mode": raw_mode,
+            "selections": [
+                {"device_ip": s.device_ip, "if_indices": s.if_indices}
+                for s in payload.selections
+            ],
+        }
+    )
+    if raw_mode == "custom" and not normalized["selections"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Select at least one device when using Custom mode.",
+        )
+
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES ('overview_graph_settings', $1::jsonb, NOW())
+            ON CONFLICT (key) DO UPDATE SET
+                value = EXCLUDED.value,
+                updated_at = NOW()
+            """,
+            json.dumps(normalized),
+        )
+
+    if redis_client:
+        try:
+            await redis_client.delete("netdash:live:traffic")
+        except Exception:
+            pass
+    await _notify_worker("live_reload")
+    return await get_all_config()
 
 
 @app.put("/api/config/isp")
@@ -1716,15 +2097,17 @@ def _clean_bps_sql(col: str, coalesce_zero: bool = False) -> str:
 
 
 async def _query_overview_traffic_series(
-    conn: asyncpg.Connection, range_key: str = "1h"
+    conn: asyncpg.Connection,
+    range_key: str = "1d",
+    graph_settings: Optional[Dict[str, Any]] = None,
 ) -> tuple[List[Dict[str, Any]], str]:
-    rk = (range_key or "1h").strip().lower()
+    rk = (range_key or "1d").strip().lower()
     if rk == "24h":
         rk = "1d"
     elif rk == "30d":
         rk = "1m"
     if rk not in ("1h", "12h", "1d", "7d", "1m"):
-        rk = "1h"
+        rk = "1d"
 
     range_specs = {
         "1h": ("1 hour", "1 minute"),
@@ -1735,62 +2118,82 @@ async def _query_overview_traffic_series(
     }
     sql_interval, sql_bucket = range_specs[rk]
 
-    wan_history = await conn.fetch(
-        f"""
-        SELECT time_bucket('{sql_bucket}', time) AS bucket,
-               AVG(wan_rx_bps) AS rx_bps,
-               AVG(wan_tx_bps) AS tx_bps,
-               AVG(wan_latency_ms) AS latency_ms
-        FROM unifi_gateway_metrics
-        WHERE time > NOW() - INTERVAL '{sql_interval}'
-        GROUP BY bucket
-        ORDER BY bucket ASC
-        """
-    )
+    if graph_settings is None:
+        graph_settings = await _read_overview_graph_settings(conn)
 
-    # Fallback: aggregate SNMP traffic across all non-loopback interfaces
-    if not wan_history:
-        clean_avg_in = _clean_bps_sql("avg_in_bps")
-        clean_avg_out = _clean_bps_sql("avg_out_bps")
-        clean_raw_in = _clean_bps_sql("in_bps")
-        clean_raw_out = _clean_bps_sql("out_bps")
-        if rk in ("7d", "1m"):
-            if rk == "7d":
-                wan_history = await conn.fetch(
-                    f"""
-                    SELECT bucket,
-                           SUM({clean_avg_in}) AS rx_bps,
-                           SUM({clean_avg_out}) AS tx_bps,
-                           0.0 AS latency_ms
-                    FROM snmp_metrics_hourly
-                    WHERE bucket > NOW() - INTERVAL '7 days'
-                      AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
-                    GROUP BY bucket
-                    ORDER BY bucket ASC
-                    """
-                )
+    selections = graph_settings.get("selections") or []
+    use_custom = graph_settings.get("mode") == "custom" and bool(selections)
+    clean_avg_in = _clean_bps_sql("avg_in_bps")
+    clean_avg_out = _clean_bps_sql("avg_out_bps")
+    clean_raw_in = _clean_bps_sql("in_bps")
+    clean_raw_out = _clean_bps_sql("out_bps")
+
+    wan_history = []
+    if use_custom:
+        all_if_ips: List[str] = []
+        spec_ips: List[str] = []
+        spec_indices: List[int] = []
+        for s in selections:
+            ip = str(s.get("device_ip") or "").strip()
+            if not ip:
+                continue
+            idxs = [int(i) for i in (s.get("if_indices") or []) if int(i) > 0]
+            if not idxs:
+                all_if_ips.append(ip)
             else:
-                wan_history = await conn.fetch(
-                    f"""
-                    SELECT bucket,
-                           SUM(if_rx) AS rx_bps,
-                           SUM(if_tx) AS tx_bps,
-                           0.0 AS latency_ms
-                    FROM (
-                        SELECT time_bucket('4 hours', bucket) AS bucket,
-                               device_ip,
-                               if_index,
-                               AVG({clean_avg_in}) AS if_rx,
-                               AVG({clean_avg_out}) AS if_tx
-                        FROM snmp_metrics_hourly
-                        WHERE bucket > NOW() - INTERVAL '30 days'
-                          AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
-                        GROUP BY 1, device_ip, if_index
-                    ) sub
-                    GROUP BY bucket
-                    ORDER BY bucket ASC
-                    """
-                )
+                for idx in idxs:
+                    spec_ips.append(ip)
+                    spec_indices.append(idx)
+
+        custom_where = """
+            (
+                (device_ip = ANY($1::text[]) AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0'))
+                OR (device_ip, if_index) IN (SELECT * FROM unnest($2::text[], $3::int[]))
+            )
+        """
+
+        if rk == "7d":
+            wan_history = await conn.fetch(
+                f"""
+                SELECT bucket,
+                       SUM({clean_avg_in}) AS rx_bps,
+                       SUM({clean_avg_out}) AS tx_bps,
+                       0.0 AS latency_ms
+                FROM snmp_metrics_hourly
+                WHERE bucket > NOW() - INTERVAL '7 days'
+                  AND {custom_where}
+                GROUP BY bucket
+                ORDER BY bucket ASC
+                """,
+                all_if_ips,
+                spec_ips,
+                spec_indices,
+            )
+        elif rk == "1m":
+            wan_history = await conn.fetch(
+                f"""
+                SELECT bucket,
+                       SUM(if_rx) AS rx_bps,
+                       SUM(if_tx) AS tx_bps,
+                       0.0 AS latency_ms
+                FROM (
+                    SELECT time_bucket('4 hours', bucket) AS bucket,
+                           device_ip,
+                           if_index,
+                           AVG({clean_avg_in}) AS if_rx,
+                           AVG({clean_avg_out}) AS if_tx
+                    FROM snmp_metrics_hourly
+                    WHERE bucket > NOW() - INTERVAL '30 days'
+                      AND {custom_where}
+                    GROUP BY 1, device_ip, if_index
+                ) sub
+                GROUP BY bucket
+                ORDER BY bucket ASC
+                """,
+                all_if_ips,
+                spec_ips,
+                spec_indices,
+            )
 
         if not wan_history:
             wan_history = await conn.fetch(
@@ -1807,13 +2210,92 @@ async def _query_overview_traffic_series(
                            AVG({clean_raw_out}) AS if_tx
                     FROM snmp_metrics_raw
                     WHERE time > NOW() - INTERVAL '{sql_interval}'
-                      AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+                      AND {custom_where}
                     GROUP BY bucket, device_ip, if_index
                 ) sub
                 GROUP BY bucket
                 ORDER BY bucket ASC
-                """
+                """,
+                all_if_ips,
+                spec_ips,
+                spec_indices,
             )
+    else:
+        wan_history = await conn.fetch(
+            f"""
+            SELECT time_bucket('{sql_bucket}', time) AS bucket,
+                   AVG(wan_rx_bps) AS rx_bps,
+                   AVG(wan_tx_bps) AS tx_bps,
+                   AVG(wan_latency_ms) AS latency_ms
+            FROM unifi_gateway_metrics
+            WHERE time > NOW() - INTERVAL '{sql_interval}'
+            GROUP BY bucket
+            ORDER BY bucket ASC
+            """
+        )
+
+        # Fallback: aggregate SNMP traffic across all non-loopback interfaces
+        if not wan_history:
+            if rk in ("7d", "1m"):
+                if rk == "7d":
+                    wan_history = await conn.fetch(
+                        f"""
+                        SELECT bucket,
+                               SUM({clean_avg_in}) AS rx_bps,
+                               SUM({clean_avg_out}) AS tx_bps,
+                               0.0 AS latency_ms
+                        FROM snmp_metrics_hourly
+                        WHERE bucket > NOW() - INTERVAL '7 days'
+                          AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+                        GROUP BY bucket
+                        ORDER BY bucket ASC
+                        """
+                    )
+                else:
+                    wan_history = await conn.fetch(
+                        f"""
+                        SELECT bucket,
+                               SUM(if_rx) AS rx_bps,
+                               SUM(if_tx) AS tx_bps,
+                               0.0 AS latency_ms
+                        FROM (
+                            SELECT time_bucket('4 hours', bucket) AS bucket,
+                                   device_ip,
+                                   if_index,
+                                   AVG({clean_avg_in}) AS if_rx,
+                                   AVG({clean_avg_out}) AS if_tx
+                            FROM snmp_metrics_hourly
+                            WHERE bucket > NOW() - INTERVAL '30 days'
+                              AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+                            GROUP BY 1, device_ip, if_index
+                        ) sub
+                        GROUP BY bucket
+                        ORDER BY bucket ASC
+                        """
+                    )
+
+            if not wan_history:
+                wan_history = await conn.fetch(
+                    f"""
+                    SELECT bucket,
+                           SUM(if_rx) AS rx_bps,
+                           SUM(if_tx) AS tx_bps,
+                           0.0 AS latency_ms
+                    FROM (
+                        SELECT time_bucket('{sql_bucket}', time) AS bucket,
+                               device_ip,
+                               if_index,
+                               AVG({clean_raw_in}) AS if_rx,
+                               AVG({clean_raw_out}) AS if_tx
+                        FROM snmp_metrics_raw
+                        WHERE time > NOW() - INTERVAL '{sql_interval}'
+                          AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+                        GROUP BY bucket, device_ip, if_index
+                    ) sub
+                    GROUP BY bucket
+                    ORDER BY bucket ASC
+                    """
+                )
 
     series = [
         {
@@ -1829,7 +2311,7 @@ async def _query_overview_traffic_series(
 
 @app.get("/api/overview")
 async def get_pulse_overview(
-    range_key: str = Query(default="1h", alias="range"),
+    range_key: str = Query(default="1d", alias="range"),
 ) -> Dict[str, Any]:
     pool = _get_pool()
     async with pool.acquire() as conn:
@@ -1846,7 +2328,13 @@ async def get_pulse_overview(
             """
         )
 
-        wan_series, normalized_range = await _query_overview_traffic_series(conn, range_key)
+        overview_graph_settings = await _read_overview_graph_settings(conn)
+        wan_series, normalized_range = await _query_overview_traffic_series(
+            conn, range_key, graph_settings=overview_graph_settings
+        )
+        overview_graph_source = await _describe_overview_graph_source(
+            conn, overview_graph_settings, bool(gw_row)
+        )
         isp_settings = await _read_isp_settings(conn)
 
         unifi_devs = await conn.fetch(
@@ -1913,6 +2401,8 @@ async def get_pulse_overview(
         "wan_series": wan_series,
         "series_range": normalized_range,
         "isp_settings": isp_settings,
+        "overview_graph_settings": overview_graph_settings,
+        "overview_graph_source": overview_graph_source,
         "live_series": await _read_live_traffic_series(120),
         "unifi_devices": devices_list,
         "snmp_devices": snmp_list,
@@ -1930,12 +2420,26 @@ async def get_overview_live_series(
 
 @app.get("/api/overview/traffic")
 async def get_overview_traffic(
-    range_key: str = Query(default="1h", alias="range"),
+    range_key: str = Query(default="1d", alias="range"),
 ) -> Dict[str, Any]:
     pool = _get_pool()
     async with pool.acquire() as conn:
-        series, norm_range = await _query_overview_traffic_series(conn, range_key)
-    return {"range": norm_range, "series": series}
+        overview_graph_settings = await _read_overview_graph_settings(conn)
+        has_gw = bool(
+            await conn.fetchval("SELECT 1 FROM unifi_gateway_metrics LIMIT 1")
+        )
+        series, norm_range = await _query_overview_traffic_series(
+            conn, range_key, graph_settings=overview_graph_settings
+        )
+        overview_graph_source = await _describe_overview_graph_source(
+            conn, overview_graph_settings, has_gw
+        )
+    return {
+        "range": norm_range,
+        "series": series,
+        "overview_graph_settings": overview_graph_settings,
+        "overview_graph_source": overview_graph_source,
+    }
 
 
 @app.get("/api/snmp/interfaces")
