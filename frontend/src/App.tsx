@@ -8,6 +8,7 @@ import {
   ArrowUpDown,
   ArrowUpRight,
   Check,
+  ChevronDown,
   Clock,
   Cpu,
   Database,
@@ -17,6 +18,7 @@ import {
   EyeOff,
   HardDrive,
   KeyRound,
+  Menu,
   Monitor,
   Network,
   Play,
@@ -1055,6 +1057,7 @@ const DualAreaSparkChart: React.FC<{
 
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<TabKey>("pulse");
+  const [navMenuOpen, setNavMenuOpen] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [settingsFeedback, setSettingsFeedback] = useState<{
     type: "ok" | "err";
@@ -2004,6 +2007,15 @@ export const App: React.FC = () => {
   ]);
 
   useEffect(() => {
+    if (!navMenuOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setNavMenuOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [navMenuOpen]);
+
+  useEffect(() => {
     fetchUpdateProgress().then((p) => {
       if (!p) return;
       if (p.status === "updating") {
@@ -2286,36 +2298,85 @@ export const App: React.FC = () => {
       return deviceSortKey === "status" ? ipCmp * dir : ipCmp;
     });
 
+  const primaryTabs: Array<{
+    id: Exclude<TabKey, "settings">;
+    label: string;
+    icon: React.ComponentType<{ className?: string }>;
+  }> = [
+    { id: "pulse", label: "Overview", icon: Activity },
+    { id: "devices", label: `Devices (${allDevices.length})`, icon: Monitor },
+    { id: "snmp", label: "SNMP Trends & Ports", icon: Server },
+    { id: "scanner", label: "Subnet Scanner Matrix", icon: Network },
+    { id: "syslog", label: "Live Syslog Stream", icon: Terminal },
+    { id: "targets", label: "Targets & SNMP", icon: KeyRound },
+  ];
+
+  const activeNavMeta =
+    activeTab === "settings"
+      ? { label: "Settings", icon: Settings }
+      : primaryTabs.find((t) => t.id === activeTab) || primaryTabs[0];
+  const ActiveNavIcon = activeNavMeta.icon;
+
+  const handleGoHome = () => {
+    setSelectedDeviceDetailIp(null);
+    setActiveTab("pulse");
+    setNavMenuOpen(false);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const handleSelectNavTab = (tabId: Exclude<TabKey, "settings">) => {
+    if (tabId === "devices") setSelectedDeviceDetailIp(null);
+    setActiveTab(tabId);
+    setNavMenuOpen(false);
+  };
+
   return (
     <div className="min-h-screen bg-[#090D16] text-slate-100">
-      {/* Top Navigation Bar */}
+      {/* Top Bar & Sub-Header Collapsible Navigation */}
       <header className="sticky top-0 z-30 border-b border-slate-800/90 bg-[#090D16]/95 backdrop-blur-md">
-        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-x-4 gap-y-2.5 px-4 py-3 sm:px-6 xl:flex-nowrap">
-          <div className="order-1 flex shrink-0 items-center gap-3">
-            <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-emerald-500/30 bg-emerald-500/10 text-emerald-400">
+        <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-4 py-3 sm:px-6">
+          <div className="flex min-w-0 items-center gap-3">
+            <button
+              type="button"
+              onClick={handleGoHome}
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 transition hover:border-emerald-400/60 hover:bg-emerald-500/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/70"
+              title="Go to Overview"
+              aria-label="NetDash Overview"
+            >
               <Activity className="h-5 w-5" />
-            </div>
-            <div>
+            </button>
+            <div className="min-w-0">
               <div className="flex items-center gap-2">
-                <h1 className="text-base font-semibold tracking-tight text-white">NetDash</h1>
-                <span className="rounded border border-slate-700 bg-slate-800/80 px-1.5 py-0.5 font-mono-tabular text-[11px] text-slate-300">
+                <h1 className="text-base font-semibold tracking-tight text-white">
+                  <button
+                    type="button"
+                    onClick={handleGoHome}
+                    className="cursor-pointer rounded-sm text-left transition hover:text-emerald-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/70"
+                    title="Return to Overview"
+                  >
+                    NetDash
+                  </button>
+                </h1>
+                <span className="shrink-0 rounded border border-slate-700 bg-slate-800/80 px-1.5 py-0.5 font-mono-tabular text-[11px] text-slate-300">
                   {updateInfo?.current_version ||
                     serverInfo?.server?.git?.current_version ||
                     updateInfo?.current_sha ||
                     "v1.2"}
                 </span>
               </div>
-              <p className="hidden text-xs text-slate-400 2xl:block">
+              <p className="hidden truncate text-xs text-slate-400 md:block">
                 Network Observability • Devices • SNMP • Nmap • Syslog
               </p>
             </div>
           </div>
 
           {/* Right Status & Settings Controls (always locked to top-right corner) */}
-          <div className="order-2 flex shrink-0 items-center gap-2 xl:order-3">
+          <div className="flex shrink-0 items-center gap-2">
             <button
+              type="button"
               onClick={() => {
                 setActiveTab("settings");
+                setNavMenuOpen(false);
                 fetchServerInfo(false);
               }}
               className={`relative flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition ${
@@ -2353,49 +2414,106 @@ export const App: React.FC = () => {
               </span>
             </div>
           </div>
+        </div>
 
-          {/* Primary View Switcher (Single-row clean horizontal rail that slides cleanly under brand at <xl) */}
-          <nav
-            aria-label="Primary Navigation"
-            className="order-3 w-full xl:order-2 xl:w-auto xl:min-w-0"
-          >
-            <div className="no-scrollbar flex flex-nowrap items-center gap-1 overflow-x-auto scroll-smooth rounded-lg border border-slate-800 bg-[#111827] p-1 md:justify-between xl:justify-center">
-              {[
-                { id: "pulse", label: "Overview", icon: Activity },
-                { id: "devices", label: `Devices (${allDevices.length})`, icon: Monitor },
-                { id: "snmp", label: "SNMP Trends & Ports", icon: Server },
-                { id: "scanner", label: "Subnet Scanner Matrix", icon: Network },
-                { id: "syslog", label: "Live Syslog Stream", icon: Terminal },
-                { id: "targets", label: "Targets & SNMP", icon: KeyRound },
-              ].map((tab) => {
+        {/* Sub-Header Navigation Row: Separated bordered tabs on desktop, collapsible menu on narrower screens */}
+        <nav
+          aria-label="Primary Navigation"
+          className="border-t border-slate-800/80 bg-[#0B101B]/95"
+        >
+          <div className="mx-auto max-w-7xl px-4 py-2 sm:px-6">
+            {/* Desktop: Separated non-scrolling button bar */}
+            <div className="hidden lg:flex lg:flex-wrap lg:items-center lg:gap-2">
+              {primaryTabs.map((tab) => {
                 const Icon = tab.icon;
                 const active = activeTab === tab.id;
                 return (
                   <button
                     key={tab.id}
-                    onClick={(e) => {
-                      if (tab.id === "devices") setSelectedDeviceDetailIp(null);
-                      setActiveTab(tab.id as TabKey);
-                      e.currentTarget.scrollIntoView({
-                        behavior: "smooth",
-                        inline: "center",
-                        block: "nearest",
-                      });
-                    }}
-                    className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-medium transition-all duration-200 ease-out ${
+                    type="button"
+                    onClick={() => handleSelectNavTab(tab.id)}
+                    aria-current={active ? "page" : undefined}
+                    className={`flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-medium transition-all duration-150 ${
                       active
-                        ? "bg-slate-800 text-white shadow-xs ring-1 ring-slate-700/80"
-                        : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-200"
+                        ? "border-emerald-500/40 bg-slate-800/90 text-white shadow-xs"
+                        : "border-slate-800 bg-[#111827] text-slate-400 hover:border-slate-700 hover:bg-slate-800/60 hover:text-slate-200"
                     }`}
                   >
-                    <Icon className="h-3.5 w-3.5 shrink-0" />
+                    <Icon
+                      className={`h-3.5 w-3.5 shrink-0 ${
+                        active ? "text-emerald-400" : "text-slate-500"
+                      }`}
+                    />
                     <span>{tab.label}</span>
                   </button>
                 );
               })}
             </div>
-          </nav>
-        </div>
+
+            {/* Resized / Compact Screens: Collapsible navigation trigger & grid */}
+            <div className="lg:hidden">
+              <button
+                type="button"
+                onClick={() => setNavMenuOpen((prev) => !prev)}
+                aria-expanded={navMenuOpen}
+                aria-controls="netdash-collapsible-nav"
+                className="flex w-full items-center justify-between rounded-lg border border-slate-800 bg-[#111827] px-3 py-2 text-xs font-medium text-slate-200 transition hover:border-slate-700 hover:bg-slate-800/70"
+              >
+                <span className="flex items-center gap-2">
+                  <ActiveNavIcon className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                  <span>{activeNavMeta.label}</span>
+                </span>
+                <span className="flex items-center gap-1.5 text-slate-400">
+                  <Menu className="h-3.5 w-3.5" />
+                  <span>{navMenuOpen ? "Hide Menu" : "Navigation"}</span>
+                  <ChevronDown
+                    className={`h-3.5 w-3.5 transition-transform duration-200 ${
+                      navMenuOpen ? "rotate-180" : ""
+                    }`}
+                  />
+                </span>
+              </button>
+
+              <div
+                id="netdash-collapsible-nav"
+                aria-hidden={!navMenuOpen}
+                className={`grid transition-all duration-200 ease-out ${
+                  navMenuOpen ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"
+                }`}
+              >
+                <div className="overflow-hidden">
+                  <div className="grid grid-cols-1 gap-2 pt-2 sm:grid-cols-2 md:grid-cols-3">
+                    {primaryTabs.map((tab) => {
+                      const Icon = tab.icon;
+                      const active = activeTab === tab.id;
+                      return (
+                        <button
+                          key={tab.id}
+                          type="button"
+                          tabIndex={navMenuOpen ? 0 : -1}
+                          onClick={() => handleSelectNavTab(tab.id)}
+                          aria-current={active ? "page" : undefined}
+                          className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-left text-xs font-medium transition-all duration-150 ${
+                            active
+                              ? "border-emerald-500/40 bg-slate-800/90 text-white shadow-xs"
+                              : "border-slate-800 bg-[#111827] text-slate-400 hover:border-slate-700 hover:bg-slate-800/60 hover:text-slate-200"
+                          }`}
+                        >
+                          <Icon
+                            className={`h-3.5 w-3.5 shrink-0 ${
+                              active ? "text-emerald-400" : "text-slate-500"
+                            }`}
+                          />
+                          <span className="truncate">{tab.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </nav>
       </header>
 
       {/* First-Time Onboarding Modal Prompt (Skippable) */}

@@ -16,12 +16,3 @@ dialog::backdrop {
   background: rgba(9, 13, 22, 0.8);
   backdrop-filter: blur(4px);
 }
-
-.no-scrollbar {
-  scrollbar-width: none;
-  -ms-overflow-style: none;
-}
-
-.no-scrollbar::-webkit-scrollbar {
-  display: none;
-}
