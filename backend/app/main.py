@@ -1705,6 +1705,16 @@ async def delete_unifi_controller(ctrl_id: int) -> Dict[str, Any]:
 # ==============================================================================
 
 
+def _clean_bps_sql(col: str, coalesce_zero: bool = False) -> str:
+    """SQL expression that masks physically impossible SNMP throughput counter spikes."""
+    expr = (
+        f"CASE WHEN (COALESCE(if_speed_bps, 0) > 0 "
+        f"AND {col} > GREATEST(if_speed_bps * 1.25, 100000000.0)) "
+        f"OR {col} > 40000000000.0 THEN NULL ELSE {col} END"
+    )
+    return f"COALESCE({expr}, 0)" if coalesce_zero else expr
+
+
 async def _query_overview_traffic_series(
     conn: asyncpg.Connection, range_key: str = "1h"
 ) -> tuple[List[Dict[str, Any]], str]:
@@ -1740,13 +1750,17 @@ async def _query_overview_traffic_series(
 
     # Fallback: aggregate SNMP traffic across all non-loopback interfaces
     if not wan_history:
+        clean_avg_in = _clean_bps_sql("avg_in_bps")
+        clean_avg_out = _clean_bps_sql("avg_out_bps")
+        clean_raw_in = _clean_bps_sql("in_bps")
+        clean_raw_out = _clean_bps_sql("out_bps")
         if rk in ("7d", "1m"):
             if rk == "7d":
                 wan_history = await conn.fetch(
-                    """
+                    f"""
                     SELECT bucket,
-                           SUM(avg_in_bps) AS rx_bps,
-                           SUM(avg_out_bps) AS tx_bps,
+                           SUM({clean_avg_in}) AS rx_bps,
+                           SUM({clean_avg_out}) AS tx_bps,
                            0.0 AS latency_ms
                     FROM snmp_metrics_hourly
                     WHERE bucket > NOW() - INTERVAL '7 days'
@@ -1757,7 +1771,7 @@ async def _query_overview_traffic_series(
                 )
             else:
                 wan_history = await conn.fetch(
-                    """
+                    f"""
                     SELECT bucket,
                            SUM(if_rx) AS rx_bps,
                            SUM(if_tx) AS tx_bps,
@@ -1766,8 +1780,8 @@ async def _query_overview_traffic_series(
                         SELECT time_bucket('4 hours', bucket) AS bucket,
                                device_ip,
                                if_index,
-                               AVG(avg_in_bps) AS if_rx,
-                               AVG(avg_out_bps) AS if_tx
+                               AVG({clean_avg_in}) AS if_rx,
+                               AVG({clean_avg_out}) AS if_tx
                         FROM snmp_metrics_hourly
                         WHERE bucket > NOW() - INTERVAL '30 days'
                           AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
@@ -1789,8 +1803,8 @@ async def _query_overview_traffic_series(
                     SELECT time_bucket('{sql_bucket}', time) AS bucket,
                            device_ip,
                            if_index,
-                           AVG(in_bps) AS if_rx,
-                           AVG(out_bps) AS if_tx
+                           AVG({clean_raw_in}) AS if_rx,
+                           AVG({clean_raw_out}) AS if_tx
                     FROM snmp_metrics_raw
                     WHERE time > NOW() - INTERVAL '{sql_interval}'
                       AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
@@ -1984,6 +1998,17 @@ async def get_snmp_trends(
     }
 
     async with pool.acquire() as conn:
+        c_in_raw = _clean_bps_sql("in_bps")
+        c_out_raw = _clean_bps_sql("out_bps")
+        c_in_raw_z = _clean_bps_sql("in_bps", coalesce_zero=True)
+        c_out_raw_z = _clean_bps_sql("out_bps", coalesce_zero=True)
+        c_avg_in = _clean_bps_sql("avg_in_bps")
+        c_max_in = _clean_bps_sql("max_in_bps")
+        c_p95_in = _clean_bps_sql("p95_in_bps")
+        c_avg_out = _clean_bps_sql("avg_out_bps")
+        c_max_out = _clean_bps_sql("max_out_bps")
+        c_p95_out = _clean_bps_sql("p95_out_bps")
+
         if if_index <= 0:
             # All Ports / Interfaces Combined Traffic Overview for this device
             if rk in ("1h", "6h", "24h"):
@@ -2001,10 +2026,10 @@ async def get_snmp_trends(
                     FROM (
                         SELECT time_bucket('1 minute', time) AS bucket,
                                if_index,
-                               AVG(in_bps) AS if_avg_in,
-                               MAX(in_bps) AS if_max_in,
-                               AVG(out_bps) AS if_avg_out,
-                               MAX(out_bps) AS if_max_out,
+                               AVG({c_in_raw}) AS if_avg_in,
+                               MAX({c_in_raw}) AS if_max_in,
+                               AVG({c_out_raw}) AS if_avg_out,
+                               MAX({c_out_raw}) AS if_max_out,
                                AVG(cpu_usage) AS if_cpu
                         FROM snmp_metrics_raw
                         WHERE device_ip = $1
@@ -2023,12 +2048,12 @@ async def get_snmp_trends(
                 rows = await conn.fetch(
                     f"""
                     SELECT bucket,
-                           SUM(avg_in_bps) AS avg_in_bps,
-                           SUM(max_in_bps) AS max_in_bps,
-                           SUM(p95_in_bps) AS p95_in_bps,
-                           SUM(avg_out_bps) AS avg_out_bps,
-                           SUM(max_out_bps) AS max_out_bps,
-                           SUM(p95_out_bps) AS p95_out_bps,
+                           SUM({c_avg_in}) AS avg_in_bps,
+                           SUM({c_max_in}) AS max_in_bps,
+                           SUM({c_p95_in}) AS p95_in_bps,
+                           SUM({c_avg_out}) AS avg_out_bps,
+                           SUM({c_max_out}) AS max_out_bps,
+                           SUM({c_p95_out}) AS p95_out_bps,
                            AVG(avg_cpu_usage) AS avg_cpu_usage
                     FROM snmp_metrics_hourly
                     WHERE device_ip = $1
@@ -2045,12 +2070,12 @@ async def get_snmp_trends(
                 rows = await conn.fetch(
                     f"""
                     SELECT bucket,
-                           SUM(avg_in_bps) AS avg_in_bps,
-                           SUM(max_in_bps) AS max_in_bps,
-                           SUM(p95_in_bps) AS p95_in_bps,
-                           SUM(avg_out_bps) AS avg_out_bps,
-                           SUM(max_out_bps) AS max_out_bps,
-                           SUM(p95_out_bps) AS p95_out_bps,
+                           SUM({c_avg_in}) AS avg_in_bps,
+                           SUM({c_max_in}) AS max_in_bps,
+                           SUM({c_p95_in}) AS p95_in_bps,
+                           SUM({c_avg_out}) AS avg_out_bps,
+                           SUM({c_max_out}) AS max_out_bps,
+                           SUM({c_p95_out}) AS p95_out_bps,
                            AVG(avg_cpu_usage) AS avg_cpu_usage
                     FROM snmp_metrics_daily
                     WHERE device_ip = $1
@@ -2063,17 +2088,24 @@ async def get_snmp_trends(
                 )
                 source_table = "snmp_metrics_daily (All Interfaces Combined)"
         else:
+            c_avg_in_z = _clean_bps_sql("avg_in_bps", coalesce_zero=True)
+            c_max_in_z = _clean_bps_sql("max_in_bps", coalesce_zero=True)
+            c_p95_in_z = _clean_bps_sql("p95_in_bps", coalesce_zero=True)
+            c_avg_out_z = _clean_bps_sql("avg_out_bps", coalesce_zero=True)
+            c_max_out_z = _clean_bps_sql("max_out_bps", coalesce_zero=True)
+            c_p95_out_z = _clean_bps_sql("p95_out_bps", coalesce_zero=True)
+
             if rk in ("1h", "6h", "24h"):
                 sql_interval = interval_map[rk]
                 rows = await conn.fetch(
                     f"""
                     SELECT time AS bucket,
-                           in_bps AS avg_in_bps,
-                           in_bps AS max_in_bps,
-                           in_bps AS p95_in_bps,
-                           out_bps AS avg_out_bps,
-                           out_bps AS max_out_bps,
-                           out_bps AS p95_out_bps,
+                           {c_in_raw_z} AS avg_in_bps,
+                           {c_in_raw_z} AS max_in_bps,
+                           {c_in_raw_z} AS p95_in_bps,
+                           {c_out_raw_z} AS avg_out_bps,
+                           {c_out_raw_z} AS max_out_bps,
+                           {c_out_raw_z} AS p95_out_bps,
                            cpu_usage AS avg_cpu_usage
                     FROM snmp_metrics_raw
                     WHERE device_ip = $1
@@ -2090,12 +2122,12 @@ async def get_snmp_trends(
                 rows = await conn.fetch(
                     f"""
                     SELECT bucket,
-                           avg_in_bps,
-                           max_in_bps,
-                           p95_in_bps,
-                           avg_out_bps,
-                           max_out_bps,
-                           p95_out_bps,
+                           {c_avg_in_z} AS avg_in_bps,
+                           {c_max_in_z} AS max_in_bps,
+                           {c_p95_in_z} AS p95_in_bps,
+                           {c_avg_out_z} AS avg_out_bps,
+                           {c_max_out_z} AS max_out_bps,
+                           {c_p95_out_z} AS p95_out_bps,
                            avg_cpu_usage
                     FROM snmp_metrics_hourly
                     WHERE device_ip = $1
@@ -2112,12 +2144,12 @@ async def get_snmp_trends(
                 rows = await conn.fetch(
                     f"""
                     SELECT bucket,
-                           avg_in_bps,
-                           max_in_bps,
-                           p95_in_bps,
-                           avg_out_bps,
-                           max_out_bps,
-                           p95_out_bps,
+                           {c_avg_in_z} AS avg_in_bps,
+                           {c_max_in_z} AS max_in_bps,
+                           {c_p95_in_z} AS p95_in_bps,
+                           {c_avg_out_z} AS avg_out_bps,
+                           {c_max_out_z} AS max_out_bps,
+                           {c_p95_out_z} AS p95_out_bps,
                            avg_cpu_usage
                     FROM snmp_metrics_daily
                     WHERE device_ip = $1

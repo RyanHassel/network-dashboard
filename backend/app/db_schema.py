@@ -120,3 +120,95 @@ async def ensure_dynamic_config_tables(pool: asyncpg.Pool) -> None:
                 ON CONFLICT (name) DO NOTHING
                 """
             )
+
+    await repair_implausible_snmp_spikes(pool)
+
+
+async def repair_implausible_snmp_spikes(pool: asyncpg.Pool) -> None:
+    """Zeros out historical SNMP counter-drop spike artifacts on recent uncompressed chunks."""
+    try:
+        async with pool.acquire() as conn:
+            marker_exists = bool(
+                await conn.fetchval(
+                    "SELECT 1 FROM app_settings WHERE key = 'snmp_spike_cleanup_v1'"
+                )
+            )
+            status = await conn.execute(
+                """
+                WITH dev_caps AS (
+                    SELECT device_ip,
+                           LEAST(
+                               GREATEST(COALESCE(MAX(if_speed_bps), 0) * 1.25, 10000000000.0),
+                               40000000000.0
+                           ) AS dev_max_bps
+                    FROM snmp_metrics_raw
+                    WHERE time > NOW() - INTERVAL '6 days'
+                    GROUP BY device_ip
+                ),
+                flagged AS (
+                    SELECT r.time,
+                           r.device_ip,
+                           r.if_index,
+                           (
+                               (COALESCE(r.if_speed_bps, 0) > 0 AND r.in_bps > GREATEST(r.if_speed_bps * 1.25, 100000000.0))
+                               OR r.in_bps > dc.dev_max_bps
+                               OR (r.prev_in_oct = 0 AND r.in_bps > 500000000.0)
+                           ) AS bad_in,
+                           (
+                               (COALESCE(r.if_speed_bps, 0) > 0 AND r.out_bps > GREATEST(r.if_speed_bps * 1.25, 100000000.0))
+                               OR r.out_bps > dc.dev_max_bps
+                               OR (r.prev_out_oct = 0 AND r.out_bps > 500000000.0)
+                           ) AS bad_out
+                    FROM (
+                        SELECT time,
+                               device_ip,
+                               if_index,
+                               if_speed_bps,
+                               in_bps,
+                               out_bps,
+                               LAG(in_octets) OVER (PARTITION BY device_ip, if_index ORDER BY time ASC) AS prev_in_oct,
+                               LAG(out_octets) OVER (PARTITION BY device_ip, if_index ORDER BY time ASC) AS prev_out_oct
+                        FROM snmp_metrics_raw
+                        WHERE time > NOW() - INTERVAL '6 days'
+                    ) r
+                    JOIN dev_caps dc ON dc.device_ip = r.device_ip
+                )
+                UPDATE snmp_metrics_raw t
+                SET in_bps = CASE WHEN f.bad_in THEN 0 ELSE t.in_bps END,
+                    out_bps = CASE WHEN f.bad_out THEN 0 ELSE t.out_bps END
+                FROM flagged f
+                WHERE t.time = f.time
+                  AND t.device_ip = f.device_ip
+                  AND t.if_index = f.if_index
+                  AND (f.bad_in OR f.bad_out)
+                """
+            )
+            updated_rows = 0
+            if isinstance(status, str) and status.startswith("UPDATE "):
+                try:
+                    updated_rows = int(status.split()[-1])
+                except ValueError:
+                    updated_rows = 0
+
+            if updated_rows > 0:
+                logger.info("Repaired %d implausible SNMP spike row(s) in snmp_metrics_raw.", updated_rows)
+
+            if updated_rows > 0 or not marker_exists:
+                for view_name in ("snmp_metrics_hourly", "snmp_metrics_daily"):
+                    try:
+                        await conn.execute(
+                            f"CALL refresh_continuous_aggregate('{view_name}', NOW() - INTERVAL '7 days', NOW())"
+                        )
+                    except Exception as exc:
+                        logger.debug("Skipping refresh of %s during spike cleanup: %s", view_name, exc)
+
+                await conn.execute(
+                    """
+                    INSERT INTO app_settings (key, value)
+                    VALUES ('snmp_spike_cleanup_v1', $1::jsonb)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                    """,
+                    json.dumps({"repaired_rows": updated_rows}),
+                )
+    except Exception as exc:
+        logger.warning("SNMP spike cleanup skipped: %s", exc)

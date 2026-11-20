@@ -71,6 +71,29 @@ def _to_int(val: Optional[str], default: int = 0) -> int:
         return default
 
 
+def _compute_safe_rate_bps(
+    delta_octets: int,
+    dt: float,
+    speed_bps: int,
+    prev_octets: int,
+    max_fallback_bps: float = 40_000_000_000.0,
+    min_dt: float = 1.0,
+) -> float:
+    """Computes validated interface bps from an octet counter delta, rejecting spike artifacts."""
+    if delta_octets <= 0 or dt < min_dt:
+        return 0.0
+    rate_bps = (delta_octets * 8.0) / dt
+    # Guard against cumulative lifetime octets jumping from a 0 baseline
+    if prev_octets == 0 and rate_bps > 1_000_000_000.0:
+        logger.debug("Ignoring implausible zero-baseline SNMP rate jump: %.2f bps", rate_bps)
+        return 0.0
+    max_bps = max(speed_bps * 1.25, 100_000_000.0) if speed_bps > 0 else max_fallback_bps
+    if rate_bps > max_bps:
+        logger.debug("Ignoring implausible SNMP rate %.2f bps > ceiling %.2f bps", rate_bps, max_bps)
+        return 0.0
+    return round(rate_bps, 2)
+
+
 def _parse_timeticks(raw: Optional[str]) -> int:
     """Parses Net-SNMP numeric ticks, Timeticks: (N), D:H:MM:SS.cc, or H:MM:SS.cc into centiseconds."""
     if not raw:
@@ -356,9 +379,11 @@ class SNMPPoller:
         self.default_community = os.getenv("SNMP_COMMUNITY", "public").strip() or "public"
         self.default_port = int(os.getenv("SNMP_PORT", "161") or 161)
         # Isolated in-memory state for 2s live streaming (never shares Redis snmp:prev:* with 60s polls)
-        self._live_prev_counters: Dict[Tuple[str, int], Tuple[float, int, int]] = {}
+        self._live_prev_counters: Dict[Tuple[str, int], Dict[str, Any]] = {}
         self._live_device_rates: Dict[str, Tuple[float, float, float]] = {}
         self._live_ignore_indices: Dict[str, Set[int]] = {}
+        self._live_if_speeds: Dict[Tuple[str, int], int] = {}
+        self._live_dev_max_speed: Dict[str, float] = {}
 
     @staticmethod
     def _build_auth_args(profile: Dict[str, Any]) -> List[str]:
@@ -1075,11 +1100,14 @@ class SNMPPoller:
         )
 
         # Fallback to 32-bit IF-MIB counters when 64-bit HC counters are unavailable
+        used_counter_bits = 64
         if not hc_in and not hc_out:
             hc_in, hc_out = await asyncio.gather(
                 self._snmp_walk_oid(target, port, auth_args, OID_IF_IN_OCTETS, sem=dev_sem),
                 self._snmp_walk_oid(target, port, auth_args, OID_IF_OUT_OCTETS, sem=dev_sem),
             )
+            if hc_in or hc_out:
+                used_counter_bits = 32
 
         hr_uptime_ticks = int(enrichment.get("hr_uptime_ticks") or 0)
         ubnt_uptime_ticks = int(enrichment.get("ubnt_uptime_ticks") or 0)
@@ -1148,6 +1176,20 @@ class SNMPPoller:
             {int(k) for k in set(if_names.keys()) | set(if_descrs.keys()) if k.isdigit()}
         )
 
+        if_speed_map: Dict[int, int] = {}
+        for idx in all_indices:
+            k = str(idx)
+            high_speed_mbps = _to_int(if_speeds.get(k), 0)
+            if_speed_map[idx] = (
+                high_speed_mbps * 1_000_000 if high_speed_mbps > 0 else _to_int(if_speed32.get(k), 0)
+            )
+        max_device_speed_bps = max(if_speed_map.values(), default=0)
+        fallback_cap_bps = min(
+            max(max_device_speed_bps * 1.25, 10_000_000_000.0),
+            100_000_000_000.0,
+        )
+        self._live_dev_max_speed[target] = fallback_cap_bps
+
         rows_to_insert: List[Tuple[Any, ...]] = []
         loopback_indices: Set[int] = set()
         for idx in all_indices:
@@ -1157,14 +1199,16 @@ class SNMPPoller:
                 loopback_indices.add(idx)
             descr = if_descrs.get(k) or name
             alias = if_aliases.get(k, "")
-            high_speed_mbps = _to_int(if_speeds.get(k), 0)
-            speed_bps = high_speed_mbps * 1_000_000 if high_speed_mbps > 0 else _to_int(if_speed32.get(k), 0)
+            speed_bps = if_speed_map.get(idx, 0)
+            self._live_if_speeds[(target, idx)] = speed_bps
 
             oper_raw = (if_oper.get(k) or "1").strip()
             oper_status = 1 if (_to_int(oper_raw, 2) == 1 or oper_raw.lower().startswith("up")) else 2
 
-            in_oct = _to_int(hc_in.get(k), 0)
-            out_oct = _to_int(hc_out.get(k), 0)
+            has_in = k in hc_in
+            has_out = k in hc_out
+            in_oct = _to_int(hc_in.get(k), 0) if has_in else 0
+            out_oct = _to_int(hc_out.get(k), 0) if has_out else 0
             in_err = _to_int(in_errs.get(k), 0)
             out_err = _to_int(out_errs.get(k), 0)
             in_dsc = _to_int(in_disc.get(k), 0)
@@ -1172,27 +1216,85 @@ class SNMPPoller:
 
             redis_key = f"snmp:prev:{target}:{idx}"
             prev_raw = await redis_client.get(redis_key)
-            in_bps = 0.0
-            out_bps = 0.0
+            prev_in: Optional[int] = None
+            prev_out: Optional[int] = None
+            prev_in_ts: Optional[float] = None
+            prev_out_ts: Optional[float] = None
+            prev_bits: Optional[int] = None
+            prev_uptime: int = 0
             if prev_raw:
                 try:
                     prev = json.loads(prev_raw)
-                    dt = now_epoch - float(prev.get("ts", now_epoch))
-                    if dt > 1.0:
-                        d_in = in_oct - int(prev.get("in_oct", in_oct))
-                        d_out = out_oct - int(prev.get("out_oct", out_oct))
-                        if d_in >= 0:
-                            in_bps = round((d_in * 8.0) / dt, 2)
-                        if d_out >= 0:
-                            out_bps = round((d_out * 8.0) / dt, 2)
+                    if prev.get("in_oct") is not None:
+                        prev_in = int(prev["in_oct"])
+                    if prev.get("out_oct") is not None:
+                        prev_out = int(prev["out_oct"])
+                    raw_in_ts = prev.get("in_ts") if prev.get("in_ts") is not None else prev.get("ts")
+                    raw_out_ts = prev.get("out_ts") if prev.get("out_ts") is not None else prev.get("ts")
+                    if raw_in_ts is not None:
+                        prev_in_ts = float(raw_in_ts)
+                    if raw_out_ts is not None:
+                        prev_out_ts = float(raw_out_ts)
+                    if prev.get("counter_bits") is not None:
+                        prev_bits = int(prev["counter_bits"])
+                    prev_uptime = int(prev.get("sys_uptime") or 0)
                 except Exception:
-                    pass
+                    prev_in = None
+                    prev_out = None
+                    prev_in_ts = None
+                    prev_out_ts = None
+                    prev_bits = None
+                    prev_uptime = 0
 
-            await redis_client.set(
-                redis_key,
-                json.dumps({"ts": now_epoch, "in_oct": in_oct, "out_oct": out_oct}),
-                ex=600,
-            )
+            width_changed = prev_bits is not None and prev_bits != used_counter_bits
+            rebooted = sys_uptime > 0 and prev_uptime > 0 and sys_uptime < prev_uptime
+            reset_baseline = width_changed or rebooted
+
+            in_bps = 0.0
+            out_bps = 0.0
+            if not reset_baseline:
+                if has_in and prev_in is not None and prev_in_ts is not None:
+                    in_bps = _compute_safe_rate_bps(
+                        in_oct - prev_in,
+                        now_epoch - prev_in_ts,
+                        speed_bps,
+                        prev_in,
+                        max_fallback_bps=fallback_cap_bps,
+                        min_dt=1.0,
+                    )
+                if has_out and prev_out is not None and prev_out_ts is not None:
+                    out_bps = _compute_safe_rate_bps(
+                        out_oct - prev_out,
+                        now_epoch - prev_out_ts,
+                        speed_bps,
+                        prev_out,
+                        max_fallback_bps=fallback_cap_bps,
+                        min_dt=1.0,
+                    )
+
+            next_state: Dict[str, Any] = {
+                "counter_bits": used_counter_bits,
+                "sys_uptime": sys_uptime,
+            }
+            if has_in:
+                next_state["in_ts"] = now_epoch
+                next_state["in_oct"] = in_oct
+            elif not reset_baseline and prev_in is not None and prev_in_ts is not None:
+                next_state["in_ts"] = prev_in_ts
+                next_state["in_oct"] = prev_in
+
+            if has_out:
+                next_state["out_ts"] = now_epoch
+                next_state["out_oct"] = out_oct
+            elif not reset_baseline and prev_out is not None and prev_out_ts is not None:
+                next_state["out_ts"] = prev_out_ts
+                next_state["out_oct"] = prev_out
+
+            if "in_oct" in next_state or "out_oct" in next_state:
+                await redis_client.set(redis_key, json.dumps(next_state), ex=600)
+
+            db_in_oct = in_oct if has_in else (prev_in if prev_in is not None else 0)
+            db_out_oct = out_oct if has_out else (prev_out if prev_out is not None else 0)
 
             rows_to_insert.append(
                 (
@@ -1204,8 +1306,8 @@ class SNMPPoller:
                     alias,
                     speed_bps,
                     oper_status,
-                    in_oct,
-                    out_oct,
+                    db_in_oct,
+                    db_out_oct,
                     in_bps,
                     out_bps,
                     in_err,
@@ -1583,6 +1685,7 @@ class SNMPPoller:
             port = int(target_cfg.get("port") or self.default_port)
             auth_args = self._build_auth_args(target_cfg)
 
+            used_bits = 64
             async with sem:
                 hc_in, hc_out = await asyncio.gather(
                     self._snmp_walk_oid_fast(ip, port, auth_args, OID_IF_HC_IN_OCTETS),
@@ -1593,6 +1696,8 @@ class SNMPPoller:
                         self._snmp_walk_oid_fast(ip, port, auth_args, OID_IF_IN_OCTETS),
                         self._snmp_walk_oid_fast(ip, port, auth_args, OID_IF_OUT_OCTETS),
                     )
+                    if hc_in or hc_out:
+                        used_bits = 32
 
             if not hc_in and not hc_out:
                 return
@@ -1605,6 +1710,7 @@ class SNMPPoller:
             all_indices = sorted(
                 {int(k) for k in (set(hc_in.keys()) | set(hc_out.keys())) if k.isdigit()}
             )
+            fallback_cap = self._live_dev_max_speed.get(ip, 40_000_000_000.0)
             dev_rx = 0.0
             dev_tx = 0.0
             has_delta = False
@@ -1613,28 +1719,57 @@ class SNMPPoller:
                 if idx in ignore:
                     continue
                 k = str(idx)
-                in_oct = _to_int(hc_in.get(k), 0)
-                out_oct = _to_int(hc_out.get(k), 0)
+                has_in = k in hc_in
+                has_out = k in hc_out
+                if not has_in and not has_out:
+                    continue
+                in_oct = _to_int(hc_in.get(k), 0) if has_in else 0
+                out_oct = _to_int(hc_out.get(k), 0) if has_out else 0
+                speed_bps = self._live_if_speeds.get((ip, idx), 0)
 
                 prev = self._live_prev_counters.get((ip, idx))
-                if prev is not None:
-                    prev_ts, prev_in, prev_out = prev
-                    dt = now_epoch - prev_ts
-                    if dt >= 0.4:
-                        d_in = in_oct - prev_in
-                        d_out = out_oct - prev_out
-                        if d_in >= 0:
-                            rate_in = (d_in * 8.0) / dt
-                            if rate_in <= 100_000_000_000.0:
-                                dev_rx += rate_in
+                width_changed = prev is not None and prev.get("bits") != used_bits
+                if prev is not None and not width_changed:
+                    if has_in and prev.get("in_oct") is not None and prev.get("in_ts") is not None:
+                        prev_in_val = int(prev["in_oct"])
+                        dt_in = now_epoch - float(prev["in_ts"])
+                        if dt_in >= 0.4:
+                            rate_in = _compute_safe_rate_bps(
+                                in_oct - prev_in_val,
+                                dt_in,
+                                speed_bps,
+                                prev_in_val,
+                                max_fallback_bps=fallback_cap,
+                                min_dt=0.4,
+                            )
+                            dev_rx += rate_in
                             has_delta = True
-                        if d_out >= 0:
-                            rate_out = (d_out * 8.0) / dt
-                            if rate_out <= 100_000_000_000.0:
-                                dev_tx += rate_out
+                    if has_out and prev.get("out_oct") is not None and prev.get("out_ts") is not None:
+                        prev_out_val = int(prev["out_oct"])
+                        dt_out = now_epoch - float(prev["out_ts"])
+                        if dt_out >= 0.4:
+                            rate_out = _compute_safe_rate_bps(
+                                out_oct - prev_out_val,
+                                dt_out,
+                                speed_bps,
+                                prev_out_val,
+                                max_fallback_bps=fallback_cap,
+                                min_dt=0.4,
+                            )
+                            dev_tx += rate_out
                             has_delta = True
 
-                self._live_prev_counters[(ip, idx)] = (now_epoch, in_oct, out_oct)
+                next_live: Dict[str, Any] = (
+                    {} if (prev is None or width_changed) else dict(prev)
+                )
+                next_live["bits"] = used_bits
+                if has_in:
+                    next_live["in_ts"] = now_epoch
+                    next_live["in_oct"] = in_oct
+                if has_out:
+                    next_live["out_ts"] = now_epoch
+                    next_live["out_oct"] = out_oct
+                self._live_prev_counters[(ip, idx)] = next_live
 
             if has_delta:
                 self._live_device_rates[ip] = (now_epoch, dev_rx, dev_tx)
@@ -1648,6 +1783,12 @@ class SNMPPoller:
         stale_ips = [ip for ip in self._live_device_rates if ip not in active_ips]
         for ip in stale_ips:
             del self._live_device_rates[ip]
+        stale_spd_keys = [k for k in self._live_if_speeds if k[0] not in active_ips]
+        for k in stale_spd_keys:
+            del self._live_if_speeds[k]
+        stale_dev_spd = [ip for ip in self._live_dev_max_speed if ip not in active_ips]
+        for ip in stale_dev_spd:
+            del self._live_dev_max_speed[ip]
 
         now_agg = time.time()
         total_rx = 0.0
