@@ -1067,7 +1067,14 @@ export const App: React.FC = () => {
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [updateProgress, setUpdateProgress] = useState<UpdateProgressState | null>(null);
   const [updateMinimized, setUpdateMinimized] = useState(false);
-  const [promptDismissedSha, setPromptDismissedSha] = useState<string | null>(null);
+  const DISMISSED_UPDATE_SHA_KEY = "netdash_dismissed_update_sha";
+  const [promptDismissedSha, setPromptDismissedSha] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(DISMISSED_UPDATE_SHA_KEY);
+    } catch {
+      return null;
+    }
+  });
   const updateDialogRef = useRef<HTMLDialogElement | null>(null);
   const updateStartTimeRef = useRef<number>(0);
   const finishingUpdateRef = useRef<boolean>(false);
@@ -1194,7 +1201,21 @@ export const App: React.FC = () => {
     setTimeout(() => setSettingsFeedback(null), 5000);
   };
 
+  const persistDismissedUpdateSha = (sha: string | null) => {
+    setPromptDismissedSha(sha);
+    try {
+      if (sha) {
+        localStorage.setItem(DISMISSED_UPDATE_SHA_KEY, sha);
+      } else {
+        localStorage.removeItem(DISMISSED_UPDATE_SHA_KEY);
+      }
+    } catch {
+      // ignore storage errors
+    }
+  };
+
   const openUpdateModal = () => {
+    if (activeTab !== "settings") return;
     const dlg = updateDialogRef.current;
     if (dlg && !dlg.open) dlg.showModal();
   };
@@ -1202,7 +1223,7 @@ export const App: React.FC = () => {
   const closeUpdateModal = () => {
     const dlg = updateDialogRef.current;
     if (dlg && dlg.open) dlg.close();
-    if (updateInfo?.remote_sha) setPromptDismissedSha(updateInfo.remote_sha);
+    if (updateInfo?.remote_sha) persistDismissedUpdateSha(updateInfo.remote_sha);
   };
 
   const openOnboardingModal = () => {
@@ -1645,6 +1666,9 @@ export const App: React.FC = () => {
       if (resp.ok) {
         const data: SystemUpdateStatus = await resp.json();
         setUpdateInfo(data);
+        if (!data.update_available) {
+          persistDismissedUpdateSha(null);
+        }
       }
     } catch {
       // ignore
@@ -1956,9 +1980,14 @@ export const App: React.FC = () => {
   }, [selectedDeviceDetailIp, detailIfIndex, detailTrendRange]);
 
   useEffect(() => {
+    if (activeTab !== "settings") {
+      const dlg = updateDialogRef.current;
+      if (dlg && dlg.open) dlg.close();
+      return;
+    }
     if (
-      activeTab === "settings" &&
       updateInfo?.update_available &&
+      Boolean(updateInfo.remote_sha) &&
       updateInfo.remote_sha !== promptDismissedSha &&
       updateInfo.status !== "updating" &&
       !installingUpdate
