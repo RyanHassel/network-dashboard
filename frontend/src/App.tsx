@@ -3068,18 +3068,76 @@ export const App: React.FC = () => {
     id: Exclude<TabKey, "settings">;
     label: string;
     icon: React.ComponentType<{ className?: string }>;
+    activeClass: string;
+    inactiveClass: string;
+    iconActiveClass: string;
+    iconInactiveClass: string;
   }> = [
-    { id: "pulse", label: "Overview", icon: Activity },
-    { id: "devices", label: `Devices (${allDevices.length})`, icon: Monitor },
-    { id: "snmp", label: "SNMP Trends & Ports", icon: Server },
-    { id: "scanner", label: "Subnet Scanner Matrix", icon: Network },
-    { id: "syslog", label: "Live Syslog Stream", icon: Terminal },
-    { id: "targets", label: "Targets & SNMP", icon: KeyRound },
+    {
+      id: "pulse",
+      label: "Overview",
+      icon: Activity,
+      activeClass: "border-emerald-500/60 bg-emerald-500/15 text-emerald-100 shadow-xs",
+      inactiveClass:
+        "border-slate-800 bg-[#111827] text-slate-400 hover:border-emerald-500/50 hover:bg-emerald-500/10 hover:text-emerald-200",
+      iconActiveClass: "text-emerald-400",
+      iconInactiveClass: "text-slate-500 group-hover:text-emerald-400",
+    },
+    {
+      id: "devices",
+      label: `Devices (${allDevices.length})`,
+      icon: Monitor,
+      activeClass: "border-sky-500/60 bg-sky-500/15 text-sky-100 shadow-xs",
+      inactiveClass:
+        "border-slate-800 bg-[#111827] text-slate-400 hover:border-sky-500/50 hover:bg-sky-500/10 hover:text-sky-200",
+      iconActiveClass: "text-sky-400",
+      iconInactiveClass: "text-slate-500 group-hover:text-sky-400",
+    },
+    {
+      id: "snmp",
+      label: "SNMP Trends & Ports",
+      icon: Server,
+      activeClass: "border-violet-500/60 bg-violet-500/15 text-violet-100 shadow-xs",
+      inactiveClass:
+        "border-slate-800 bg-[#111827] text-slate-400 hover:border-violet-500/50 hover:bg-violet-500/10 hover:text-violet-200",
+      iconActiveClass: "text-violet-400",
+      iconInactiveClass: "text-slate-500 group-hover:text-violet-400",
+    },
+    {
+      id: "scanner",
+      label: "Subnet Scanner Matrix",
+      icon: Network,
+      activeClass: "border-amber-500/60 bg-amber-500/15 text-amber-100 shadow-xs",
+      inactiveClass:
+        "border-slate-800 bg-[#111827] text-slate-400 hover:border-amber-500/50 hover:bg-amber-500/10 hover:text-amber-200",
+      iconActiveClass: "text-amber-400",
+      iconInactiveClass: "text-slate-500 group-hover:text-amber-400",
+    },
+    {
+      id: "syslog",
+      label: "Live Syslog Stream",
+      icon: Terminal,
+      activeClass: "border-rose-500/60 bg-rose-500/15 text-rose-100 shadow-xs",
+      inactiveClass:
+        "border-slate-800 bg-[#111827] text-slate-400 hover:border-rose-500/50 hover:bg-rose-500/10 hover:text-rose-200",
+      iconActiveClass: "text-rose-400",
+      iconInactiveClass: "text-slate-500 group-hover:text-rose-400",
+    },
+    {
+      id: "targets",
+      label: "Targets & SNMP",
+      icon: KeyRound,
+      activeClass: "border-cyan-500/60 bg-cyan-500/15 text-cyan-100 shadow-xs",
+      inactiveClass:
+        "border-slate-800 bg-[#111827] text-slate-400 hover:border-cyan-500/50 hover:bg-cyan-500/10 hover:text-cyan-200",
+      iconActiveClass: "text-cyan-400",
+      iconInactiveClass: "text-slate-500 group-hover:text-cyan-400",
+    },
   ];
 
   const activeNavMeta =
     activeTab === "settings"
-      ? { label: "Settings", icon: Settings }
+      ? { label: "Settings", icon: Settings, iconActiveClass: "text-indigo-400" }
       : primaryTabs.find((t) => t.id === activeTab) || primaryTabs[0];
   const ActiveNavIcon = activeNavMeta.icon;
 
@@ -3145,14 +3203,14 @@ export const App: React.FC = () => {
                 setNavMenuOpen(false);
                 fetchServerInfo(false);
               }}
-              className={`relative flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition ${
+              className={`group relative flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition ${
                 updateInfo?.update_available && !installingUpdate
                   ? activeTab === "settings"
                     ? "border-amber-400/70 bg-amber-500/25 text-amber-200"
                     : "border-amber-500/50 bg-amber-500/15 text-amber-300 hover:border-amber-400/70 hover:bg-amber-500/25 hover:text-amber-200"
                   : activeTab === "settings"
-                    ? "border-emerald-500/40 bg-slate-800 text-white"
-                    : "border-slate-800 bg-[#111827] text-slate-300 hover:border-slate-700 hover:text-white"
+                    ? "border-indigo-500/60 bg-indigo-500/15 text-indigo-100"
+                    : "border-slate-800 bg-[#111827] text-slate-300 hover:border-indigo-500/50 hover:bg-indigo-500/10 hover:text-indigo-200"
               }`}
               title={
                 updateInfo?.update_available && !installingUpdate
@@ -3162,7 +3220,15 @@ export const App: React.FC = () => {
                   : "Server Information, Updates & Background Services"
               }
             >
-              <Settings className="h-3.5 w-3.5" />
+              <Settings
+                className={`h-3.5 w-3.5 transition-colors ${
+                  updateInfo?.update_available && !installingUpdate
+                    ? "text-amber-300"
+                    : activeTab === "settings"
+                      ? "text-indigo-400"
+                      : "text-slate-400 group-hover:text-indigo-400"
+                }`}
+              />
               <span>Settings</span>
               {updateInfo?.update_available && !installingUpdate && (
                 <DownloadCloud className="h-3.5 w-3.5 shrink-0 text-amber-300" />
@@ -3199,15 +3265,13 @@ export const App: React.FC = () => {
                     type="button"
                     onClick={() => handleSelectNavTab(tab.id)}
                     aria-current={active ? "page" : undefined}
-                    className={`flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-medium transition-all duration-150 ${
-                      active
-                        ? "border-emerald-500/40 bg-slate-800/90 text-white shadow-xs"
-                        : "border-slate-800 bg-[#111827] text-slate-400 hover:border-slate-700 hover:bg-slate-800/60 hover:text-slate-200"
+                    className={`group flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-medium transition-all duration-150 ${
+                      active ? tab.activeClass : tab.inactiveClass
                     }`}
                   >
                     <Icon
-                      className={`h-3.5 w-3.5 shrink-0 ${
-                        active ? "text-emerald-400" : "text-slate-500"
+                      className={`h-3.5 w-3.5 shrink-0 transition-colors ${
+                        active ? tab.iconActiveClass : tab.iconInactiveClass
                       }`}
                     />
                     <span>{tab.label}</span>
@@ -3226,7 +3290,7 @@ export const App: React.FC = () => {
                 className="flex w-full items-center justify-between rounded-lg border border-slate-800 bg-[#111827] px-3 py-2 text-xs font-medium text-slate-200 transition hover:border-slate-700 hover:bg-slate-800/70"
               >
                 <span className="flex items-center gap-2">
-                  <ActiveNavIcon className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                  <ActiveNavIcon className={`h-3.5 w-3.5 shrink-0 ${activeNavMeta.iconActiveClass}`} />
                   <span>{activeNavMeta.label}</span>
                 </span>
                 <span className="flex items-center gap-1.5 text-slate-400">
@@ -3259,15 +3323,13 @@ export const App: React.FC = () => {
                           tabIndex={navMenuOpen ? 0 : -1}
                           onClick={() => handleSelectNavTab(tab.id)}
                           aria-current={active ? "page" : undefined}
-                          className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-left text-xs font-medium transition-all duration-150 ${
-                            active
-                              ? "border-emerald-500/40 bg-slate-800/90 text-white shadow-xs"
-                              : "border-slate-800 bg-[#111827] text-slate-400 hover:border-slate-700 hover:bg-slate-800/60 hover:text-slate-200"
+                          className={`group flex items-center gap-2 rounded-lg border px-3 py-2 text-left text-xs font-medium transition-all duration-150 ${
+                            active ? tab.activeClass : tab.inactiveClass
                           }`}
                         >
                           <Icon
-                            className={`h-3.5 w-3.5 shrink-0 ${
-                              active ? "text-emerald-400" : "text-slate-500"
+                            className={`h-3.5 w-3.5 shrink-0 transition-colors ${
+                              active ? tab.iconActiveClass : tab.iconInactiveClass
                             }`}
                           />
                           <span className="truncate">{tab.label}</span>
