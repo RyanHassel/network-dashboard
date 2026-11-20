@@ -95,6 +95,15 @@ async def ensure_dynamic_config_tables(pool: asyncpg.Pool) -> None:
             json.dumps({"completed": False, "skipped": False}),
         )
 
+        await conn.execute(
+            """
+            INSERT INTO app_settings (key, value)
+            VALUES ('isp_settings', $1::jsonb)
+            ON CONFLICT (key) DO NOTHING
+            """,
+            json.dumps({"isp_name": "", "download_mbps": 1000, "upload_mbps": 1000}),
+        )
+
         count = await conn.fetchval("SELECT COUNT(*) FROM snmp_profiles")
         if not count:
             await conn.execute(

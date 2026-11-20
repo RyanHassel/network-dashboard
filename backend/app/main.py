@@ -360,6 +360,12 @@ class CustomMIBUploadPayload(BaseModel):
     content: str
 
 
+class ISPSettingsPayload(BaseModel):
+    isp_name: str = ""
+    download_mbps: float = 1000.0
+    upload_mbps: float = 1000.0
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_pool, redis_client
@@ -1206,12 +1212,44 @@ async def get_system_info() -> Dict[str, Any]:
 # ==============================================================================
 
 
+async def _read_isp_settings(conn: asyncpg.Connection) -> Dict[str, Any]:
+    raw = await conn.fetchval("SELECT value FROM app_settings WHERE key = 'isp_settings'")
+    parsed: Dict[str, Any] = {}
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = {}
+    elif isinstance(raw, dict):
+        parsed = dict(raw)
+
+    def _safe_mbps(val: Any, default: float = 1000.0) -> float:
+        try:
+            num = float(val)
+            if num < 0:
+                return 0.0
+            return round(min(num, 1_000_000.0), 2)
+        except Exception:
+            return default
+
+    return {
+        "isp_name": str(parsed.get("isp_name") or "").strip()[:80],
+        "download_mbps": _safe_mbps(parsed.get("download_mbps"), 1000.0)
+        if "download_mbps" in parsed
+        else 1000.0,
+        "upload_mbps": _safe_mbps(parsed.get("upload_mbps"), 1000.0)
+        if "upload_mbps" in parsed
+        else 1000.0,
+    }
+
+
 @app.get("/api/config")
 async def get_all_config() -> Dict[str, Any]:
     pool = _get_pool()
     async with pool.acquire() as conn:
         ob_val = await conn.fetchval("SELECT value FROM app_settings WHERE key = 'onboarding'")
         onboarding = json.loads(ob_val) if isinstance(ob_val, str) else (ob_val or {"completed": False, "skipped": False})
+        isp_settings = await _read_isp_settings(conn)
 
         profiles = await conn.fetch(
             """
@@ -1250,11 +1288,40 @@ async def get_all_config() -> Dict[str, Any]:
 
     return {
         "onboarding": onboarding,
+        "isp_settings": isp_settings,
         "snmp_profiles": [dict(r) for r in profiles],
         "snmp_targets": [dict(r) for r in targets],
         "subnets": [dict(r) for r in subnets],
         "unifi_controllers": [dict(r) for r in unifi_ctrls],
     }
+
+
+@app.put("/api/config/isp")
+async def save_isp_settings(payload: ISPSettingsPayload) -> Dict[str, Any]:
+    dl = float(payload.download_mbps if payload.download_mbps is not None else 0.0)
+    ul = float(payload.upload_mbps if payload.upload_mbps is not None else 0.0)
+    if dl < 0 or ul < 0 or dl > 1_000_000 or ul > 1_000_000:
+        raise HTTPException(
+            status_code=400, detail="Internet speeds must be between 0 and 1,000,000 Mbps."
+        )
+    val = {
+        "isp_name": payload.isp_name.strip()[:80],
+        "download_mbps": round(dl, 2),
+        "upload_mbps": round(ul, 2),
+    }
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES ('isp_settings', $1::jsonb, NOW())
+            ON CONFLICT (key) DO UPDATE SET
+                value = EXCLUDED.value,
+                updated_at = NOW()
+            """,
+            json.dumps(val),
+        )
+    return await get_all_config()
 
 
 @app.post("/api/config/onboarding")
@@ -1638,8 +1705,118 @@ async def delete_unifi_controller(ctrl_id: int) -> Dict[str, Any]:
 # ==============================================================================
 
 
+async def _query_overview_traffic_series(
+    conn: asyncpg.Connection, range_key: str = "1h"
+) -> tuple[List[Dict[str, Any]], str]:
+    rk = (range_key or "1h").strip().lower()
+    if rk == "24h":
+        rk = "1d"
+    elif rk == "30d":
+        rk = "1m"
+    if rk not in ("1h", "12h", "1d", "7d", "1m"):
+        rk = "1h"
+
+    range_specs = {
+        "1h": ("1 hour", "1 minute"),
+        "12h": ("12 hours", "5 minutes"),
+        "1d": ("24 hours", "10 minutes"),
+        "7d": ("7 days", "1 hour"),
+        "1m": ("30 days", "4 hours"),
+    }
+    sql_interval, sql_bucket = range_specs[rk]
+
+    wan_history = await conn.fetch(
+        f"""
+        SELECT time_bucket('{sql_bucket}', time) AS bucket,
+               AVG(wan_rx_bps) AS rx_bps,
+               AVG(wan_tx_bps) AS tx_bps,
+               AVG(wan_latency_ms) AS latency_ms
+        FROM unifi_gateway_metrics
+        WHERE time > NOW() - INTERVAL '{sql_interval}'
+        GROUP BY bucket
+        ORDER BY bucket ASC
+        """
+    )
+
+    # Fallback: aggregate SNMP traffic across all non-loopback interfaces
+    if not wan_history:
+        if rk in ("7d", "1m"):
+            if rk == "7d":
+                wan_history = await conn.fetch(
+                    """
+                    SELECT bucket,
+                           SUM(avg_in_bps) AS rx_bps,
+                           SUM(avg_out_bps) AS tx_bps,
+                           0.0 AS latency_ms
+                    FROM snmp_metrics_hourly
+                    WHERE bucket > NOW() - INTERVAL '7 days'
+                      AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+                    GROUP BY bucket
+                    ORDER BY bucket ASC
+                    """
+                )
+            else:
+                wan_history = await conn.fetch(
+                    """
+                    SELECT bucket,
+                           SUM(if_rx) AS rx_bps,
+                           SUM(if_tx) AS tx_bps,
+                           0.0 AS latency_ms
+                    FROM (
+                        SELECT time_bucket('4 hours', bucket) AS bucket,
+                               device_ip,
+                               if_index,
+                               AVG(avg_in_bps) AS if_rx,
+                               AVG(avg_out_bps) AS if_tx
+                        FROM snmp_metrics_hourly
+                        WHERE bucket > NOW() - INTERVAL '30 days'
+                          AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+                        GROUP BY 1, device_ip, if_index
+                    ) sub
+                    GROUP BY bucket
+                    ORDER BY bucket ASC
+                    """
+                )
+
+        if not wan_history:
+            wan_history = await conn.fetch(
+                f"""
+                SELECT bucket,
+                       SUM(if_rx) AS rx_bps,
+                       SUM(if_tx) AS tx_bps,
+                       0.0 AS latency_ms
+                FROM (
+                    SELECT time_bucket('{sql_bucket}', time) AS bucket,
+                           device_ip,
+                           if_index,
+                           AVG(in_bps) AS if_rx,
+                           AVG(out_bps) AS if_tx
+                    FROM snmp_metrics_raw
+                    WHERE time > NOW() - INTERVAL '{sql_interval}'
+                      AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
+                    GROUP BY bucket, device_ip, if_index
+                ) sub
+                GROUP BY bucket
+                ORDER BY bucket ASC
+                """
+            )
+
+    series = [
+        {
+            "time": r["bucket"].isoformat(),
+            "rx_bps": round(float(r["rx_bps"] or 0.0), 1),
+            "tx_bps": round(float(r["tx_bps"] or 0.0), 1),
+            "latency_ms": round(float(r["latency_ms"] or 0.0), 2),
+        }
+        for r in wan_history
+    ]
+    return series, rk
+
+
 @app.get("/api/overview")
-async def get_pulse_overview() -> Dict[str, Any]:
+async def get_pulse_overview(
+    range_key: str = Query(default="1h", alias="range"),
+) -> Dict[str, Any]:
     pool = _get_pool()
     async with pool.acquire() as conn:
         gw_row = await conn.fetchrow(
@@ -1655,42 +1832,8 @@ async def get_pulse_overview() -> Dict[str, Any]:
             """
         )
 
-        wan_history = await conn.fetch(
-            """
-            SELECT time_bucket('1 minute', time) AS bucket,
-                   AVG(wan_rx_bps) AS rx_bps,
-                   AVG(wan_tx_bps) AS tx_bps,
-                   AVG(wan_latency_ms) AS latency_ms
-            FROM unifi_gateway_metrics
-            WHERE time > NOW() - INTERVAL '1 hour'
-            GROUP BY bucket
-            ORDER BY bucket ASC
-            """
-        )
-
-        # Fallback: when UniFi gateway is not configured, aggregate SNMP traffic across all polled interfaces
-        if not wan_history:
-            wan_history = await conn.fetch(
-                """
-                SELECT bucket,
-                       SUM(if_rx) AS rx_bps,
-                       SUM(if_tx) AS tx_bps,
-                       0.0 AS latency_ms
-                FROM (
-                    SELECT time_bucket('1 minute', time) AS bucket,
-                           device_ip,
-                           if_index,
-                           AVG(in_bps) AS if_rx,
-                           AVG(out_bps) AS if_tx
-                    FROM snmp_metrics_raw
-                    WHERE time > NOW() - INTERVAL '1 hour'
-                      AND COALESCE(LOWER(if_name), '') NOT IN ('lo', 'loopback', 'null0')
-                    GROUP BY bucket, device_ip, if_index
-                ) sub
-                GROUP BY bucket
-                ORDER BY bucket ASC
-                """
-            )
+        wan_series, normalized_range = await _query_overview_traffic_series(conn, range_key)
+        isp_settings = await _read_isp_settings(conn)
 
         unifi_devs = await conn.fetch(
             """
@@ -1753,15 +1896,9 @@ async def get_pulse_overview() -> Dict[str, Any]:
 
     return {
         "gateway": gw_dict,
-        "wan_series": [
-            {
-                "time": r["bucket"].isoformat(),
-                "rx_bps": round(float(r["rx_bps"] or 0.0), 1),
-                "tx_bps": round(float(r["tx_bps"] or 0.0), 1),
-                "latency_ms": round(float(r["latency_ms"] or 0.0), 2),
-            }
-            for r in wan_history
-        ],
+        "wan_series": wan_series,
+        "series_range": normalized_range,
+        "isp_settings": isp_settings,
         "live_series": await _read_live_traffic_series(120),
         "unifi_devices": devices_list,
         "snmp_devices": snmp_list,
@@ -1775,6 +1912,16 @@ async def get_overview_live_series(
     limit: int = Query(default=120, ge=10, le=180),
 ) -> Dict[str, Any]:
     return {"live_series": await _read_live_traffic_series(limit)}
+
+
+@app.get("/api/overview/traffic")
+async def get_overview_traffic(
+    range_key: str = Query(default="1h", alias="range"),
+) -> Dict[str, Any]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        series, norm_range = await _query_overview_traffic_series(conn, range_key)
+    return {"range": norm_range, "series": series}
 
 
 @app.get("/api/snmp/interfaces")

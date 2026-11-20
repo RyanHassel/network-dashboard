@@ -203,11 +203,20 @@ interface UniFiControllerConfig {
   enabled: boolean;
 }
 
+interface ISPSettings {
+  isp_name: string;
+  download_mbps: number;
+  upload_mbps: number;
+}
+
+type OverviewRangeKey = "live" | "1h" | "12h" | "1d" | "7d" | "1m";
+
 interface AllConfigPayload {
   onboarding: {
     completed: boolean;
     skipped: boolean;
   };
+  isp_settings?: ISPSettings;
   snmp_profiles: SNMPProfile[];
   snmp_targets: SNMPTargetConfig[];
   subnets: SubnetConfig[];
@@ -435,6 +444,8 @@ interface OverviewPayload {
     tx_bps: number;
     latency_ms: number;
   }>;
+  series_range?: string;
+  isp_settings?: ISPSettings;
   live_series?: LiveTrafficSample[];
   unifi_devices: Array<{
     mac: string;
@@ -534,6 +545,14 @@ function formatBps(bps: number | undefined | null): string {
   if (val >= 1_000_000) return `${(val / 1_000_000).toFixed(2)} Mbps`;
   if (val >= 1_000) return `${(val / 1_000).toFixed(1)} Kbps`;
   return `${val.toFixed(0)} bps`;
+}
+
+function formatAxisMbps(bps: number | undefined | null): string {
+  const mbps = Number(bps || 0) / 1_000_000;
+  if (mbps <= 0) return "0";
+  if (mbps >= 100) return Math.round(mbps).toString();
+  if (mbps >= 1) return parseFloat(mbps.toFixed(1)).toString();
+  return parseFloat(mbps.toFixed(2)).toString();
 }
 
 function formatBytes(bytes: number | undefined | null): string {
@@ -779,7 +798,16 @@ const DualAreaSparkChart: React.FC<{
   height?: number;
   liveMode?: boolean;
   liveWindowMs?: number;
-}> = ({ points, height = 210, liveMode = false, liveWindowMs = 120_000 }) => {
+  showYAxis?: boolean;
+  fixedMaxBps?: number | null;
+}> = ({
+  points,
+  height = 210,
+  liveMode = false,
+  liveWindowMs = 120_000,
+  showYAxis = false,
+  fixedMaxBps = null,
+}) => {
   const rawId = useId();
   const gradPrefix = rawId.replace(/[^a-zA-Z0-9_-]/g, "");
   const rxGradId = `rxGrad-${gradPrefix}`;
@@ -794,6 +822,8 @@ const DualAreaSparkChart: React.FC<{
   const sampleGapRef = useRef<number>(2000);
   const displayEndRef = useRef<number>(0);
   const displayMaxRef = useRef<number>(1000);
+  const fixedMaxRef = useRef<number | null>(fixedMaxBps ?? null);
+  fixedMaxRef.current = fixedMaxBps ?? null;
   const [isHovering, setIsHovering] = useState(false);
   const [animateMove, setAnimateMove] = useState(false);
   const [, setAnimFrame] = useState(0);
@@ -908,22 +938,27 @@ const DualAreaSparkChart: React.FC<{
         displayEndRef.current = Math.min(targetEnd, displayEndRef.current + dtMs * speed);
       }
 
-      const winEnd = displayEndRef.current;
-      const winStart = winEnd - liveWindowMs;
-      let visMax = 1000;
-      for (let i = 0; i < samples.length; i++) {
-        const s = samples[i];
-        if (s.ts < winStart - sampleGapRef.current) continue;
-        if (s.ts > winEnd + sampleGapRef.current) break;
-        const m = Math.max(s.inVal, s.outVal, s.p95In);
-        if (m > visMax) visMax = m;
-      }
-      const targetMax = Math.max(1000, visMax * 1.12);
-      const alpha = Math.min(1, 1 - Math.exp(-dtMs / 420));
-      if (displayMaxRef.current <= 1000 && targetMax > 1000) {
-        displayMaxRef.current = targetMax;
+      const lockedMax = fixedMaxRef.current;
+      if (lockedMax && lockedMax > 0) {
+        displayMaxRef.current = lockedMax;
       } else {
-        displayMaxRef.current += (targetMax - displayMaxRef.current) * alpha;
+        const winEnd = displayEndRef.current;
+        const winStart = winEnd - liveWindowMs;
+        let visMax = 1000;
+        for (let i = 0; i < samples.length; i++) {
+          const s = samples[i];
+          if (s.ts < winStart - sampleGapRef.current) continue;
+          if (s.ts > winEnd + sampleGapRef.current) break;
+          const m = Math.max(s.inVal, s.outVal, s.p95In);
+          if (m > visMax) visMax = m;
+        }
+        const targetMax = Math.max(1000, visMax * 1.12);
+        const alpha = Math.min(1, 1 - Math.exp(-dtMs / 420));
+        if (displayMaxRef.current <= 1000 && targetMax > 1000) {
+          displayMaxRef.current = targetMax;
+        } else {
+          displayMaxRef.current += (targetMax - displayMaxRef.current) * alpha;
+        }
       }
 
       lastDrawWallMs = nowWallMs;
@@ -966,6 +1001,7 @@ const DualAreaSparkChart: React.FC<{
     : [];
   const useLiveRender = liveMode && liveSamples.length >= 2;
 
+  let observedPeakBps = 0;
   let maxVal = 1000;
   let spanMs = 0;
   let inPts: Array<{ x: number; y: number }> = [];
@@ -994,12 +1030,18 @@ const DualAreaSparkChart: React.FC<{
     }
     const visibleSlice = liveSamples.slice(startIdx);
 
-    let peakNow = 1000;
+    let peakNow = 0;
     for (const s of visibleSlice) {
       const m = Math.max(s.inVal, s.outVal, s.p95In);
       if (m > peakNow) peakNow = m;
     }
-    maxVal = displayMaxRef.current > 1000 ? displayMaxRef.current : Math.max(1000, peakNow * 1.12);
+    observedPeakBps = peakNow;
+    maxVal =
+      fixedMaxBps && fixedMaxBps > 0
+        ? fixedMaxBps
+        : displayMaxRef.current > 1000
+          ? displayMaxRef.current
+          : Math.max(1000, peakNow * 1.12);
 
     inPts = visibleSlice.map((s) => ({
       x: ((s.ts - liveWindowStart) / liveWindowMs) * width,
@@ -1024,10 +1066,11 @@ const DualAreaSparkChart: React.FC<{
       );
     }
   } else {
-    maxVal = Math.max(
-      1000,
+    observedPeakBps = Math.max(
+      0,
       ...points.map((p) => Math.max(p.inVal, p.outVal, p.p95In || 0)),
     );
+    maxVal = fixedMaxBps && fixedMaxBps > 0 ? fixedMaxBps : Math.max(1000, observedPeakBps);
     const firstTs = new Date(points[0].label).getTime();
     const lastTs = new Date(points[points.length - 1].label).getTime();
     spanMs =
@@ -1061,10 +1104,6 @@ const DualAreaSparkChart: React.FC<{
   const outSpline = buildMonotoneSpline(outPts, topPad, baselineY);
   const minCurveX = inPts.length > 0 ? Math.max(0, inPts[0].x) : 0;
   const maxCurveX = inPts.length > 0 ? Math.min(width, inPts[inPts.length - 1].x) : width;
-
-  const headX = useLiveRender ? maxCurveX : 0;
-  const headInY = useLiveRender ? evalSplineAtX(inSpline.segments, inPts, headX) : 0;
-  const headOutY = useLiveRender ? evalSplineAtX(outSpline.segments, outPts, headX) : 0;
 
   const buildHoverSnapshot = (ratioInput: number) => {
     const rect = plotRef.current?.getBoundingClientRect();
@@ -1178,8 +1217,13 @@ const DualAreaSparkChart: React.FC<{
 
   return (
     <div className="relative w-full overflow-visible rounded-lg border border-slate-800/80 bg-[#0B101B] p-3">
-      <div className="mb-2 flex items-center justify-between text-xs text-slate-400">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
         <div className="flex items-center gap-4">
+          {showYAxis && (
+            <span className="w-12 text-right font-mono-tabular text-[11px] font-medium uppercase tracking-wider text-slate-500">
+              Mbps
+            </span>
+          )}
           <span className="flex items-center gap-1.5">
             <span className="h-2 w-2 rounded-full bg-emerald-400" />
             Download (RX)
@@ -1189,200 +1233,205 @@ const DualAreaSparkChart: React.FC<{
             Upload (TX)
           </span>
         </div>
-        <span className="font-mono-tabular text-slate-300">Peak: {formatBps(maxVal)}</span>
+        <span className="font-mono-tabular text-slate-300">
+          Peak: {formatBps(observedPeakBps)}
+          {fixedMaxBps && fixedMaxBps > 0 ? ` / ${formatAxisMbps(fixedMaxBps)} Mbps` : ""}
+        </span>
       </div>
 
-      <div
-        ref={plotRef}
-        onPointerEnter={(e) => updateHoverFromEvent(e, true)}
-        onPointerMove={(e) => updateHoverFromEvent(e, false)}
-        onPointerLeave={handlePointerLeave}
-        className="relative h-44 w-full cursor-crosshair select-none touch-none"
-      >
-        <svg
-          viewBox={`0 0 ${width} ${height}`}
-          preserveAspectRatio="none"
-          className="block h-full w-full overflow-visible"
-        >
-          <defs>
-            <linearGradient id={rxGradId} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#10B981" stopOpacity="0.32" />
-              <stop offset="100%" stopColor="#10B981" stopOpacity="0.0" />
-            </linearGradient>
-            <linearGradient id={txGradId} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#38BDF8" stopOpacity="0.26" />
-              <stop offset="100%" stopColor="#38BDF8" stopOpacity="0.0" />
-            </linearGradient>
-            <clipPath id={clipId}>
-              <rect x={0} y={0} width={width} height={height} />
-            </clipPath>
-          </defs>
-          {[0.25, 0.5, 0.75].map((r) => (
-            <line
-              key={r}
-              x1={0}
-              y1={topPad + plotSpanY * r}
-              x2={width}
-              y2={topPad + plotSpanY * r}
-              stroke="#1E293B"
-              strokeDasharray="4 4"
-              strokeWidth="1"
-            />
-          ))}
-          <line
-            x1={0}
-            y1={baselineY}
-            x2={width}
-            y2={baselineY}
-            stroke="#1E293B"
-            strokeWidth="1"
-          />
-          {tickXPositions.map((x, idx) => (
-            <line
-              key={idx}
-              x1={x}
-              y1={baselineY}
-              x2={x}
-              y2={baselineY + 7}
-              stroke="#334155"
-              strokeWidth="1"
-            />
-          ))}
-          <g clipPath={`url(#${clipId})`}>
-            {inSpline.areaPath && <path d={inSpline.areaPath} fill={`url(#${rxGradId})`} />}
-            {outSpline.areaPath && <path d={outSpline.areaPath} fill={`url(#${txGradId})`} />}
-            {inSpline.linePath && (
-              <path
-                d={inSpline.linePath}
-                fill="none"
-                stroke="#10B981"
-                strokeWidth="2.2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                vectorEffect="non-scaling-stroke"
-              />
-            )}
-            {outSpline.linePath && (
-              <path
-                d={outSpline.linePath}
-                fill="none"
-                stroke="#38BDF8"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                vectorEffect="non-scaling-stroke"
-              />
-            )}
-          </g>
-        </svg>
-
-        {useLiveRender && !isHovering && (
-          <>
-            <div
-              className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-emerald-400 ring-2 ring-[#0B101B] shadow-[0_0_10px_rgba(16,185,129,0.9)]"
-              style={{
-                left: `${((headX / width) * 100).toFixed(3)}%`,
-                top: `${((headInY / height) * 100).toFixed(3)}%`,
-              }}
-            />
-            <div
-              className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-sky-400 ring-2 ring-[#0B101B] shadow-[0_0_10px_rgba(56,189,248,0.9)]"
-              style={{
-                left: `${((headX / width) * 100).toFixed(3)}%`,
-                top: `${((headOutY / height) * 100).toFixed(3)}%`,
-              }}
-            />
-          </>
-        )}
-
-        {displayedHover && (
-          <>
-            {/* Vertical crosshair line */}
-            <div
-              className="pointer-events-none absolute top-0 bottom-4 w-px bg-slate-400/55 motion-reduce:transition-none"
-              style={{
-                left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
-                opacity: isHovering ? 1 : 0,
-                transition: smoothPosTransition
-                  ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
-                  : "opacity 180ms ease-out",
-              }}
-            />
-
-            {/* Active point markers on Download & Upload curves */}
-            <div
-              className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-emerald-400 ring-2 ring-[#0B101B] shadow-[0_0_8px_rgba(16,185,129,0.85)] motion-reduce:transition-none"
-              style={{
-                left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
-                top: `${(displayedHover.inYFrac * 100).toFixed(3)}%`,
-                opacity: isHovering ? 1 : 0,
-                transition: smoothPosTransition
-                  ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
-                  : "opacity 180ms ease-out",
-              }}
-            />
-            <div
-              className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-sky-400 ring-2 ring-[#0B101B] shadow-[0_0_8px_rgba(56,189,248,0.85)] motion-reduce:transition-none"
-              style={{
-                left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
-                top: `${(displayedHover.outYFrac * 100).toFixed(3)}%`,
-                opacity: isHovering ? 1 : 0,
-                transition: smoothPosTransition
-                  ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
-                  : "opacity 180ms ease-out",
-              }}
-            />
-
-            {/* Smooth floating Download / Upload tooltip box */}
-            <div
-              className="pointer-events-none absolute top-0 left-0 z-20 w-[204px] will-change-transform motion-reduce:transition-none"
-              style={{
-                transform: `translate3d(${displayedHover.boxX.toFixed(1)}px, ${displayedHover.boxY.toFixed(1)}px, 0)`,
-                transition: smoothPosTransition
-                  ? "transform 95ms cubic-bezier(0.22, 1, 0.36, 1)"
-                  : "none",
-              }}
-            >
-              <div
-                className={`rounded-lg border border-slate-700/90 bg-[#090D16]/95 px-3 py-2 text-xs shadow-xl shadow-black/50 backdrop-blur-md transition-[opacity,transform] duration-200 ease-out motion-reduce:transition-none ${
-                  isHovering
-                    ? "translate-y-0 scale-100 opacity-100"
-                    : "translate-y-1 scale-95 opacity-0"
-                }`}
-              >
-                <div className="mb-1.5 border-b border-slate-800/80 pb-1 font-mono-tabular text-[11px] text-slate-400">
-                  {displayedHover.timeText}
-                </div>
-                <div className="space-y-1">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="flex items-center gap-1.5 text-slate-300">
-                      <span className="h-2 w-2 rounded-full bg-emerald-400" />
-                      Download
-                    </span>
-                    <span className="font-mono-tabular font-semibold text-emerald-400">
-                      {formatBps(displayedHover.inVal)}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="flex items-center gap-1.5 text-slate-300">
-                      <span className="h-2 w-2 rounded-full bg-sky-400" />
-                      Upload
-                    </span>
-                    <span className="font-mono-tabular font-semibold text-sky-400">
-                      {formatBps(displayedHover.outVal)}
-                    </span>
-                  </div>
-                </div>
-              </div>
+      <div className={showYAxis ? "flex items-stretch gap-2" : ""}>
+        {showYAxis && (
+          <div className="flex w-12 shrink-0 flex-col">
+            <div className="relative h-44 w-full select-none pr-1.5 text-right font-mono-tabular text-[11px] text-slate-400">
+              {[0, 0.25, 0.5, 0.75, 1].map((r) => (
+                <span
+                  key={r}
+                  style={{ top: `${((topPad + plotSpanY * r) / height) * 100}%` }}
+                  className="absolute right-1.5 -translate-y-1/2 leading-none"
+                >
+                  {formatAxisMbps(r === 1 ? 0 : maxVal * (1 - r))}
+                </span>
+              ))}
             </div>
-          </>
+            <div className="mt-1 pt-1.5" aria-hidden="true" />
+          </div>
         )}
-      </div>
 
-      <div className="mt-1 flex items-center justify-between border-t border-slate-800/70 pt-1.5 font-mono-tabular text-[11px] text-slate-400">
-        {axisLabels.map((lbl, idx) => (
-          <span key={idx}>{lbl}</span>
-        ))}
+        <div className={showYAxis ? "min-w-0 flex-1" : "w-full"}>
+          <div
+            ref={plotRef}
+            onPointerEnter={(e) => updateHoverFromEvent(e, true)}
+            onPointerMove={(e) => updateHoverFromEvent(e, false)}
+            onPointerLeave={handlePointerLeave}
+            className="relative h-44 w-full cursor-crosshair select-none touch-none"
+          >
+            <svg
+              viewBox={`0 0 ${width} ${height}`}
+              preserveAspectRatio="none"
+              className="block h-full w-full overflow-visible"
+            >
+              <defs>
+                <linearGradient id={rxGradId} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#10B981" stopOpacity="0.32" />
+                  <stop offset="100%" stopColor="#10B981" stopOpacity="0.0" />
+                </linearGradient>
+                <linearGradient id={txGradId} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#38BDF8" stopOpacity="0.26" />
+                  <stop offset="100%" stopColor="#38BDF8" stopOpacity="0.0" />
+                </linearGradient>
+                <clipPath id={clipId}>
+                  <rect x={0} y={0} width={width} height={height} />
+                </clipPath>
+              </defs>
+              {(showYAxis ? [0, 0.25, 0.5, 0.75] : [0.25, 0.5, 0.75]).map((r) => (
+                <line
+                  key={r}
+                  x1={0}
+                  y1={topPad + plotSpanY * r}
+                  x2={width}
+                  y2={topPad + plotSpanY * r}
+                  stroke="#1E293B"
+                  strokeDasharray="4 4"
+                  strokeWidth="1"
+                />
+              ))}
+              <line
+                x1={0}
+                y1={baselineY}
+                x2={width}
+                y2={baselineY}
+                stroke="#1E293B"
+                strokeWidth="1"
+              />
+              {tickXPositions.map((x, idx) => (
+                <line
+                  key={idx}
+                  x1={x}
+                  y1={baselineY}
+                  x2={x}
+                  y2={baselineY + 7}
+                  stroke="#334155"
+                  strokeWidth="1"
+                />
+              ))}
+              <g clipPath={`url(#${clipId})`}>
+                {inSpline.areaPath && <path d={inSpline.areaPath} fill={`url(#${rxGradId})`} />}
+                {outSpline.areaPath && <path d={outSpline.areaPath} fill={`url(#${txGradId})`} />}
+                {inSpline.linePath && (
+                  <path
+                    d={inSpline.linePath}
+                    fill="none"
+                    stroke="#10B981"
+                    strokeWidth="2.2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    vectorEffect="non-scaling-stroke"
+                  />
+                )}
+                {outSpline.linePath && (
+                  <path
+                    d={outSpline.linePath}
+                    fill="none"
+                    stroke="#38BDF8"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    vectorEffect="non-scaling-stroke"
+                  />
+                )}
+              </g>
+            </svg>
+
+            {displayedHover && (
+              <>
+                {/* Vertical crosshair line */}
+                <div
+                  className="pointer-events-none absolute top-0 bottom-4 w-px bg-slate-400/55 motion-reduce:transition-none"
+                  style={{
+                    left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
+                    opacity: isHovering ? 1 : 0,
+                    transition: smoothPosTransition
+                      ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
+                      : "opacity 180ms ease-out",
+                  }}
+                />
+
+                {/* Hover-only markers on Download & Upload curves */}
+                <div
+                  className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-emerald-400 ring-2 ring-[#0B101B] shadow-[0_0_8px_rgba(16,185,129,0.85)] motion-reduce:transition-none"
+                  style={{
+                    left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
+                    top: `${(displayedHover.inYFrac * 100).toFixed(3)}%`,
+                    opacity: isHovering ? 1 : 0,
+                    transition: smoothPosTransition
+                      ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
+                      : "opacity 180ms ease-out",
+                  }}
+                />
+                <div
+                  className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-sky-400 ring-2 ring-[#0B101B] shadow-[0_0_8px_rgba(56,189,248,0.85)] motion-reduce:transition-none"
+                  style={{
+                    left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
+                    top: `${(displayedHover.outYFrac * 100).toFixed(3)}%`,
+                    opacity: isHovering ? 1 : 0,
+                    transition: smoothPosTransition
+                      ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
+                      : "opacity 180ms ease-out",
+                  }}
+                />
+
+                {/* Smooth floating Download / Upload tooltip box */}
+                <div
+                  className="pointer-events-none absolute top-0 left-0 z-20 w-[204px] will-change-transform motion-reduce:transition-none"
+                  style={{
+                    transform: `translate3d(${displayedHover.boxX.toFixed(1)}px, ${displayedHover.boxY.toFixed(1)}px, 0)`,
+                    transition: smoothPosTransition
+                      ? "transform 95ms cubic-bezier(0.22, 1, 0.36, 1)"
+                      : "none",
+                  }}
+                >
+                  <div
+                    className={`rounded-lg border border-slate-700/90 bg-[#090D16]/95 px-3 py-2 text-xs shadow-xl shadow-black/50 backdrop-blur-md transition-[opacity,transform] duration-200 ease-out motion-reduce:transition-none ${
+                      isHovering
+                        ? "translate-y-0 scale-100 opacity-100"
+                        : "translate-y-1 scale-95 opacity-0"
+                    }`}
+                  >
+                    <div className="mb-1.5 border-b border-slate-800/80 pb-1 font-mono-tabular text-[11px] text-slate-400">
+                      {displayedHover.timeText}
+                    </div>
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="flex items-center gap-1.5 text-slate-300">
+                          <span className="h-2 w-2 rounded-full bg-emerald-400" />
+                          Download
+                        </span>
+                        <span className="font-mono-tabular font-semibold text-emerald-400">
+                          {formatBps(displayedHover.inVal)}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="flex items-center gap-1.5 text-slate-300">
+                          <span className="h-2 w-2 rounded-full bg-sky-400" />
+                          Upload
+                        </span>
+                        <span className="font-mono-tabular font-semibold text-sky-400">
+                          {formatBps(displayedHover.outVal)}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+
+          <div className="mt-1 flex items-center justify-between border-t border-slate-800/70 pt-1.5 font-mono-tabular text-[11px] text-slate-400">
+            {axisLabels.map((lbl, idx) => (
+              <span key={idx}>{lbl}</span>
+            ))}
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -1432,6 +1481,11 @@ export const App: React.FC = () => {
   // First-Time Setup Onboarding Modal & Dynamic Config State
   const [config, setConfig] = useState<AllConfigPayload | null>(null);
   const onboardingDialogRef = useRef<HTMLDialogElement | null>(null);
+  const [ispNameInput, setIspNameInput] = useState("");
+  const [ispDownloadInput, setIspDownloadInput] = useState("1000");
+  const [ispUploadInput, setIspUploadInput] = useState("1000");
+  const [savingIsp, setSavingIsp] = useState(false);
+  const ispFormInitializedRef = useRef(false);
 
   // Onboarding Wizard Draft Inputs
   const [obSubnetInput, setObSubnetInput] = useState("10.1.3.0/24");
@@ -1518,8 +1572,12 @@ export const App: React.FC = () => {
 
   // Domain Telemetry State
   const [overview, setOverview] = useState<OverviewPayload | null>(null);
-  const [overviewGraphMode, setOverviewGraphMode] = useState<"live" | "1h">("live");
+  const [overviewGraphMode, setOverviewGraphMode] = useState<OverviewRangeKey>("live");
   const [liveTrafficSeries, setLiveTrafficSeries] = useState<LiveTrafficSample[]>([]);
+  const [overviewHistorySeries, setOverviewHistorySeries] = useState<
+    Array<{ time: string; rx_bps: number; tx_bps: number; latency_ms: number }>
+  >([]);
+  const [loadingOverviewRange, setLoadingOverviewRange] = useState(false);
   const [interfaces, setInterfaces] = useState<SNMPInterface[]>([]);
   const [selectedDeviceIp, setSelectedDeviceIp] = useState<string>("");
   const [selectedIfIndex, setSelectedIfIndex] = useState<number>(1);
@@ -1581,6 +1639,12 @@ export const App: React.FC = () => {
 
   const syncConfigState = (data: AllConfigPayload) => {
     setConfig(data);
+    if (!ispFormInitializedRef.current && data.isp_settings) {
+      setIspNameInput(data.isp_settings.isp_name || "");
+      setIspDownloadInput(String(data.isp_settings.download_mbps ?? 1000));
+      setIspUploadInput(String(data.isp_settings.upload_mbps ?? 1000));
+      ispFormInitializedRef.current = true;
+    }
     if (data.snmp_profiles.length > 0) {
       const exists = data.snmp_profiles.some((p) => p.id === newHostProfileId);
       if (!exists) {
@@ -1603,6 +1667,53 @@ export const App: React.FC = () => {
       }
     } catch {
       // ignore
+    }
+  };
+
+  const handleSaveIspSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const dl = Number(ispDownloadInput || 0);
+    const ul = Number(ispUploadInput || 0);
+    if (
+      Number.isNaN(dl) ||
+      Number.isNaN(ul) ||
+      dl < 0 ||
+      ul < 0 ||
+      dl > 1_000_000 ||
+      ul > 1_000_000
+    ) {
+      flashFeedback("err", "Internet speeds must be between 0 and 1,000,000 Mbps.");
+      return;
+    }
+    setSavingIsp(true);
+    try {
+      const r = await fetch("/api/config/isp", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          isp_name: ispNameInput.trim(),
+          download_mbps: dl,
+          upload_mbps: ul,
+        }),
+      });
+      if (r.ok) {
+        const updated: AllConfigPayload = await r.json();
+        syncConfigState(updated);
+        if (updated.isp_settings) {
+          setIspNameInput(updated.isp_settings.isp_name || "");
+          setIspDownloadInput(String(updated.isp_settings.download_mbps ?? dl));
+          setIspUploadInput(String(updated.isp_settings.upload_mbps ?? ul));
+        }
+        fetchOverview();
+        flashFeedback("ok", "Saved ISP internet speed settings.");
+      } else {
+        const errBody = await r.json().catch(() => null);
+        flashFeedback("err", errBody?.detail || "Failed to save ISP settings.");
+      }
+    } catch {
+      flashFeedback("err", "Network error saving ISP settings.");
+    } finally {
+      setSavingIsp(false);
     }
   };
 
@@ -2251,12 +2362,33 @@ export const App: React.FC = () => {
       if (r.ok) {
         const data: OverviewPayload = await r.json();
         setOverview(data);
+        if (overviewGraphMode === "1h" || overviewHistorySeries.length === 0) {
+          setOverviewHistorySeries(data.wan_series || []);
+        }
         if (data.live_series && data.live_series.length > 0) {
           setLiveTrafficSeries((prev) => mergeLiveTrafficSamples(prev, data.live_series!));
         }
       }
     } catch {
       // ignore
+    }
+  };
+
+  const fetchOverviewTraffic = async (
+    rk: Exclude<OverviewRangeKey, "live">,
+    showLoading = false,
+  ) => {
+    if (showLoading) setLoadingOverviewRange(true);
+    try {
+      const r = await fetch(`/api/overview/traffic?range=${encodeURIComponent(rk)}`);
+      if (r.ok) {
+        const data = await r.json();
+        setOverviewHistorySeries(data.series || []);
+      }
+    } catch {
+      // ignore
+    } finally {
+      if (showLoading) setLoadingOverviewRange(false);
     }
   };
 
@@ -2357,6 +2489,9 @@ export const App: React.FC = () => {
 
     const interval = setInterval(() => {
       fetchOverview();
+      if (activeTab === "pulse" && overviewGraphMode !== "live") {
+        fetchOverviewTraffic(overviewGraphMode, false);
+      }
       if (activeTab === "devices") {
         fetchAllDevices();
         if (selectedDeviceDetailIp) fetchDeviceDetail(selectedDeviceDetailIp);
@@ -2375,7 +2510,21 @@ export const App: React.FC = () => {
       clearInterval(interval);
       clearInterval(updateTimer);
     };
-  }, [activeTab, selectedDeviceDetailIp, logsPaused, logSeverity, logSourceIp, logSearch]);
+  }, [
+    activeTab,
+    overviewGraphMode,
+    selectedDeviceDetailIp,
+    logsPaused,
+    logSeverity,
+    logSourceIp,
+    logSearch,
+  ]);
+
+  useEffect(() => {
+    if (overviewGraphMode !== "live") {
+      fetchOverviewTraffic(overviewGraphMode, true);
+    }
+  }, [overviewGraphMode]);
 
   useEffect(() => {
     if (selectedDeviceIp && selectedIfIndex >= 0) {
@@ -2741,10 +2890,21 @@ export const App: React.FC = () => {
   };
 
   const gw = overview?.gateway;
+  const ispConfig = overview?.isp_settings || config?.isp_settings;
+  const ispCeilingMbps = Math.max(
+    Number(ispConfig?.download_mbps ?? 1000),
+    Number(ispConfig?.upload_mbps ?? 0),
+  );
+  const ispCeilingBps = ispCeilingMbps > 0 ? ispCeilingMbps * 1_000_000 : null;
   const isLiveOverview = overviewGraphMode === "live" && liveTrafficSeries.length >= 2;
-  const activeOverviewSeries = isLiveOverview
-    ? liveTrafficSeries
-    : overview?.wan_series || [];
+  const activeOverviewSeries =
+    overviewGraphMode === "live"
+      ? liveTrafficSeries.length >= 2
+        ? liveTrafficSeries
+        : overviewHistorySeries.length > 0
+          ? overviewHistorySeries
+          : overview?.wan_series || []
+      : overviewHistorySeries;
   const latestLiveSample =
     liveTrafficSeries.length > 0 ? liveTrafficSeries[liveTrafficSeries.length - 1] : null;
   const latestWanSample =
@@ -3694,15 +3854,23 @@ export const App: React.FC = () => {
               </div>
             </div>
 
-            {/* Network Throughput Overview Graph with Live Streaming & Time Axis */}
+            {/* Network Throughput Overview Graph with Live Streaming, ISP Scaling & Multi-Range Axis */}
             <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
               <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <h3 className="text-sm font-semibold text-white">
                       {overviewGraphMode === "live"
                         ? "Network Traffic Overview (Live Stream)"
-                        : "Network Traffic Overview (Last 60 Minutes)"}
+                        : overviewGraphMode === "1h"
+                          ? "Network Traffic Overview (Last 1 Hour)"
+                          : overviewGraphMode === "12h"
+                            ? "Network Traffic Overview (Last 12 Hours)"
+                            : overviewGraphMode === "1d"
+                              ? "Network Traffic Overview (Last 24 Hours)"
+                              : overviewGraphMode === "7d"
+                                ? "Network Traffic Overview (Last 7 Days)"
+                                : "Network Traffic Overview (Last 30 Days)"}
                     </h3>
                     {overviewGraphMode === "live" && (
                       <span className="inline-flex items-center gap-1 rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 font-mono-tabular text-[10px] font-semibold text-emerald-400">
@@ -3710,13 +3878,16 @@ export const App: React.FC = () => {
                         LIVE
                       </span>
                     )}
+                    {loadingOverviewRange && overviewGraphMode !== "live" && (
+                      <RefreshCw className="h-3.5 w-3.5 animate-spin text-sky-400" />
+                    )}
                   </div>
                   <p className="text-xs text-slate-400">
                     {gw
                       ? `UniFi Gateway (${gw.gateway_name} • ${gw.wan_ip || "WAN"}) ${
                           overviewGraphMode === "live"
                             ? "real-time 2s traffic stream"
-                            : "60-minute throughput history"
+                            : "historical throughput"
                         }`
                       : overviewGraphMode === "live"
                         ? "Aggregated real-time 2s traffic across all polled SNMP interfaces"
@@ -3735,33 +3906,53 @@ export const App: React.FC = () => {
                       )}
                     </div>
                   )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveTab("settings");
+                      fetchServerInfo(false);
+                    }}
+                    className="rounded border border-slate-800 bg-[#090D16] px-2 py-0.5 font-mono-tabular text-[11px] text-slate-400 transition hover:border-slate-700 hover:text-slate-200"
+                    title="Configure ISP Download/Upload Speed in Settings"
+                  >
+                    {ispCeilingBps
+                      ? `${ispConfig?.isp_name ? `${ispConfig.isp_name} • ` : "ISP: "}${
+                          ispConfig?.download_mbps ?? 1000
+                        }/${ispConfig?.upload_mbps ?? 1000} Mbps`
+                      : "Scale: Auto"}
+                  </button>
                   <div className="inline-flex items-center rounded-md border border-slate-800 bg-[#090D16] p-0.5 text-[11px] font-medium">
-                    <button
-                      type="button"
-                      onClick={() => setOverviewGraphMode("live")}
-                      className={`rounded px-2 py-0.5 transition ${
-                        overviewGraphMode === "live"
-                          ? "bg-emerald-500/20 text-emerald-300"
-                          : "text-slate-400 hover:text-slate-200"
-                      }`}
-                    >
-                      Live (2m)
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setOverviewGraphMode("1h")}
-                      className={`rounded px-2 py-0.5 transition ${
-                        overviewGraphMode === "1h"
-                          ? "bg-slate-800 text-white"
-                          : "text-slate-400 hover:text-slate-200"
-                      }`}
-                    >
-                      1h
-                    </button>
+                    {(
+                      [
+                        { id: "live", label: "Live" },
+                        { id: "1h", label: "1H" },
+                        { id: "12h", label: "12H" },
+                        { id: "1d", label: "1D" },
+                        { id: "7d", label: "7D" },
+                        { id: "1m", label: "1M" },
+                      ] as Array<{ id: OverviewRangeKey; label: string }>
+                    ).map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => setOverviewGraphMode(opt.id)}
+                        className={`rounded px-2 py-0.5 transition ${
+                          overviewGraphMode === opt.id
+                            ? opt.id === "live"
+                              ? "bg-emerald-500/20 text-emerald-300"
+                              : "bg-slate-800 text-white"
+                            : "text-slate-400 hover:text-slate-200"
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
                   </div>
                 </div>
               </div>
               <DualAreaSparkChart
+                showYAxis={true}
+                fixedMaxBps={ispCeilingBps}
                 liveMode={isLiveOverview}
                 liveWindowMs={120_000}
                 points={activeOverviewSeries.map((pt) => ({
@@ -5987,6 +6178,21 @@ export const App: React.FC = () => {
               </button>
             </div>
 
+            {settingsFeedback && (
+              <div
+                className={`flex items-center justify-between rounded-lg border px-4 py-2.5 text-xs ${
+                  settingsFeedback.type === "ok"
+                    ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
+                    : "border-rose-500/40 bg-rose-500/15 text-rose-300"
+                }`}
+              >
+                <span>{settingsFeedback.text}</span>
+                <button type="button" onClick={() => setSettingsFeedback(null)}>
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            )}
+
             {/* 1. Software Updates Panel */}
             <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
               <div className="flex flex-wrap items-start justify-between gap-4">
@@ -6107,7 +6313,106 @@ export const App: React.FC = () => {
               )}
             </div>
 
-            {/* 2. Background Services & Versions */}
+            {/* 2. Internet Service Provider (ISP) Speed */}
+            <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
+                    <Activity className="h-4 w-4 text-emerald-400" />
+                    Internet Service Provider (ISP) Speed
+                  </h3>
+                  <p className="mt-0.5 text-xs text-slate-400">
+                    Set your provisioned ISP bandwidth in Mbps to lock the Overview traffic graph
+                    Y-axis from <span className="font-mono-tabular text-slate-300">0</span> to your
+                    configured ceiling (set 0 for auto-scaling).
+                  </p>
+                </div>
+                <span className="rounded border border-slate-700 bg-[#090D16] px-2.5 py-1 font-mono-tabular text-xs text-emerald-400">
+                  {ispCeilingMbps > 0
+                    ? `Ceiling: ${ispCeilingMbps} Mbps`
+                    : "Auto Scale"}
+                </span>
+              </div>
+
+              <form
+                onSubmit={handleSaveIspSettings}
+                className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-4"
+              >
+                <div>
+                  <label className="mb-1 block text-[11px] font-medium text-slate-400">
+                    ISP Name (Optional)
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="e.g. AT&T Fiber / Xfinity"
+                    value={ispNameInput}
+                    onChange={(e) => setIspNameInput(e.target.value)}
+                    className="w-full rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 text-xs text-white"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-[11px] font-medium text-slate-400">
+                    Download Speed (Mbps)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={1000000}
+                    step="any"
+                    placeholder="1000"
+                    value={ispDownloadInput}
+                    onChange={(e) => setIspDownloadInput(e.target.value)}
+                    className="w-full rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 font-mono-tabular text-xs text-white"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-[11px] font-medium text-slate-400">
+                    Upload Speed (Mbps)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={1000000}
+                    step="any"
+                    placeholder="1000"
+                    value={ispUploadInput}
+                    onChange={(e) => setIspUploadInput(e.target.value)}
+                    className="w-full rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 font-mono-tabular text-xs text-white"
+                    required
+                  />
+                </div>
+                <div className="flex items-end">
+                  <button
+                    type="submit"
+                    disabled={savingIsp}
+                    className="flex w-full items-center justify-center gap-1.5 rounded-md bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
+                  >
+                    <Check className="h-3.5 w-3.5" />
+                    <span>{savingIsp ? "Saving..." : "Save ISP Speed"}</span>
+                  </button>
+                </div>
+              </form>
+
+              <div className="mt-3 flex flex-wrap items-center gap-1.5 text-[11px]">
+                <span className="mr-1 text-slate-500">Quick Symmetrical Presets:</span>
+                {[100, 300, 500, 1000, 2500, 5000, 10000].map((mbps) => (
+                  <button
+                    key={mbps}
+                    type="button"
+                    onClick={() => {
+                      setIspDownloadInput(String(mbps));
+                      setIspUploadInput(String(mbps));
+                    }}
+                    className="rounded border border-slate-800 bg-[#090D16] px-2 py-0.5 font-mono-tabular text-slate-300 hover:border-slate-700 hover:bg-slate-800 hover:text-white"
+                  >
+                    {mbps} Mbps
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* 3. Background Services & Versions */}
             <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
               <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                 <div>
