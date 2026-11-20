@@ -1,8 +1,10 @@
 import asyncio
 from datetime import datetime, timezone
+import ipaddress
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -15,11 +17,17 @@ logger = logging.getLogger("netdash.snmp")
 
 # Standard MIB-II / IF-MIB OIDs
 OID_IF_DESCR = "1.3.6.1.2.1.2.2.1.2"
+OID_IF_SPEED = "1.3.6.1.2.1.2.2.1.5"
+OID_IF_PHYS_ADDR = "1.3.6.1.2.1.2.2.1.6"
 OID_IF_OPER_STATUS = "1.3.6.1.2.1.2.2.1.8"
+OID_IF_IN_OCTETS = "1.3.6.1.2.1.2.2.1.10"
 OID_IF_IN_DISCARDS = "1.3.6.1.2.1.2.2.1.13"
 OID_IF_IN_ERRORS = "1.3.6.1.2.1.2.2.1.14"
+OID_IF_OUT_OCTETS = "1.3.6.1.2.1.2.2.1.16"
 OID_IF_OUT_DISCARDS = "1.3.6.1.2.1.2.2.1.19"
 OID_IF_OUT_ERRORS = "1.3.6.1.2.1.2.2.1.20"
+OID_IP_ADDR_TABLE = "1.3.6.1.2.1.4.20.1"
+OID_BRIDGE_MAC = "1.3.6.1.2.1.17.1.1.0"
 
 OID_IF_NAME = "1.3.6.1.2.1.31.1.1.1.1"
 OID_IF_HC_IN_OCTETS = "1.3.6.1.2.1.31.1.1.1.6"
@@ -32,13 +40,15 @@ OID_HR_PROC_LOAD = "1.3.6.1.2.1.25.3.3.1.2"
 OID_HR_STORAGE = "1.3.6.1.2.1.25.2.3.1"
 OID_HR_SYSTEM = "1.3.6.1.2.1.25.1"
 OID_ENT_PHYSICAL = "1.3.6.1.2.1.47.1.1.1.1"
+OID_LLDP_LOC_CHASSIS = "1.0.8802.1.1.2.1.3.2.0"
 OID_LLDP_REM = "1.0.8802.1.1.2.1.4.1.1"
 
 # UCD-SNMP-MIB (Linux, Proxmox, Ubiquiti, Synology, TrueNAS, QNAP)
 OID_UCD_MEMORY = "1.3.6.1.4.1.2021.4"
+OID_UCD_DISK = "1.3.6.1.4.1.2021.9.1"
 OID_UCD_LOAD = "1.3.6.1.4.1.2021.10.1.3"
 OID_UCD_CPU = "1.3.6.1.4.1.2021.11"
-OID_LM_TEMP = "1.3.6.1.4.1.2021.13.16.2.1"
+OID_LM_SENSORS = "1.3.6.1.4.1.2021.13.16"
 
 
 def _to_float(val: Optional[str], default: float = 0.0) -> float:
@@ -59,6 +69,283 @@ def _to_int(val: Optional[str], default: int = 0) -> int:
         return int(float(clean))
     except ValueError:
         return default
+
+
+def _parse_timeticks(raw: Optional[str]) -> int:
+    """Parses Net-SNMP numeric ticks, Timeticks: (N), D:H:MM:SS.cc, or H:MM:SS.cc into centiseconds."""
+    if not raw:
+        return 0
+    s = raw.strip().strip('"')
+    if not s or "No Such" in s:
+        return 0
+    # Plain numeric integer/float (e.g. from -Ot)
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        return int(float(s))
+    # Explicit "Timeticks: (123456) 0:20:34.56"
+    m_ticks = re.search(r"\((\d+)\)", s)
+    if m_ticks:
+        return int(m_ticks.group(1))
+    # D:H:MM:SS(.cc) or H:MM:SS(.cc)
+    m_hms = re.match(r"^(?:(\d+):)?(\d+):(\d+):(\d+(?:\.\d+)?)(?:\s|$)", s)
+    if m_hms:
+        days = int(m_hms.group(1) or 0)
+        hours = int(m_hms.group(2))
+        mins = int(m_hms.group(3))
+        secs = float(m_hms.group(4))
+        total_secs = days * 86400 + hours * 3600 + mins * 60 + secs
+        return int(round(total_secs * 100))
+    return 0
+
+
+def _normalize_mac(raw: Optional[str]) -> Optional[str]:
+    """Normalizes SNMP MAC strings into lowercase colon-delimited aa:bb:cc:dd:ee:ff."""
+    if not raw:
+        return None
+    s = raw.strip().strip('"')
+    for prefix in ("Hex-STRING:", "STRING:"):
+        if s.lower().startswith(prefix.lower()):
+            s = s[len(prefix) :].strip()
+    if not s or "No Such" in s:
+        return None
+
+    tokens = [t for t in re.split(r"[:\-\s.]+", s) if t]
+    if len(tokens) == 6 and all(re.fullmatch(r"[0-9a-fA-F]{1,2}", t) for t in tokens):
+        octets = [t.zfill(2).lower() for t in tokens]
+    else:
+        hex_only = re.sub(r"[^0-9a-fA-F]", "", s)
+        if len(hex_only) != 12:
+            return None
+        octets = [hex_only[i : i + 2].lower() for i in range(0, 12, 2)]
+
+    mac = ":".join(octets)
+    if mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+        return None
+    # Reject multicast/group MACs (LSB of first octet == 1)
+    if int(octets[0], 16) & 1:
+        return None
+    return mac
+
+
+def _parse_sys_descr_metadata(sys_descr: str, vendor_key: str) -> Dict[str, str]:
+    """Extracts hardware model, firmware version, and OS/kernel fallback info from sysDescr."""
+    descr = (sys_descr or "").strip()
+    out = {"hardware_model": "", "firmware_version": "", "os_kernel": ""}
+    if not descr:
+        return out
+
+    if vendor_key == "ubiquiti" or any(
+        kw in descr.lower() for kw in ("ubiquiti", "unifi", "ubnt", "edgeos", "udm", "usw", "uap")
+    ):
+        # Match UniFi model names: UDM-Pro, UDM-SE, UCG-Ultra, UXG-Pro, USW-Pro-24-PoE, UAP-AC-Pro, U6-Pro, U7-Pro, etc.
+        m_unifi = re.search(
+            r"\b((?:UDM|UCG|UXG|USG|USW|USL|UAP|U6|U7|UK|UNVR|UCK)[A-Za-z0-9-]*)\b(?:\s+v?(\d+\.\d+(?:\.\d+)+))?",
+            descr,
+        )
+        if m_unifi:
+            out["hardware_model"] = m_unifi.group(1)
+            if m_unifi.group(2):
+                out["firmware_version"] = m_unifi.group(2)
+        else:
+            m_edge = re.search(r"\bEdge(?:Router|Switch|OS)[^,\n]*?\b(v?\d+\.\d+\.\d+[^\s,]*)", descr, re.I)
+            if m_edge:
+                out["firmware_version"] = m_edge.group(1)
+            m_model = re.search(r"\b(Edge(?:Router|Switch)[A-Za-z0-9-]*)\b", descr, re.I)
+            if m_model:
+                out["hardware_model"] = m_model.group(1)
+
+    elif vendor_key == "mikrotik":
+        m_mt = re.search(r"\bRouterOS\s+([A-Za-z0-9+._/-]+)", descr, re.I)
+        if m_mt:
+            out["hardware_model"] = m_mt.group(1)
+
+    elif vendor_key == "cisco":
+        m_cs = re.search(r"\bVersion\s+([0-9A-Za-z()._-]+)", descr, re.I)
+        if m_cs:
+            out["firmware_version"] = m_cs.group(1).rstrip(",")
+
+    # Extract Linux kernel + architecture from sysDescr regardless of vendor
+    m_linux = re.search(
+        r"\bLinux\s+(?:[A-Za-z][A-Za-z0-9._-]*\s+)?(\d+\.\d+\.\d+[^\s,]*)(?:\s+(al\d+|aarch64|arm64|armv7l|x86_64|amd64|mips(?:64)?))?",
+        descr,
+    )
+    if m_linux:
+        kernel = m_linux.group(1)
+        arch = m_linux.group(2)
+        out["os_kernel"] = f"Linux {kernel} ({arch})" if arch else f"Linux {kernel}"
+
+    return out
+
+
+def _extract_ip_and_mac(
+    target: str,
+    ip_addr_table: Dict[str, str],
+    if_phys: Dict[str, str],
+    if_names: Dict[str, str],
+    if_oper: Dict[str, str],
+    lldp_loc_chassis: str = "",
+    bridge_mac: str = "",
+) -> Tuple[str, str, List[Dict[str, Any]]]:
+    """Resolves primary device MAC, target subnet CIDR, and non-loopback IPv4 addresses."""
+    ips_seen: Set[str] = set()
+    for k in ip_addr_table.keys():
+        if "." in k and k.split(".", 1)[0] in ("1", "2", "3"):
+            ips_seen.add(k.split(".", 1)[1])
+
+    ip_addresses: List[Dict[str, Any]] = []
+    target_subnet_cidr = ""
+    target_if_idx = 0
+
+    for ip_str in ips_seen:
+        try:
+            ip_obj = ipaddress.IPv4Address(ip_str)
+        except ValueError:
+            continue
+        if ip_obj.is_loopback:
+            continue
+
+        mask = (ip_addr_table.get(f"3.{ip_str}") or "").strip()
+        if_idx = _to_int(ip_addr_table.get(f"2.{ip_str}"), 0)
+        if_name = (if_names.get(str(if_idx)) or "").strip()
+        mac_for_if = _normalize_mac(if_phys.get(str(if_idx))) or ""
+
+        cidr = ""
+        if mask:
+            try:
+                net_obj = ipaddress.IPv4Network(f"{ip_str}/{mask}", strict=False)
+                cidr = str(net_obj)
+            except ValueError:
+                cidr = ""
+
+        if ip_str == target:
+            target_subnet_cidr = cidr
+            target_if_idx = if_idx
+
+        ip_addresses.append(
+            {
+                "ip": ip_str,
+                "netmask": mask,
+                "cidr": cidr,
+                "if_index": if_idx,
+                "if_name": if_name,
+                "mac_address": mac_for_if,
+            }
+        )
+
+    ip_addresses.sort(key=lambda item: int(ipaddress.IPv4Address(item["ip"])))
+
+    if not target_subnet_cidr:
+        try:
+            target_ip_obj = ipaddress.IPv4Address(target)
+            for item in ip_addresses:
+                if item["cidr"] and target_ip_obj in ipaddress.IPv4Network(item["cidr"], strict=False):
+                    target_subnet_cidr = item["cidr"]
+                    if not target_if_idx:
+                        target_if_idx = int(item["if_index"] or 0)
+                    break
+        except ValueError:
+            pass
+
+    def _is_loopback_name(idx_str: str) -> bool:
+        nm = (if_names.get(idx_str) or "").strip().lower()
+        return nm in ("lo", "loopback", "null0")
+
+    primary_mac: Optional[str] = None
+    if target_if_idx > 0 and not _is_loopback_name(str(target_if_idx)):
+        primary_mac = _normalize_mac(if_phys.get(str(target_if_idx)))
+
+    sorted_if_keys = sorted(if_phys.keys(), key=lambda x: int(x) if x.isdigit() else 999999)
+    if not primary_mac:
+        for k in sorted_if_keys:
+            if _is_loopback_name(k):
+                continue
+            oper_raw = (if_oper.get(k) or "").strip().lower()
+            is_up = _to_int(oper_raw, 2) == 1 or oper_raw.startswith("up")
+            if is_up:
+                candidate = _normalize_mac(if_phys.get(k))
+                if candidate:
+                    primary_mac = candidate
+                    break
+
+    if not primary_mac:
+        for k in sorted_if_keys:
+            if _is_loopback_name(k):
+                continue
+            candidate = _normalize_mac(if_phys.get(k))
+            if candidate:
+                primary_mac = candidate
+                break
+
+    if not primary_mac:
+        primary_mac = _normalize_mac(lldp_loc_chassis) or _normalize_mac(bridge_mac)
+
+    return (primary_mac or "", target_subnet_cidr, ip_addresses)
+
+
+def _parse_lm_sensors(lm_data: Dict[str, str]) -> Tuple[Optional[float], List[Dict[str, Any]]]:
+    """Parses temperature, fan RPM, and voltage sensors from LM-SENSORS-MIB (1.3.6.1.4.1.2021.13.16)."""
+    sensors: List[Dict[str, Any]] = []
+    temp_celsius: Optional[float] = None
+    if not lm_data:
+        return (temp_celsius, sensors)
+
+    # Support both .13.16 (keys 2.1.2.<idx>) and direct .2.1 (keys 2.<idx>) formats
+    def _collect_table(sub_prefix: str, short_mode: bool = False) -> Dict[str, Tuple[str, str]]:
+        name_pfx = "2." if short_mode else f"{sub_prefix}.2."
+        val_pfx = "3." if short_mode else f"{sub_prefix}.3."
+        indices = {
+            k[len(name_pfx) :]
+            for k in lm_data.keys()
+            if k.startswith(name_pfx) and k[len(name_pfx) :]
+        }
+        rows: Dict[str, Tuple[str, str]] = {}
+        for idx in sorted(indices, key=lambda x: int(x) if x.isdigit() else 999999):
+            rows[idx] = (lm_data.get(f"{name_pfx}{idx}", ""), lm_data.get(f"{val_pfx}{idx}", ""))
+        return rows
+
+    temp_rows = _collect_table("2.1") or (
+        _collect_table("2.1", short_mode=True) if any(k.startswith("2.") and not k.startswith("2.1.") for k in lm_data) else {}
+    )
+    for t_idx, (t_name, raw_val) in temp_rows.items():
+        raw_mdeg = _to_float(raw_val, 0.0)
+        deg_c = round(raw_mdeg / 1000.0, 1) if raw_mdeg > 200 else round(raw_mdeg, 1)
+        if 0 < deg_c < 150:
+            if temp_celsius is None:
+                temp_celsius = deg_c
+            sensors.append(
+                {
+                    "name": t_name or f"Temp #{t_idx}",
+                    "category": "Temperature",
+                    "value": f"{deg_c} °C",
+                    "status": "warning" if deg_c >= 80 else "ok",
+                }
+            )
+
+    for f_idx, (f_name, raw_val) in _collect_table("3.1").items():
+        rpm = _to_int(raw_val, -1)
+        if rpm >= 0:
+            sensors.append(
+                {
+                    "name": f_name or f"Fan #{f_idx}",
+                    "category": "Fan",
+                    "value": f"{rpm} RPM",
+                    "status": "warning" if rpm == 0 else "ok",
+                }
+            )
+
+    for v_idx, (v_name, raw_val) in _collect_table("4.1").items():
+        mv = _to_float(raw_val, -1.0)
+        if mv >= 0:
+            volts = round(mv / 1000.0, 2)
+            sensors.append(
+                {
+                    "name": v_name or f"Voltage #{v_idx}",
+                    "category": "Voltage",
+                    "value": f"{volts:.2f} V",
+                    "status": "ok",
+                }
+            )
+
+    return (temp_celsius, sensors)
 
 
 class SNMPPoller:
@@ -83,6 +370,8 @@ class SNMPPoller:
         v3_auth_proto = str(profile.get("v3_auth_proto") or "SHA").strip().upper()
         v3_priv_proto = str(profile.get("v3_priv_proto") or "AES").strip().upper()
 
+        if version == "v1":
+            return ["-v1", "-c", community]
         if version == "v3" and v3_user:
             args = ["-v3", "-u", v3_user]
             if v3_auth_key and v3_priv_key:
@@ -113,50 +402,64 @@ class SNMPPoller:
         port: int,
         auth_args: List[str],
         base_oid: str,
-        timeout: float = 5.0,
+        timeout: float = 6.0,
         snmp_timeout: int = 2,
         retries: int = 1,
+        sem: Optional[asyncio.Semaphore] = None,
     ) -> Dict[str, str]:
+        clean_base = base_oid.strip().lstrip(".")
+        walker = "snmpwalk" if auth_args and auth_args[0] == "-v1" else "snmpbulkwalk"
         cmd = [
-            "snmpbulkwalk",
+            walker,
             "-On",
             "-Oq",
+            "-Ot",
+            "-Oe",
+            "-O0",
+            "-OU",
             "-t",
             str(snmp_timeout),
             "-r",
             str(retries),
             *auth_args,
             f"{target}:{port}",
-            base_oid,
+            clean_base,
         ]
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            if proc.returncode != 0 and not stdout:
+
+        async def _exec() -> Dict[str, str]:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                if proc.returncode != 0 and not stdout:
+                    return {}
+                result: Dict[str, str] = {}
+                prefix = f".{clean_base}."
+                for line in stdout.decode("utf-8", errors="ignore").splitlines():
+                    line = line.strip()
+                    if not line or "No Such" in line or "End of MIB" in line:
+                        continue
+                    parts = line.split(" ", 1)
+                    if len(parts) != 2:
+                        continue
+                    oid_str, val_str = parts[0], parts[1].strip().strip('"')
+                    if oid_str.startswith(prefix):
+                        idx = oid_str[len(prefix) :]
+                        result[idx] = val_str
+                    elif oid_str == f".{clean_base}":
+                        result["0"] = val_str
+                return result
+            except Exception as exc:
+                logger.debug("SNMP walk failed on %s (%s): %s", target, clean_base, exc)
                 return {}
-            result: Dict[str, str] = {}
-            prefix = f".{base_oid}."
-            for line in stdout.decode("utf-8", errors="ignore").splitlines():
-                line = line.strip()
-                if not line or "No Such" in line or "End of MIB" in line:
-                    continue
-                parts = line.split(" ", 1)
-                if len(parts) != 2:
-                    continue
-                oid_str, val_str = parts[0], parts[1].strip().strip('"')
-                if oid_str.startswith(prefix):
-                    idx = oid_str[len(prefix) :]
-                    result[idx] = val_str
-                elif oid_str == f".{base_oid}":
-                    result["0"] = val_str
-            return result
-        except Exception as exc:
-            logger.debug("SNMP walk failed on %s (%s): %s", target, base_oid, exc)
-            return {}
+
+        if sem is not None:
+            async with sem:
+                return await _exec()
+        return await _exec()
 
     async def _collect_vendor_enrichment(
         self,
@@ -165,8 +468,11 @@ class SNMPPoller:
         auth_args: List[str],
         vendor_key: str,
         matched_mibs: List[str],
+        sys_descr: str = "",
+        redis_client: Optional[aioredis.Redis] = None,
+        sem: Optional[asyncio.Semaphore] = None,
     ) -> Dict[str, Any]:
-        """Walks universal & vendor-matched MIB trees to extract maximum hardware/OS/sensor details."""
+        """Walks universal & vendor-matched MIB trees to extract hardware/OS/sensor/LLDP details."""
         (
             ent_phys,
             hr_storage,
@@ -174,20 +480,34 @@ class SNMPPoller:
             ucd_mem,
             ucd_load,
             ucd_cpu,
-            lm_temp,
+            ucd_disk,
+            lm_sensors,
             lldp_rem,
+            lldp_loc_chassis,
+            bridge_mac,
         ) = await asyncio.gather(
-            self._snmp_walk_oid(target, port, auth_args, OID_ENT_PHYSICAL, timeout=4.0),
-            self._snmp_walk_oid(target, port, auth_args, OID_HR_STORAGE, timeout=4.0),
-            self._snmp_walk_oid(target, port, auth_args, OID_HR_SYSTEM, timeout=3.0),
-            self._snmp_walk_oid(target, port, auth_args, OID_UCD_MEMORY, timeout=3.0),
-            self._snmp_walk_oid(target, port, auth_args, OID_UCD_LOAD, timeout=3.0),
-            self._snmp_walk_oid(target, port, auth_args, OID_UCD_CPU, timeout=3.0),
-            self._snmp_walk_oid(target, port, auth_args, OID_LM_TEMP, timeout=3.0),
-            self._snmp_walk_oid(target, port, auth_args, OID_LLDP_REM, timeout=4.0),
+            self._snmp_walk_oid(target, port, auth_args, OID_ENT_PHYSICAL, timeout=5.0, sem=sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_HR_STORAGE, timeout=5.0, sem=sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_HR_SYSTEM, timeout=4.0, sem=sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_UCD_MEMORY, timeout=4.0, sem=sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_UCD_LOAD, timeout=4.0, sem=sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_UCD_CPU, timeout=4.0, sem=sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_UCD_DISK, timeout=4.0, sem=sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_LM_SENSORS, timeout=4.0, sem=sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_LLDP_REM, timeout=5.0, sem=sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_LLDP_LOC_CHASSIS, timeout=3.0, sem=sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_BRIDGE_MAC, timeout=3.0, sem=sem),
         )
 
         active_mibs = list(matched_mibs)
+        responding_mibs: List[str] = []
+
+        def _mark_mib(mib_name: str) -> None:
+            if mib_name not in responding_mibs:
+                responding_mibs.append(mib_name)
+            if mib_name not in active_mibs:
+                active_mibs.append(mib_name)
+
         hardware_model = ""
         serial_number = ""
         firmware_version = ""
@@ -201,11 +521,17 @@ class SNMPPoller:
         temp_celsius: Optional[float] = None
         cpu_pct: Optional[float] = None
         mem_pct: Optional[float] = None
+        hr_uptime_ticks = _parse_timeticks(hr_sys.get("1.0"))
+        ubnt_uptime_ticks = 0
+        lldp_chassis_mac = _normalize_mac(lldp_loc_chassis.get("0", "")) or ""
+        bridge_mac_norm = _normalize_mac(bridge_mac.get("0", "")) or ""
+
+        if bridge_mac:
+            _mark_mib("BRIDGE-MIB")
 
         # 1. Parse ENTITY-MIB (entPhysicalTable)
         if ent_phys:
-            if "ENTITY-MIB" not in active_mibs:
-                active_mibs.append("ENTITY-MIB")
+            _mark_mib("ENTITY-MIB")
             for k, val in ent_phys.items():
                 if not val or val in ("", "0"):
                     continue
@@ -220,24 +546,58 @@ class SNMPPoller:
                 elif k.startswith("12.") and not manufacturer:
                     manufacturer = val
 
-        # 2. Parse UCD-SNMP-MIB (CPU, Load Averages, RAM)
+        # 2. Parse UCD-SNMP-MIB (Load Averages, Live Raw CPU Delta, RAM, Disks)
+        if ucd_load or ucd_cpu or ucd_mem or ucd_disk:
+            _mark_mib("UCD-SNMP-MIB")
+
         cpu_details: Dict[str, Any] = {}
         if ucd_load:
-            if "UCD-SNMP-MIB" not in active_mibs:
-                active_mibs.append("UCD-SNMP-MIB")
             cpu_details["load_1m"] = _to_float(ucd_load.get("1"))
             cpu_details["load_5m"] = _to_float(ucd_load.get("2"))
             cpu_details["load_15m"] = _to_float(ucd_load.get("3"))
 
         if ucd_cpu:
-            user_p = _to_float(ucd_cpu.get("9.0"))
-            sys_p = _to_float(ucd_cpu.get("10.0"))
-            idle_p = _to_float(ucd_cpu.get("11.0"))
-            if idle_p > 0 or user_p > 0 or sys_p > 0:
-                cpu_details["user_pct"] = user_p
-                cpu_details["system_pct"] = sys_p
-                cpu_details["idle_pct"] = idle_p
-                cpu_pct = round(max(0.0, 100.0 - idle_p), 1)
+            raw_keys = ("50.0", "51.0", "52.0", "53.0", "54.0", "56.0", "61.0")
+            curr_raw = {
+                rk: _to_int(ucd_cpu.get(rk), -1) for rk in raw_keys if rk in ucd_cpu
+            }
+            curr_raw = {rk: rv for rk, rv in curr_raw.items() if rv >= 0}
+            if "53.0" in curr_raw and len(curr_raw) >= 2 and redis_client is not None:
+                cpu_redis_key = f"snmp:prev_cpu:{target}"
+                try:
+                    prev_raw_str = await redis_client.get(cpu_redis_key)
+                    if prev_raw_str:
+                        prev_raw = json.loads(prev_raw_str)
+                        deltas: Dict[str, int] = {}
+                        valid_delta = True
+                        for rk, cur_v in curr_raw.items():
+                            prev_v = int(prev_raw.get(rk, -1))
+                            if prev_v < 0 or cur_v < prev_v:
+                                valid_delta = False
+                                break
+                            deltas[rk] = cur_v - prev_v
+                        d_total = sum(deltas.values()) if valid_delta else 0
+                        if d_total > 0:
+                            d_idle = deltas.get("53.0", 0)
+                            d_user = deltas.get("50.0", 0) + deltas.get("51.0", 0)
+                            d_sys = deltas.get("52.0", 0) + deltas.get("56.0", 0) + deltas.get("61.0", 0)
+                            cpu_details["user_pct"] = round((d_user / d_total) * 100.0, 1)
+                            cpu_details["system_pct"] = round((d_sys / d_total) * 100.0, 1)
+                            cpu_details["idle_pct"] = round((d_idle / d_total) * 100.0, 1)
+                            cpu_pct = round(max(0.0, min(100.0, ((d_total - d_idle) / d_total) * 100.0)), 1)
+                    await redis_client.set(cpu_redis_key, json.dumps(curr_raw), ex=600)
+                except Exception:
+                    pass
+
+            if cpu_pct is None:
+                user_p = _to_float(ucd_cpu.get("9.0"))
+                sys_p = _to_float(ucd_cpu.get("10.0"))
+                idle_p = _to_float(ucd_cpu.get("11.0"))
+                if idle_p > 0 or user_p > 0 or sys_p > 0:
+                    cpu_details["user_pct"] = user_p
+                    cpu_details["system_pct"] = sys_p
+                    cpu_details["idle_pct"] = idle_p
+                    cpu_pct = round(max(0.0, 100.0 - idle_p), 1)
 
         memory_details: Dict[str, Any] = {}
         if ucd_mem:
@@ -261,6 +621,8 @@ class SNMPPoller:
                 }
 
         # 3. Parse HOST-RESOURCES-MIB (hrStorageTable & hrSystem)
+        if hr_sys or hr_storage:
+            _mark_mib("HOST-RESOURCES-MIB")
         if hr_sys:
             procs = _to_int(hr_sys.get("6.0"))
             users = _to_int(hr_sys.get("5.0"))
@@ -270,8 +632,6 @@ class SNMPPoller:
                 vendor_scalars["Logged-in Users"] = users
 
         if hr_storage:
-            if "HOST-RESOURCES-MIB" not in active_mibs:
-                active_mibs.append("HOST-RESOURCES-MIB")
             storage_indices = {
                 k.split(".", 1)[1] for k in hr_storage.keys() if k.startswith("3.") and "." in k
             }
@@ -311,40 +671,59 @@ class SNMPPoller:
                         }
                     )
 
-        # 4. Parse LM-SENSORS-MIB temperatures
-        if lm_temp:
-            if "LM-SENSORS-MIB" not in active_mibs:
-                active_mibs.append("LM-SENSORS-MIB")
-            t_indices = {
-                k.split(".", 1)[1] for k in lm_temp.keys() if k.startswith("2.") and "." in k
+        # Fallback to UCD-SNMP-MIB::dskTable when hrStorageTable yields no filesystems
+        if not storage_volumes and ucd_disk:
+            d_indices = {
+                k.split(".", 1)[1] for k in ucd_disk.keys() if k.startswith("2.") and "." in k
             }
-            for t_idx in sorted(t_indices):
-                t_name = lm_temp.get(f"2.{t_idx}", f"Sensor #{t_idx}")
-                raw_mdeg = _to_float(lm_temp.get(f"3.{t_idx}"), 0.0)
-                deg_c = round(raw_mdeg / 1000.0, 1) if raw_mdeg > 200 else round(raw_mdeg, 1)
-                if 0 < deg_c < 150:
-                    if temp_celsius is None:
-                        temp_celsius = deg_c
-                    sensors.append(
-                        {
-                            "name": t_name,
-                            "category": "Temperature",
-                            "value": f"{deg_c} °C",
-                            "status": "warning" if deg_c >= 80 else "ok",
-                        }
-                    )
+            for d_idx in sorted(d_indices, key=lambda x: int(x) if x.isdigit() else 999):
+                mount = (ucd_disk.get(f"2.{d_idx}") or "").strip()
+                if not mount or any(
+                    mount.startswith(skip) for skip in ("/dev", "/run", "/sys", "/proc", "/snap")
+                ):
+                    continue
+                tot_kb = _to_int(ucd_disk.get(f"6.{d_idx}"), 0)
+                used_kb = _to_int(ucd_disk.get(f"8.{d_idx}"), 0)
+                if tot_kb <= 0:
+                    continue
+                total_b = tot_kb * 1024
+                used_b = used_kb * 1024
+                pct = _to_float(ucd_disk.get(f"9.{d_idx}"), -1.0)
+                if pct < 0:
+                    pct = round((used_b / total_b) * 100.0, 1) if total_b > 0 else 0.0
+                storage_volumes.append(
+                    {
+                        "mount": mount,
+                        "total_bytes": total_b,
+                        "used_bytes": used_b,
+                        "usage_pct": round(pct, 1),
+                    }
+                )
+
+        # 4. Parse LM-SENSORS-MIB temperatures, fans, and voltages
+        if lm_sensors:
+            _mark_mib("LM-SENSORS-MIB")
+            lm_temp_c, lm_list = _parse_lm_sensors(lm_sensors)
+            if lm_temp_c is not None and temp_celsius is None:
+                temp_celsius = lm_temp_c
+            sensors.extend(lm_list)
 
         # 5. Parse LLDP-MIB Neighbors
+        if lldp_rem or lldp_loc_chassis:
+            _mark_mib("LLDP-MIB")
         if lldp_rem:
-            if "LLDP-MIB" not in active_mibs:
-                active_mibs.append("LLDP-MIB")
             rem_keys = {
-                ".".join(k.split(".")[1:])
+                k.split(".", 1)[1]
                 for k in lldp_rem.keys()
-                if k.startswith("9.") and "." in k
+                if "." in k and k.split(".", 1)[0] in ("5", "7", "8", "9", "10")
             }
             for rk in sorted(rem_keys):
-                sys_n = lldp_rem.get(f"9.{rk}", "")
+                chassis_id = lldp_rem.get(f"5.{rk}", "")
+                sys_n = (
+                    lldp_rem.get(f"9.{rk}", "")
+                    or _normalize_mac(chassis_id)
+                    or chassis_id
+                )
                 port_id = lldp_rem.get(f"7.{rk}", "")
                 port_desc = lldp_rem.get(f"8.{rk}", "")
                 sys_desc = lldp_rem.get(f"10.{rk}", "")
@@ -363,25 +742,31 @@ class SNMPPoller:
         # 6. Vendor-Specific Enterprise MIB Walks
         if vendor_key == "ubiquiti":
             ubnt_sys, ubnt_vap, frog_mem = await asyncio.gather(
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.6.3", timeout=3.0),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.6.1.2.1", timeout=3.0),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.10002.1.1.1.1", timeout=3.0),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.6.3", timeout=3.0, sem=sem),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.6.1.2.1", timeout=3.0, sem=sem),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.10002.1.1.1.1", timeout=3.0, sem=sem),
             )
+            if ubnt_sys or ubnt_vap:
+                _mark_mib("UBNT-UniFi-MIB")
             if ubnt_sys:
                 hardware_model = ubnt_sys.get("3.0") or hardware_model
                 firmware_version = ubnt_sys.get("6.0") or firmware_version
-            if frog_mem and mem_pct is None:
-                tot_k = _to_int(frog_mem.get("1.0"))
-                free_k = _to_int(frog_mem.get("2.0"))
-                if tot_k > 0:
-                    used_k = max(0, tot_k - free_k)
-                    mem_pct = round((used_k / tot_k) * 100.0, 1)
-                    memory_details = {
-                        "total_bytes": tot_k * 1024,
-                        "used_bytes": used_k * 1024,
-                        "avail_bytes": free_k * 1024,
-                        "usage_pct": mem_pct,
-                    }
+                if ubnt_sys.get("5.0"):
+                    ubnt_uptime_ticks = _to_int(ubnt_sys.get("5.0"), 0) * 100
+            if frog_mem:
+                _mark_mib("FROGFOOT-RESOURCES-MIB")
+                if mem_pct is None:
+                    tot_k = _to_int(frog_mem.get("1.0"))
+                    free_k = _to_int(frog_mem.get("2.0"))
+                    if tot_k > 0:
+                        used_k = max(0, tot_k - free_k)
+                        mem_pct = round((used_k / tot_k) * 100.0, 1)
+                        memory_details = {
+                            "total_bytes": tot_k * 1024,
+                            "used_bytes": used_k * 1024,
+                            "avail_bytes": free_k * 1024,
+                            "usage_pct": mem_pct,
+                        }
             if ubnt_vap:
                 vap_ids = {
                     k.split(".", 1)[1] for k in ubnt_vap.keys() if k.startswith("6.") and "." in k
@@ -405,10 +790,12 @@ class SNMPPoller:
 
         elif vendor_key == "mikrotik":
             mt_hl, mt_lic, mt_sys = await asyncio.gather(
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.3", timeout=3.0),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.4", timeout=3.0),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.7", timeout=3.0),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.3", timeout=3.0, sem=sem),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.4", timeout=3.0, sem=sem),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.7", timeout=3.0, sem=sem),
             )
+            if mt_hl or mt_lic or mt_sys:
+                _mark_mib("MIKROTIK-MIB")
             if mt_lic:
                 firmware_version = mt_lic.get("4.0") or firmware_version
             if mt_sys:
@@ -441,11 +828,12 @@ class SNMPPoller:
 
         elif vendor_key == "synology":
             syno_sys, syno_disk, syno_raid = await asyncio.gather(
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.6574.1", timeout=3.0),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.6574.2.1.1", timeout=3.0),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.6574.3.1.1", timeout=3.0),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.6574.1", timeout=3.0, sem=sem),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.6574.2.1.1", timeout=3.0, sem=sem),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.6574.3.1.1", timeout=3.0, sem=sem),
             )
             if syno_sys:
+                _mark_mib("SYNOLOGY-SYSTEM-MIB")
                 t_val = _to_float(syno_sys.get("2.0"))
                 if t_val > 0:
                     temp_celsius = t_val
@@ -456,6 +844,7 @@ class SNMPPoller:
                 serial_number = syno_sys.get("5.2.0") or serial_number
                 firmware_version = syno_sys.get("5.3.0") or firmware_version
             if syno_disk:
+                _mark_mib("SYNOLOGY-DISK-MIB")
                 d_ids = {k.split(".", 1)[1] for k in syno_disk.keys() if k.startswith("2.") and "." in k}
                 for did in sorted(d_ids):
                     d_name = syno_disk.get(f"2.{did}", f"Disk {did}")
@@ -470,6 +859,7 @@ class SNMPPoller:
                         }
                     )
             if syno_raid:
+                _mark_mib("SYNOLOGY-RAID-MIB")
                 r_ids = {k.split(".", 1)[1] for k in syno_raid.keys() if k.startswith("2.") and "." in k}
                 for rid in sorted(r_ids):
                     r_name = syno_raid.get(f"2.{rid}", f"RAID {rid}")
@@ -485,15 +875,17 @@ class SNMPPoller:
 
         elif vendor_key == "cisco":
             c_cpu, c_env = await asyncio.gather(
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.109.1.1.1.1", timeout=3.0),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.13.1.3.1", timeout=3.0),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.109.1.1.1.1", timeout=3.0, sem=sem),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.13.1.3.1", timeout=3.0, sem=sem),
             )
             if c_cpu:
+                _mark_mib("CISCO-PROCESS-MIB")
                 for k, v in c_cpu.items():
                     if k.startswith("7.") or k.startswith("8."):
                         cpu_pct = _to_float(v)
                         break
             if c_env:
+                _mark_mib("CISCO-ENVMON-MIB")
                 e_ids = {k.split(".", 1)[1] for k in c_env.keys() if k.startswith("2.") and "." in k}
                 for eid in sorted(e_ids):
                     s_name = c_env.get(f"2.{eid}", f"Temp Sensor {eid}")
@@ -506,8 +898,11 @@ class SNMPPoller:
                         )
 
         elif vendor_key == "fortinet":
-            fg_sys = await self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.12356.101.4.1", timeout=3.0)
+            fg_sys = await self._snmp_walk_oid(
+                target, port, auth_args, "1.3.6.1.4.1.12356.101.4.1", timeout=3.0, sem=sem
+            )
             if fg_sys:
+                _mark_mib("FORTINET-FORTIGATE-MIB")
                 firmware_version = fg_sys.get("1.0") or firmware_version
                 cpu_pct = _to_float(fg_sys.get("3.0")) or cpu_pct
                 mem_pct = _to_float(fg_sys.get("4.0")) or mem_pct
@@ -517,10 +912,11 @@ class SNMPPoller:
 
         elif vendor_key in ("apc", "cyberpower", "eaton"):
             apc_ups, std_ups = await asyncio.gather(
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.318.1.1.1", timeout=3.0),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.2.1.33.1", timeout=3.0),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.318.1.1.1", timeout=3.0, sem=sem),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.2.1.33.1", timeout=3.0, sem=sem),
             )
             if apc_ups:
+                _mark_mib("PowerNet-UPS-MIB")
                 hardware_model = apc_ups.get("1.1.1.0") or hardware_model
                 b_cap = _to_float(apc_ups.get("2.2.1.0"))
                 b_temp = _to_float(apc_ups.get("2.2.2.0"))
@@ -536,6 +932,7 @@ class SNMPPoller:
                 if out_load >= 0:
                     sensors.append({"name": "UPS Output Load", "category": "Load", "value": f"{out_load:.0f}%", "status": "ok"})
             if std_ups:
+                _mark_mib("UPS-MIB")
                 b_chg = _to_float(std_ups.get("2.4.0"))
                 b_min = _to_int(std_ups.get("2.3.0"))
                 if b_chg > 0:
@@ -544,15 +941,26 @@ class SNMPPoller:
                     vendor_scalars["Estimated Runtime"] = f"{b_min} mins"
 
         elif vendor_key == "printer":
-            prt_mib = await self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.2.1.43", timeout=3.0)
+            prt_mib = await self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.2.1.43", timeout=3.0, sem=sem)
             if prt_mib:
+                _mark_mib("Printer-MIB")
                 pages = _to_int(prt_mib.get("10.2.1.4.1.1"))
                 if pages > 0:
                     vendor_scalars["Total Lifetime Pages Printed"] = pages
                 serial_number = prt_mib.get("5.1.1.17.1") or serial_number
 
+        # Apply sysDescr fallback extraction (UDM-Pro, switches, APs, Linux kernels, etc.)
+        descr_meta = _parse_sys_descr_metadata(sys_descr, vendor_key)
+        if not hardware_model and descr_meta["hardware_model"]:
+            hardware_model = descr_meta["hardware_model"]
+        if not firmware_version and not software_version and descr_meta["firmware_version"]:
+            firmware_version = descr_meta["firmware_version"]
+        if descr_meta["os_kernel"]:
+            vendor_scalars["OS / Kernel"] = descr_meta["os_kernel"]
+
         return {
             "active_mibs": active_mibs,
+            "responding_mibs": responding_mibs,
             "hardware_model": hardware_model,
             "serial_number": serial_number,
             "firmware_version": firmware_version or software_version,
@@ -560,6 +968,10 @@ class SNMPPoller:
             "temp_celsius": temp_celsius,
             "cpu_pct": cpu_pct,
             "mem_pct": mem_pct,
+            "hr_uptime_ticks": hr_uptime_ticks,
+            "ubnt_uptime_ticks": ubnt_uptime_ticks,
+            "lldp_chassis_mac": lldp_chassis_mac,
+            "bridge_mac": bridge_mac_norm,
             "extended_metrics": {
                 "cpu_details": cpu_details,
                 "memory_details": memory_details,
@@ -602,8 +1014,7 @@ class SNMPPoller:
 
         sys_descr = sys_scalars.get("1.0", "")
         sys_obj_id = sys_scalars.get("2.0", "")
-        raw_uptime = sys_scalars.get("3.0", "0").split(":")[0].strip()
-        sys_uptime = int(raw_uptime) if raw_uptime.isdigit() else 0
+        snmpd_uptime_ticks = _parse_timeticks(sys_scalars.get("3.0"))
         sys_contact = sys_scalars.get("4.0", "")
         sys_name = label or sys_scalars.get("5.0", target) or target
         sys_location = sys_scalars.get("6.0", "")
@@ -614,12 +1025,17 @@ class SNMPPoller:
         device_category = vendor_profile["category"]
         base_mibs = vendor_profile["mibs"]
 
-        # Walk interface tables, HR processor load, and vendor enrichment MIBs concurrently
+        # Bound per-device subprocess concurrency to avoid SNMP agent throttling/drops
+        dev_sem = asyncio.Semaphore(6)
+
+        # Walk interface tables, IP address table, HR processor load, and vendor enrichment MIBs
         (
             if_names,
             if_descrs,
             if_aliases,
             if_speeds,
+            if_speed32,
+            if_phys,
             if_oper,
             hc_in,
             hc_out,
@@ -627,27 +1043,95 @@ class SNMPPoller:
             out_errs,
             in_disc,
             out_disc,
+            ip_addr_table,
             cpu_loads,
             enrichment,
         ) = await asyncio.gather(
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_NAME),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_DESCR),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_ALIAS),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_HIGH_SPEED),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_OPER_STATUS),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_HC_IN_OCTETS),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_HC_OUT_OCTETS),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_IN_ERRORS),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_OUT_ERRORS),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_IN_DISCARDS),
-            self._snmp_walk_oid(target, port, auth_args, OID_IF_OUT_DISCARDS),
-            self._snmp_walk_oid(target, port, auth_args, OID_HR_PROC_LOAD),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_NAME, sem=dev_sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_DESCR, sem=dev_sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_ALIAS, sem=dev_sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_HIGH_SPEED, sem=dev_sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_SPEED, sem=dev_sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_PHYS_ADDR, sem=dev_sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_OPER_STATUS, sem=dev_sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_HC_IN_OCTETS, sem=dev_sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_HC_OUT_OCTETS, sem=dev_sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_IN_ERRORS, sem=dev_sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_OUT_ERRORS, sem=dev_sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_IN_DISCARDS, sem=dev_sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_OUT_DISCARDS, sem=dev_sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_IP_ADDR_TABLE, sem=dev_sem),
+            self._snmp_walk_oid(target, port, auth_args, OID_HR_PROC_LOAD, sem=dev_sem),
             self._collect_vendor_enrichment(
-                target, port, auth_args, vendor_profile["key"], base_mibs
+                target,
+                port,
+                auth_args,
+                vendor_profile["key"],
+                base_mibs,
+                sys_descr=sys_descr,
+                redis_client=redis_client,
+                sem=dev_sem,
             ),
         )
 
-        cpu_vals = [float(v) for v in cpu_loads.values() if v.replace(".", "", 1).isdigit()]
+        # Fallback to 32-bit IF-MIB counters when 64-bit HC counters are unavailable
+        if not hc_in and not hc_out:
+            hc_in, hc_out = await asyncio.gather(
+                self._snmp_walk_oid(target, port, auth_args, OID_IF_IN_OCTETS, sem=dev_sem),
+                self._snmp_walk_oid(target, port, auth_args, OID_IF_OUT_OCTETS, sem=dev_sem),
+            )
+
+        hr_uptime_ticks = int(enrichment.get("hr_uptime_ticks") or 0)
+        ubnt_uptime_ticks = int(enrichment.get("ubnt_uptime_ticks") or 0)
+        if hr_uptime_ticks > 0:
+            sys_uptime = hr_uptime_ticks
+        elif ubnt_uptime_ticks > 0:
+            sys_uptime = ubnt_uptime_ticks
+        else:
+            sys_uptime = snmpd_uptime_ticks
+
+        if hr_uptime_ticks > 0 and snmpd_uptime_ticks > 0 and abs(hr_uptime_ticks - snmpd_uptime_ticks) > 60000:
+            sec = snmpd_uptime_ticks // 100
+            d, h, m = sec // 86400, (sec % 86400) // 3600, (sec % 3600) // 60
+            if d > 0:
+                agent_up_str = f"{d}d {h}h"
+            elif h > 0:
+                agent_up_str = f"{h}h {m}m"
+            else:
+                agent_up_str = f"{m}m"
+            enrichment["extended_metrics"]["vendor_scalars"]["SNMP Agent Uptime"] = agent_up_str
+
+        mac_address, subnet_cidr, ip_addresses = _extract_ip_and_mac(
+            target,
+            ip_addr_table,
+            if_phys,
+            if_names or if_descrs,
+            if_oper,
+            enrichment.get("lldp_chassis_mac", ""),
+            enrichment.get("bridge_mac", ""),
+        )
+
+        responding_mibs: List[str] = ["SNMPv2-MIB"]
+        if if_names or if_descrs or hc_in or if_phys:
+            responding_mibs.append("IF-MIB")
+        if ip_addr_table:
+            responding_mibs.append("IP-MIB")
+        if cpu_loads and "HOST-RESOURCES-MIB" not in responding_mibs:
+            responding_mibs.append("HOST-RESOURCES-MIB")
+        for rmib in enrichment.get("responding_mibs", []):
+            if rmib not in responding_mibs:
+                responding_mibs.append(rmib)
+
+        active_mibs = list(enrichment["active_mibs"])
+        for rmib in responding_mibs:
+            if rmib not in active_mibs:
+                active_mibs.append(rmib)
+
+        enrichment["extended_metrics"]["responding_mibs"] = responding_mibs
+        enrichment["extended_metrics"]["ip_addresses"] = ip_addresses[:32]
+
+        cpu_vals = [_to_float(v, -1.0) for v in cpu_loads.values()]
+        cpu_vals = [v for v in cpu_vals if v >= 0.0]
         if cpu_vals:
             avg_cpu = round(sum(cpu_vals) / len(cpu_vals), 2)
             enrichment["extended_metrics"]["cpu_details"]["core_count"] = len(cpu_vals)
@@ -673,18 +1157,18 @@ class SNMPPoller:
                 loopback_indices.add(idx)
             descr = if_descrs.get(k) or name
             alias = if_aliases.get(k, "")
-            high_speed_mbps = int(if_speeds.get(k, "0") or 0) if if_speeds.get(k, "0").isdigit() else 0
-            speed_bps = high_speed_mbps * 1_000_000
+            high_speed_mbps = _to_int(if_speeds.get(k), 0)
+            speed_bps = high_speed_mbps * 1_000_000 if high_speed_mbps > 0 else _to_int(if_speed32.get(k), 0)
 
-            oper_raw = if_oper.get(k, "1")
-            oper_status = 1 if "1" in oper_raw or "up" in oper_raw.lower() else 2
+            oper_raw = (if_oper.get(k) or "1").strip()
+            oper_status = 1 if (_to_int(oper_raw, 2) == 1 or oper_raw.lower().startswith("up")) else 2
 
-            in_oct = int(hc_in.get(k, "0") or 0) if hc_in.get(k, "0").isdigit() else 0
-            out_oct = int(hc_out.get(k, "0") or 0) if hc_out.get(k, "0").isdigit() else 0
-            in_err = int(in_errs.get(k, "0") or 0) if in_errs.get(k, "0").isdigit() else 0
-            out_err = int(out_errs.get(k, "0") or 0) if out_errs.get(k, "0").isdigit() else 0
-            in_dsc = int(in_disc.get(k, "0") or 0) if in_disc.get(k, "0").isdigit() else 0
-            out_dsc = int(out_disc.get(k, "0") or 0) if out_disc.get(k, "0").isdigit() else 0
+            in_oct = _to_int(hc_in.get(k), 0)
+            out_oct = _to_int(hc_out.get(k), 0)
+            in_err = _to_int(in_errs.get(k), 0)
+            out_err = _to_int(out_errs.get(k), 0)
+            in_dsc = _to_int(in_disc.get(k), 0)
+            out_dsc = _to_int(out_disc.get(k), 0)
 
             redis_key = f"snmp:prev:{target}:{idx}"
             prev_raw = await redis_client.get(redis_key)
@@ -744,14 +1228,14 @@ class SNMPPoller:
                     device_ip, sys_name, sys_descr, sys_object_id, sys_location, sys_contact,
                     sys_uptime_ticks, cpu_usage_pct, mem_usage_pct, temp_celsius,
                     interface_count, vendor_name, device_category, matched_mibs,
-                    hardware_model, serial_number, firmware_version, extended_metrics,
-                    is_reachable, last_poll_duration_ms, last_polled
+                    hardware_model, serial_number, firmware_version, mac_address, subnet_cidr,
+                    extended_metrics, is_reachable, last_poll_duration_ms, first_polled, last_polled
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6,
                     $7, $8, $9, $10,
                     $11, $12, $13, $14::jsonb,
-                    $15, $16, $17, $18::jsonb,
-                    TRUE, $19, NOW()
+                    $15, $16, $17, $18, $19,
+                    $20::jsonb, TRUE, $21, NOW(), NOW()
                 )
                 ON CONFLICT (device_ip) DO UPDATE SET
                     sys_name = EXCLUDED.sys_name,
@@ -770,9 +1254,12 @@ class SNMPPoller:
                     hardware_model = COALESCE(NULLIF(EXCLUDED.hardware_model, ''), snmp_devices.hardware_model),
                     serial_number = COALESCE(NULLIF(EXCLUDED.serial_number, ''), snmp_devices.serial_number),
                     firmware_version = COALESCE(NULLIF(EXCLUDED.firmware_version, ''), snmp_devices.firmware_version),
+                    mac_address = COALESCE(NULLIF(EXCLUDED.mac_address, ''), snmp_devices.mac_address),
+                    subnet_cidr = COALESCE(NULLIF(EXCLUDED.subnet_cidr, ''), snmp_devices.subnet_cidr),
                     extended_metrics = EXCLUDED.extended_metrics,
                     is_reachable = TRUE,
                     last_poll_duration_ms = EXCLUDED.last_poll_duration_ms,
+                    first_polled = COALESCE(snmp_devices.first_polled, NOW()),
                     last_polled = NOW()
                 """,
                 target,
@@ -788,10 +1275,12 @@ class SNMPPoller:
                 len(rows_to_insert),
                 vendor_name,
                 device_category,
-                json.dumps(enrichment["active_mibs"]),
+                json.dumps(active_mibs),
                 enrichment["hardware_model"],
                 enrichment["serial_number"],
                 enrichment["firmware_version"],
+                mac_address,
+                subnet_cidr,
                 json.dumps(enrichment["extended_metrics"]),
                 poll_ms,
             )
@@ -824,6 +1313,73 @@ class SNMPPoller:
             "mem_usage_pct": mem_usage,
             "poll_ms": poll_ms,
         }
+
+    async def poll_single_ip(
+        self,
+        device_ip: str,
+        pool: asyncpg.Pool,
+        redis_client: aioredis.Redis,
+    ) -> Optional[Dict[str, Any]]:
+        """Immediately polls one specific IP using its configured profile or matching profiles."""
+        target_ip = device_ip.strip()
+        if not target_ip:
+            return None
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT t.device_ip, t.label,
+                       COALESCE(p.version, 'v2c') AS version,
+                       COALESCE(p.port, 161) AS port,
+                       COALESCE(p.community, 'public') AS community,
+                       COALESCE(p.v3_user, '') AS v3_user,
+                       COALESCE(p.v3_auth_proto, 'SHA') AS v3_auth_proto,
+                       COALESCE(p.v3_auth_key, '') AS v3_auth_key,
+                       COALESCE(p.v3_priv_proto, 'AES') AS v3_priv_proto,
+                       COALESCE(p.v3_priv_key, '') AS v3_priv_key
+                FROM snmp_targets_config t
+                LEFT JOIN snmp_profiles p ON p.id = t.profile_id
+                WHERE t.device_ip = $1
+                """,
+                target_ip,
+            )
+            if row:
+                return await self._poll_single_device(dict(row), pool, redis_client)
+
+            profiles = [
+                dict(p)
+                for p in await conn.fetch(
+                    """
+                    SELECT id, name, version, port, community, v3_user,
+                           v3_auth_proto, v3_auth_key, v3_priv_proto, v3_priv_key
+                    FROM snmp_profiles
+                    ORDER BY id ASC
+                    """
+                )
+            ]
+
+        for prof in profiles:
+            port = int(prof.get("port") or 161)
+            auth_args = self._build_auth_args(prof)
+            scalars = await self._snmp_walk_oid(
+                target_ip, port, auth_args, "1.3.6.1.2.1.1", timeout=2.5
+            )
+            if scalars:
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        INSERT INTO snmp_targets_config (device_ip, label, profile_id, enabled)
+                        VALUES ($1, '', $2, TRUE)
+                        ON CONFLICT (device_ip) DO UPDATE SET
+                            profile_id = EXCLUDED.profile_id,
+                            enabled = TRUE
+                        """,
+                        target_ip,
+                        prof["id"],
+                    )
+                target_cfg = {**prof, "device_ip": target_ip, "label": ""}
+                return await self._poll_single_device(target_cfg, pool, redis_client)
+        return None
 
     async def auto_discover_and_rematch_devices(
         self,
@@ -1032,6 +1588,11 @@ class SNMPPoller:
                     self._snmp_walk_oid_fast(ip, port, auth_args, OID_IF_HC_IN_OCTETS),
                     self._snmp_walk_oid_fast(ip, port, auth_args, OID_IF_HC_OUT_OCTETS),
                 )
+                if not hc_in and not hc_out:
+                    hc_in, hc_out = await asyncio.gather(
+                        self._snmp_walk_oid_fast(ip, port, auth_args, OID_IF_IN_OCTETS),
+                        self._snmp_walk_oid_fast(ip, port, auth_args, OID_IF_OUT_OCTETS),
+                    )
 
             if not hc_in and not hc_out:
                 return
@@ -1052,10 +1613,8 @@ class SNMPPoller:
                 if idx in ignore:
                     continue
                 k = str(idx)
-                in_raw = hc_in.get(k, "0") or "0"
-                out_raw = hc_out.get(k, "0") or "0"
-                in_oct = int(in_raw) if in_raw.isdigit() else 0
-                out_oct = int(out_raw) if out_raw.isdigit() else 0
+                in_oct = _to_int(hc_in.get(k), 0)
+                out_oct = _to_int(hc_out.get(k), 0)
 
                 prev = self._live_prev_counters.get((ip, idx))
                 if prev is not None:

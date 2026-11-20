@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
+import ipaddress
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import asyncpg
 import httpx
@@ -109,10 +111,21 @@ class UniFiCollector:
                     if not mac:
                         continue
                     ip_addr = str(dev.get("ip", ""))
+                    cfg_net = dev.get("config_network") if isinstance(dev.get("config_network"), dict) else {}
+                    lan_ip = str(dev.get("lan_ip") or cfg_net.get("ip") or "").strip()
                     name = str(dev.get("name") or dev.get("model") or mac)
                     model = str(dev.get("model", ""))
                     dev_type = str(dev.get("type", "udm"))
+                    serial_num = str(dev.get("serial") or "").strip()
                     fw_ver = str(dev.get("version", ""))
+                    is_gw = dev_type in ("ugw", "udm", "uxg") or "UDM" in model.upper()
+                    if not lan_ip and is_gw:
+                        parsed_host = urlparse(host if "://" in host else f"https://{host}").hostname or ""
+                        try:
+                            ipaddress.IPv4Address(parsed_host)
+                            lan_ip = parsed_host
+                        except ValueError:
+                            pass
                     state_code = int(dev.get("state", 1) or 0)
                     status = "online" if state_code == 1 else "offline"
                     if state_code == 1:
@@ -159,7 +172,7 @@ class UniFiCollector:
                     rx_bps = float(dev.get("rx_bytes-r", 0.0) or 0.0) * 8.0
                     tx_bps = float(dev.get("tx_bytes-r", 0.0) or 0.0) * 8.0
 
-                    if dev_type in ("ugw", "udm", "uxg") or "UDM" in model.upper():
+                    if is_gw:
                         gateway_mac = mac
                         gateway_name = name
                         gateway_model = model
@@ -173,19 +186,21 @@ class UniFiCollector:
                     await conn.execute(
                         """
                         INSERT INTO unifi_devices (
-                            mac, ip_address, name, model, device_type, firmware_version,
+                            mac, ip_address, lan_ip, name, model, device_type, serial_number, firmware_version,
                             status, uptime_sec, cpu_usage_pct, mem_usage_pct, temp_celsius,
                             poe_total_watts, poe_max_watts, num_sta, rx_bps, tx_bps, port_table, last_seen
                         ) VALUES (
-                            $1, $2, $3, $4, $5, $6,
-                            $7, $8, $9, $10, $11,
-                            $12, $13, $14, $15, $16, $17::jsonb, NOW()
+                            $1, $2, $3, $4, $5, $6, $7, $8,
+                            $9, $10, $11, $12, $13,
+                            $14, $15, $16, $17, $18, $19::jsonb, NOW()
                         )
                         ON CONFLICT (mac) DO UPDATE SET
                             ip_address = EXCLUDED.ip_address,
+                            lan_ip = COALESCE(NULLIF(EXCLUDED.lan_ip, ''), unifi_devices.lan_ip),
                             name = EXCLUDED.name,
                             model = EXCLUDED.model,
                             device_type = EXCLUDED.device_type,
+                            serial_number = COALESCE(NULLIF(EXCLUDED.serial_number, ''), unifi_devices.serial_number),
                             firmware_version = EXCLUDED.firmware_version,
                             status = EXCLUDED.status,
                             uptime_sec = EXCLUDED.uptime_sec,
@@ -202,9 +217,11 @@ class UniFiCollector:
                         """,
                         mac,
                         ip_addr,
+                        lan_ip,
                         name,
                         model,
                         dev_type,
+                        serial_num,
                         fw_ver,
                         status,
                         uptime_sec,

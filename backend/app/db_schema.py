@@ -66,6 +66,13 @@ ALTER TABLE snmp_devices ADD COLUMN IF NOT EXISTS firmware_version TEXT;
 ALTER TABLE snmp_devices ADD COLUMN IF NOT EXISTS sys_contact TEXT;
 ALTER TABLE snmp_devices ADD COLUMN IF NOT EXISTS temp_celsius DOUBLE PRECISION;
 ALTER TABLE snmp_devices ADD COLUMN IF NOT EXISTS extended_metrics JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE snmp_devices ADD COLUMN IF NOT EXISTS mac_address TEXT;
+ALTER TABLE snmp_devices ADD COLUMN IF NOT EXISTS subnet_cidr TEXT;
+ALTER TABLE snmp_devices ADD COLUMN IF NOT EXISTS first_polled TIMESTAMPTZ DEFAULT NOW();
+
+-- Extend unifi_devices with serial_number & lan_ip for accurate L3 correlation
+ALTER TABLE unifi_devices ADD COLUMN IF NOT EXISTS serial_number TEXT;
+ALTER TABLE unifi_devices ADD COLUMN IF NOT EXISTS lan_ip TEXT;
 
 CREATE TABLE IF NOT EXISTS custom_mibs (
     id             SERIAL PRIMARY KEY,

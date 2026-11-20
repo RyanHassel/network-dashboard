@@ -270,6 +270,7 @@ interface DeviceDetailPayload {
     label: string;
     profile_id: number | null;
     enabled: boolean;
+    created_at?: string | null;
     profile_name: string | null;
     profile_version: string | null;
     profile_port: number | null;
@@ -292,6 +293,9 @@ interface DeviceDetailPayload {
     hardware_model: string | null;
     serial_number: string | null;
     firmware_version: string | null;
+    mac_address?: string | null;
+    subnet_cidr?: string | null;
+    first_polled?: string | null;
     extended_metrics: {
       cpu_details?: {
         core_count?: number;
@@ -336,6 +340,15 @@ interface DeviceDetailPayload {
         stations: number;
         tx_power: string;
       }>;
+      responding_mibs?: string[];
+      ip_addresses?: Array<{
+        ip: string;
+        netmask: string;
+        cidr: string;
+        if_index: number;
+        if_name: string;
+        mac_address: string;
+      }>;
       vendor_scalars?: Record<string, string | number>;
     } | null;
     is_reachable: boolean;
@@ -347,6 +360,16 @@ interface DeviceDetailPayload {
     vendor?: string;
     category: string;
     mibs: string[];
+  };
+  resolved_identity?: {
+    hostname: string;
+    mac_address: string | null;
+    vendor: string | null;
+    subnet_cidr: string | null;
+    vlan_id: number | null;
+    discovery_source: string;
+    first_seen: string | null;
+    last_seen: string | null;
   };
   snmp_interfaces: Array<{
     if_index: number;
@@ -370,9 +393,11 @@ interface DeviceDetailPayload {
   unifi_device: {
     mac: string;
     ip_address: string;
+    lan_ip?: string | null;
     name: string;
     model: string;
     device_type: string;
+    serial_number?: string | null;
     firmware_version: string;
     status: string;
     uptime_sec: number;
@@ -567,6 +592,7 @@ function formatBytes(bytes: number | undefined | null): string {
 function formatUptime(sec: number | undefined | null): string {
   const s = Number(sec || 0);
   if (s <= 0) return "—";
+  if (s < 60) return `${Math.floor(s)}s`;
   const d = Math.floor(s / 86400);
   const h = Math.floor((s % 86400) / 3600);
   const m = Math.floor((s % 3600) / 60);
@@ -1827,13 +1853,24 @@ export const App: React.FC = () => {
   const handlePollSingleDeviceNow = async (ip: string) => {
     setPollingDeviceNow(true);
     try {
-      await fetch(`/api/devices/${encodeURIComponent(ip)}/poll`, { method: "POST" });
-      setTimeout(() => {
-        fetchDeviceDetail(ip);
-        fetchAllDevices();
-        setPollingDeviceNow(false);
-      }, 3500);
-    } catch {
+      const r = await fetch(`/api/devices/${encodeURIComponent(ip)}/poll`, { method: "POST" });
+      let status = "triggered";
+      if (r.ok) {
+        try {
+          const body = await r.json();
+          status = body?.status || "triggered";
+        } catch {
+          status = "triggered";
+        }
+      }
+      await Promise.all([fetchDeviceDetail(ip), fetchAllDevices()]);
+      if (status !== "completed") {
+        setTimeout(() => {
+          fetchDeviceDetail(ip);
+          fetchAllDevices();
+        }, 2000);
+      }
+    } finally {
       setPollingDeviceNow(false);
     }
   };
@@ -4381,7 +4418,8 @@ export const App: React.FC = () => {
                       {selectedDeviceDetailIp}
                     </h2>
                     <span className="text-sm font-medium text-slate-300">
-                      {deviceDetail?.snmp_system?.sys_name ||
+                      {deviceDetail?.resolved_identity?.hostname ||
+                        deviceDetail?.snmp_system?.sys_name ||
                         deviceDetail?.snmp_config?.label ||
                         deviceDetail?.discovered_host?.hostname ||
                         ""}
@@ -4389,13 +4427,15 @@ export const App: React.FC = () => {
                     <span
                       className={`rounded px-2 py-0.5 font-mono-tabular text-[11px] ${
                         deviceDetail?.discovered_host?.is_online ||
-                        deviceDetail?.snmp_system?.is_reachable
+                        deviceDetail?.snmp_system?.is_reachable ||
+                        deviceDetail?.unifi_device?.status === "online"
                           ? "bg-emerald-500/15 text-emerald-400"
                           : "bg-slate-800 text-slate-400"
                       }`}
                     >
                       {deviceDetail?.discovered_host?.is_online ||
-                      deviceDetail?.snmp_system?.is_reachable
+                      deviceDetail?.snmp_system?.is_reachable ||
+                      deviceDetail?.unifi_device?.status === "online"
                         ? "ONLINE"
                         : "OFFLINE"}
                     </span>
@@ -4446,70 +4486,97 @@ export const App: React.FC = () => {
                       <Network className="h-4 w-4 text-emerald-400" />
                       Network Identity & ARP / Nmap Discovery
                     </h3>
-                    <dl className="grid grid-cols-2 gap-y-3 text-xs">
-                      <div>
-                        <dt className="text-slate-400">IPv4 Address</dt>
-                        <dd className="mt-0.5 font-mono-tabular font-semibold text-white">
-                          {selectedDeviceDetailIp}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt className="text-slate-400">Hostname</dt>
-                        <dd className="mt-0.5 text-slate-200">
-                          {deviceDetail?.discovered_host?.hostname ||
-                            deviceDetail?.snmp_system?.sys_name ||
-                            "—"}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt className="text-slate-400">MAC Address</dt>
-                        <dd className="mt-0.5 font-mono-tabular text-slate-200">
-                          {deviceDetail?.discovered_host?.mac_address ||
-                            deviceDetail?.unifi_client?.mac ||
-                            deviceDetail?.unifi_device?.mac ||
-                            "—"}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt className="text-slate-400">OUI Hardware Vendor</dt>
-                        <dd className="mt-0.5 text-slate-200">
-                          {deviceDetail?.discovered_host?.vendor ||
-                            deviceDetail?.unifi_client?.oui_vendor ||
-                            "—"}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt className="text-slate-400">Subnet CIDR & VLAN</dt>
-                        <dd className="mt-0.5 font-mono-tabular text-slate-200">
-                          {deviceDetail?.discovered_host?.subnet_cidr || "—"}
-                          {deviceDetail?.discovered_host?.vlan_id
-                            ? ` (VLAN ${deviceDetail.discovered_host.vlan_id})`
-                            : ""}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt className="text-slate-400">Discovery Method</dt>
-                        <dd className="mt-0.5 font-mono-tabular text-slate-300">
-                          {deviceDetail?.discovered_host?.discovery_source || "manual / snmp"}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt className="text-slate-400">First Seen</dt>
-                        <dd className="mt-0.5 font-mono-tabular text-slate-400">
-                          {deviceDetail?.discovered_host?.first_seen
-                            ? new Date(deviceDetail.discovered_host.first_seen).toLocaleString()
-                            : "—"}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt className="text-slate-400">Last Seen</dt>
-                        <dd className="mt-0.5 font-mono-tabular text-slate-300">
-                          {deviceDetail?.discovered_host?.last_seen
-                            ? new Date(deviceDetail.discovered_host.last_seen).toLocaleString()
-                            : "—"}
-                        </dd>
-                      </div>
-                    </dl>
+                    {(() => {
+                      const ri = deviceDetail?.resolved_identity;
+                      const hostname =
+                        ri?.hostname ||
+                        deviceDetail?.discovered_host?.hostname ||
+                        deviceDetail?.snmp_system?.sys_name ||
+                        "—";
+                      const macAddr =
+                        ri?.mac_address ||
+                        deviceDetail?.discovered_host?.mac_address ||
+                        deviceDetail?.snmp_system?.mac_address ||
+                        deviceDetail?.unifi_client?.mac ||
+                        deviceDetail?.unifi_device?.mac ||
+                        "—";
+                      const vendorName =
+                        ri?.vendor ||
+                        deviceDetail?.discovered_host?.vendor ||
+                        deviceDetail?.unifi_client?.oui_vendor ||
+                        deviceDetail?.snmp_system?.vendor_name ||
+                        "—";
+                      const subnetCidr =
+                        ri?.subnet_cidr ||
+                        deviceDetail?.discovered_host?.subnet_cidr ||
+                        deviceDetail?.snmp_system?.subnet_cidr;
+                      const vlanId =
+                        ri?.vlan_id ??
+                        deviceDetail?.discovered_host?.vlan_id ??
+                        deviceDetail?.unifi_client?.vlan_id;
+                      const discMethod =
+                        ri?.discovery_source ||
+                        deviceDetail?.discovered_host?.discovery_source ||
+                        "manual / snmp";
+                      const firstSeen =
+                        ri?.first_seen ||
+                        deviceDetail?.discovered_host?.first_seen ||
+                        deviceDetail?.snmp_system?.first_polled ||
+                        deviceDetail?.snmp_config?.created_at;
+                      const lastSeen =
+                        ri?.last_seen ||
+                        deviceDetail?.discovered_host?.last_seen ||
+                        deviceDetail?.snmp_system?.last_polled ||
+                        deviceDetail?.unifi_device?.last_seen;
+
+                      return (
+                        <dl className="grid grid-cols-2 gap-y-3 text-xs">
+                          <div>
+                            <dt className="text-slate-400">IPv4 Address</dt>
+                            <dd className="mt-0.5 font-mono-tabular font-semibold text-white">
+                              {selectedDeviceDetailIp}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-400">Hostname</dt>
+                            <dd className="mt-0.5 text-slate-200">{hostname}</dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-400">MAC Address</dt>
+                            <dd className="mt-0.5 font-mono-tabular text-slate-200">{macAddr}</dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-400">OUI Hardware Vendor</dt>
+                            <dd className="mt-0.5 text-slate-200">{vendorName}</dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-400">Subnet CIDR & VLAN</dt>
+                            <dd className="mt-0.5 font-mono-tabular text-slate-200">
+                              {subnetCidr || "—"}
+                              {vlanId != null ? ` (VLAN ${vlanId})` : ""}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-400">Discovery Method</dt>
+                            <dd className="mt-0.5 font-mono-tabular text-slate-300">
+                              {discMethod}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-400">First Seen</dt>
+                            <dd className="mt-0.5 font-mono-tabular text-slate-400">
+                              {firstSeen ? new Date(firstSeen).toLocaleString() : "—"}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt className="text-slate-400">Last Seen</dt>
+                            <dd className="mt-0.5 font-mono-tabular text-slate-300">
+                              {lastSeen ? new Date(lastSeen).toLocaleString() : "—"}
+                            </dd>
+                          </div>
+                        </dl>
+                      );
+                    })()}
                   </div>
 
                   {/* Card 2: Polled SNMP System & Matched Vendor MIB Information */}
@@ -4539,18 +4606,47 @@ export const App: React.FC = () => {
                             </span>
                           </div>
                           {deviceDetail.snmp_system.matched_mibs &&
-                            deviceDetail.snmp_system.matched_mibs.length > 0 && (
-                              <div className="mt-2 flex flex-wrap gap-1.5">
-                                {deviceDetail.snmp_system.matched_mibs.map((mib) => (
-                                  <span
-                                    key={mib}
-                                    className="rounded border border-sky-400/30 bg-[#090D16] px-2 py-0.5 font-mono-tabular text-[10px] text-sky-300"
-                                  >
-                                    {mib}
-                                  </span>
-                                ))}
-                              </div>
-                            )}
+                            deviceDetail.snmp_system.matched_mibs.length > 0 && (() => {
+                              const snmpSys = deviceDetail?.snmp_system;
+                              const mibs = snmpSys?.matched_mibs || [];
+                              const respList = snmpSys?.extended_metrics?.responding_mibs || [];
+                              const respSet = new Set(respList);
+                              const hasRespTracking = respList.length > 0;
+                              return (
+                                <>
+                                  <div className="mt-2 flex flex-wrap gap-1.5">
+                                    {mibs.map((mib) => {
+                                      const isResp = !hasRespTracking || respSet.has(mib);
+                                      return (
+                                        <span
+                                          key={mib}
+                                          title={
+                                            isResp
+                                              ? "Actively responding on this device"
+                                              : "Profile MIB — not exposed by this device's SNMP agent"
+                                          }
+                                          className={`rounded border px-2 py-0.5 font-mono-tabular text-[10px] ${
+                                            hasRespTracking
+                                              ? isResp
+                                                ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
+                                                : "border-slate-700/80 bg-[#090D16] text-slate-500"
+                                              : "border-sky-400/30 bg-[#090D16] text-sky-300"
+                                          }`}
+                                        >
+                                          {hasRespTracking && isResp ? `✓ ${mib}` : mib}
+                                        </span>
+                                      );
+                                    })}
+                                  </div>
+                                  {hasRespTracking && (
+                                    <div className="mt-2 font-mono-tabular text-[11px] text-slate-400">
+                                      {respList.length} of {mibs.length} MIBs responding •{" "}
+                                      {snmpSys?.interface_count ?? 0} interfaces polled
+                                    </div>
+                                  )}
+                                </>
+                              );
+                            })()}
                         </div>
 
                         <dl className="grid grid-cols-2 gap-y-2.5">
@@ -4569,18 +4665,30 @@ export const App: React.FC = () => {
                             </dd>
                           </div>
                           <div>
-                            <dt className="text-slate-400">Hardware Model (ENTITY-MIB)</dt>
+                            <dt className="text-slate-400">Hardware Model</dt>
                             <dd className="mt-0.5 font-mono-tabular text-slate-200">
-                              {deviceDetail.snmp_system.hardware_model || "—"}
+                              {deviceDetail.snmp_system.hardware_model ||
+                                deviceDetail.unifi_device?.model ||
+                                "—"}
                             </dd>
                           </div>
                           <div>
                             <dt className="text-slate-400">Serial Number & Firmware</dt>
                             <dd className="mt-0.5 font-mono-tabular text-slate-200">
-                              {deviceDetail.snmp_system.serial_number || "—"}
-                              {deviceDetail.snmp_system.firmware_version
-                                ? ` (${deviceDetail.snmp_system.firmware_version})`
-                                : ""}
+                              {(() => {
+                                const serial =
+                                  deviceDetail?.snmp_system?.serial_number ||
+                                  deviceDetail?.unifi_device?.serial_number ||
+                                  "";
+                                const fw =
+                                  deviceDetail?.snmp_system?.firmware_version ||
+                                  deviceDetail?.unifi_device?.firmware_version ||
+                                  "";
+                                if (serial && fw) return `${serial} (${fw})`;
+                                if (serial) return serial;
+                                if (fw) return `Firmware ${fw}`;
+                                return "—";
+                              })()}
                             </dd>
                           </div>
                           <div className="col-span-2">
@@ -4593,11 +4701,14 @@ export const App: React.FC = () => {
                           <div>
                             <dt className="text-slate-400">System Uptime (sysUpTime)</dt>
                             <dd className="mt-0.5 font-mono-tabular text-slate-200">
-                              {deviceDetail.snmp_system.sys_uptime_ticks
+                              {deviceDetail.snmp_system.sys_uptime_ticks &&
+                              deviceDetail.snmp_system.sys_uptime_ticks > 0
                                 ? formatUptime(
                                     Math.floor(deviceDetail.snmp_system.sys_uptime_ticks / 100),
                                   )
-                                : "—"}
+                                : deviceDetail.unifi_device?.uptime_sec
+                                  ? formatUptime(deviceDetail.unifi_device.uptime_sec)
+                                  : "—"}
                             </dd>
                           </div>
                           <div>
@@ -4860,6 +4971,45 @@ export const App: React.FC = () => {
                               )}
                             </tbody>
                           </table>
+                        </div>
+                      )}
+
+                    {/* Assigned IPv4 Interfaces (IP-MIB) */}
+                    {deviceDetail.snmp_system.extended_metrics.ip_addresses &&
+                      deviceDetail.snmp_system.extended_metrics.ip_addresses.length > 0 && (
+                        <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+                          <h3 className="mb-3 text-sm font-semibold text-white">
+                            Assigned IPv4 Interfaces (IP-MIB)
+                          </h3>
+                          <div className="overflow-x-auto">
+                            <table className="w-full text-left font-mono-tabular text-xs">
+                              <thead>
+                                <tr className="border-b border-slate-800 text-slate-400">
+                                  <th className="pb-2">IPv4 Address</th>
+                                  <th className="pb-2">Subnet CIDR</th>
+                                  <th className="pb-2">Interface</th>
+                                  <th className="pb-2">MAC Address</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-800/50">
+                                {deviceDetail.snmp_system.extended_metrics.ip_addresses.map(
+                                  (ipRow, idx) => (
+                                    <tr key={idx}>
+                                      <td className="py-2 font-semibold text-white">{ipRow.ip}</td>
+                                      <td className="py-2 text-sky-400">{ipRow.cidr || "—"}</td>
+                                      <td className="py-2 text-slate-300">
+                                        {ipRow.if_name ||
+                                          (ipRow.if_index > 0 ? `#${ipRow.if_index}` : "—")}
+                                      </td>
+                                      <td className="py-2 text-slate-400">
+                                        {ipRow.mac_address || "—"}
+                                      </td>
+                                    </tr>
+                                  ),
+                                )}
+                              </tbody>
+                            </table>
+                          </div>
                         </div>
                       )}
                   </div>

@@ -370,12 +370,32 @@ async def live_traffic_loop(
 
 async def command_listener_loop(
     redis_client: aioredis.Redis,
+    snmp_poller: SNMPPoller,
+    pool: asyncpg.Pool,
     scan_trigger: asyncio.Event,
     snmp_trigger: asyncio.Event,
     unifi_trigger: asyncio.Event,
     live_reload_trigger: asyncio.Event,
     stop_event: asyncio.Event,
 ) -> None:
+    async def _run_targeted_poll(target_ip: str) -> None:
+        ok = False
+        try:
+            res = await snmp_poller.poll_single_ip(target_ip, pool, redis_client)
+            if res:
+                ok = True
+                await publish_event(redis_client, "snmp_update", [res])
+        except Exception as exc:
+            logger.warning("Targeted SNMP poll failed for %s: %s", target_ip, exc)
+        try:
+            await redis_client.set(
+                f"snmp:poll_done:{target_ip}",
+                json.dumps({"ok": ok}),
+                ex=20,
+            )
+        except Exception:
+            pass
+
     pubsub = redis_client.pubsub()
     await pubsub.subscribe("netdash:cmd")
     try:
@@ -385,6 +405,10 @@ async def command_listener_loop(
                 raw = msg["data"]
                 if isinstance(raw, bytes):
                     raw = raw.decode("utf-8", errors="ignore")
+                if raw.startswith("poll_device:"):
+                    target_ip = raw.split(":", 1)[1].strip()
+                    if target_ip:
+                        asyncio.create_task(_run_targeted_poll(target_ip))
                 if raw in ("scan_now", "reload_all"):
                     scan_trigger.set()
                 if raw in ("snmp_now", "reload_all", "rematch_mibs"):
@@ -486,6 +510,8 @@ async def main() -> None:
         ),
         command_listener_loop(
             redis_client,
+            snmp_poller,
+            pool,
             scan_trigger,
             snmp_trigger,
             unifi_trigger,

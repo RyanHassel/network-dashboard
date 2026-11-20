@@ -2254,18 +2254,20 @@ async def get_all_devices() -> Dict[str, Any]:
             SELECT device_ip, sys_name, sys_descr, sys_object_id, sys_location, sys_contact,
                    sys_uptime_ticks, cpu_usage_pct, mem_usage_pct, temp_celsius, interface_count,
                    vendor_name, device_category, matched_mibs, hardware_model, serial_number,
-                   firmware_version, is_reachable, last_poll_duration_ms, last_polled
+                   firmware_version, mac_address, subnet_cidr, first_polled,
+                   is_reachable, last_poll_duration_ms, last_polled
             FROM snmp_devices
             """
         )
 
         unifi_dev_rows = await conn.fetch(
             """
-            SELECT mac, ip_address, name, model, device_type, firmware_version,
+            SELECT mac, ip_address, lan_ip, name, model, device_type, serial_number, firmware_version,
                    status, uptime_sec, cpu_usage_pct, mem_usage_pct, temp_celsius,
                    poe_total_watts, num_sta, last_seen
             FROM unifi_devices
-            WHERE ip_address IS NOT NULL AND ip_address != ''
+            WHERE (ip_address IS NOT NULL AND ip_address != '')
+               OR (lan_ip IS NOT NULL AND lan_ip != '')
             """
         )
 
@@ -2349,6 +2351,10 @@ async def get_all_devices() -> Dict[str, Any]:
         item = _ensure_ip(ip_str)
         if r.get("sys_name") and (item["hostname"] == ip_str or not item["hostname"]):
             item["hostname"] = r["sys_name"]
+        if r.get("mac_address") and not item["mac_address"]:
+            item["mac_address"] = r["mac_address"]
+        if r.get("subnet_cidr") and not item["subnet_cidr"]:
+            item["subnet_cidr"] = r["subnet_cidr"]
         item["snmp_reachable"] = bool(r.get("is_reachable"))
         if r.get("is_reachable"):
             item["is_online"] = True
@@ -2379,20 +2385,25 @@ async def get_all_devices() -> Dict[str, Any]:
             item["last_seen"] = r["last_polled"].isoformat()
 
     for r in unifi_dev_rows:
-        ip_str = str(r["ip_address"])
-        item = _ensure_ip(ip_str)
-        if r["name"]:
-            item["hostname"] = r["name"]
-        item["mac_address"] = r["mac"] or item["mac_address"]
-        item["vendor"] = item["vendor"] or f"Ubiquiti ({r['model']})"
-        if r["status"] == "online":
-            item["is_online"] = True
-        item["cpu_usage_pct"] = float(r["cpu_usage_pct"] or 0.0)
-        item["uptime_sec"] = int(r["uptime_sec"] or 0)
-        if "UniFi" not in item["sources"]:
-            item["sources"].append("UniFi")
-        if r["last_seen"]:
-            item["last_seen"] = r["last_seen"].isoformat()
+        cand_ips: List[str] = []
+        for raw_ip in (r["lan_ip"], r["ip_address"]):
+            ip_val = str(raw_ip or "").strip()
+            if ip_val and ip_val not in cand_ips:
+                cand_ips.append(ip_val)
+        for ip_str in cand_ips:
+            item = _ensure_ip(ip_str)
+            if r["name"]:
+                item["hostname"] = r["name"]
+            item["mac_address"] = r["mac"] or item["mac_address"]
+            item["vendor"] = item["vendor"] or f"Ubiquiti ({r['model']})"
+            if r["status"] == "online":
+                item["is_online"] = True
+            item["cpu_usage_pct"] = float(r["cpu_usage_pct"] or 0.0)
+            item["uptime_sec"] = int(r["uptime_sec"] or 0)
+            if "UniFi" not in item["sources"]:
+                item["sources"].append("UniFi")
+            if r["last_seen"]:
+                item["last_seen"] = r["last_seen"].isoformat()
 
     for r in unifi_cli_rows:
         ip_str = str(r["ip_address"])
@@ -2458,7 +2469,7 @@ async def get_device_detail(device_ip: str) -> Dict[str, Any]:
 
         snmp_cfg_row = await conn.fetchrow(
             """
-            SELECT t.id AS target_id, t.device_ip, t.label, t.profile_id, t.enabled,
+            SELECT t.id AS target_id, t.device_ip, t.label, t.profile_id, t.enabled, t.created_at,
                    p.name AS profile_name, p.version AS profile_version, p.port AS profile_port
             FROM snmp_targets_config t
             LEFT JOIN snmp_profiles p ON p.id = t.profile_id
@@ -2472,7 +2483,8 @@ async def get_device_detail(device_ip: str) -> Dict[str, Any]:
             SELECT device_ip, sys_name, sys_descr, sys_object_id, sys_location, sys_contact,
                    sys_uptime_ticks, cpu_usage_pct, mem_usage_pct, temp_celsius, interface_count,
                    vendor_name, device_category, matched_mibs, hardware_model, serial_number,
-                   firmware_version, extended_metrics, is_reachable, last_poll_duration_ms, last_polled
+                   firmware_version, mac_address, subnet_cidr, first_polled,
+                   extended_metrics, is_reachable, last_poll_duration_ms, last_polled
             FROM snmp_devices
             WHERE device_ip = $1
             """,
@@ -2494,11 +2506,11 @@ async def get_device_detail(device_ip: str) -> Dict[str, Any]:
 
         unifi_dev_row = await conn.fetchrow(
             """
-            SELECT mac, ip_address, name, model, device_type, firmware_version,
+            SELECT mac, ip_address, lan_ip, name, model, device_type, serial_number, firmware_version,
                    status, uptime_sec, cpu_usage_pct, mem_usage_pct, temp_celsius,
                    poe_total_watts, poe_max_watts, num_sta, rx_bps, tx_bps, port_table, last_seen
             FROM unifi_devices
-            WHERE ip_address = $1
+            WHERE ip_address = $1 OR lan_ip = $1
             """,
             device_ip,
         )
@@ -2512,6 +2524,15 @@ async def get_device_detail(device_ip: str) -> Dict[str, Any]:
             WHERE ip_address = $1
             """,
             device_ip,
+        )
+
+        cfg_subnets = await conn.fetch(
+            """
+            SELECT subnet_cidr, label, vlan_id
+            FROM scan_subnets_config
+            WHERE enabled = TRUE
+            ORDER BY id ASC
+            """
         )
 
         log_rows = await conn.fetch(
@@ -2542,6 +2563,7 @@ async def get_device_detail(device_ip: str) -> Dict[str, Any]:
         return d
 
     host_dict = _serialize(host_row)
+    snmp_cfg_dict = _serialize(snmp_cfg_row)
     snmp_sys_dict = _serialize(snmp_sys_row)
     unifi_dev_dict = _serialize(unifi_dev_row)
     unifi_cli_dict = _serialize(unifi_cli_row)
@@ -2576,12 +2598,127 @@ async def get_device_detail(device_ip: str) -> Dict[str, Any]:
         or device_ip,
     )
 
+    matched_cfg_subnet: Optional[str] = None
+    matched_cfg_vlan: Optional[int] = None
+    try:
+        ip_obj = ipaddress.IPv4Address(device_ip)
+        for s_row in cfg_subnets:
+            cidr_str = str(s_row["subnet_cidr"] or "").strip()
+            if not cidr_str:
+                continue
+            try:
+                if ip_obj in ipaddress.IPv4Network(cidr_str, strict=False):
+                    matched_cfg_subnet = cidr_str
+                    matched_cfg_vlan = s_row["vlan_id"]
+                    break
+            except ValueError:
+                continue
+    except ValueError:
+        pass
+
+    def _first_non_ip_hostname() -> str:
+        for cand in (
+            (host_dict or {}).get("hostname"),
+            (snmp_sys_dict or {}).get("sys_name"),
+            (unifi_dev_dict or {}).get("name"),
+            (unifi_cli_dict or {}).get("hostname"),
+            (snmp_cfg_dict or {}).get("label"),
+        ):
+            s = str(cand or "").strip()
+            if s and s != device_ip:
+                return s
+        return device_ip
+
+    def _pick_vendor() -> Optional[str]:
+        for cand in (
+            (host_dict or {}).get("vendor"),
+            (unifi_cli_dict or {}).get("oui_vendor"),
+            (snmp_sys_dict or {}).get("vendor_name"),
+            "Ubiquiti Networks" if unifi_dev_dict else None,
+        ):
+            s = str(cand or "").strip()
+            if s:
+                return s
+        fb = str((fallback_mib_match or {}).get("vendor_name") or "").strip()
+        if fb and fb not in ("Standard SNMP Device", "Generic / Standard RFC") and not fb.startswith("Enterprise PEN #"):
+            return fb
+        return None
+
+    def _pick_ts(candidates: List[Optional[str]], pick_min: bool) -> Optional[str]:
+        parsed: List[tuple[datetime, str]] = []
+        for raw_ts in candidates:
+            if not raw_ts:
+                continue
+            try:
+                dt = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+                parsed.append((dt, str(raw_ts)))
+            except ValueError:
+                continue
+        if not parsed:
+            return None
+        chosen = min(parsed, key=lambda x: x[0]) if pick_min else max(parsed, key=lambda x: x[0])
+        return chosen[1]
+
+    src_parts: List[str] = []
+    if (host_dict or {}).get("discovery_source"):
+        src_parts.append(str(host_dict["discovery_source"]))
+    if snmp_sys_dict and not any("snmp" in p.lower() for p in src_parts):
+        src_parts.append("snmp")
+    if (unifi_dev_dict or unifi_cli_dict) and not any("unifi" in p.lower() for p in src_parts):
+        src_parts.append("unifi")
+
+    resolved_identity = {
+        "hostname": _first_non_ip_hostname(),
+        "mac_address": (
+            (host_dict or {}).get("mac_address")
+            or (unifi_dev_dict or {}).get("mac")
+            or (unifi_cli_dict or {}).get("mac")
+            or (snmp_sys_dict or {}).get("mac_address")
+            or None
+        ),
+        "vendor": _pick_vendor(),
+        "subnet_cidr": (
+            (host_dict or {}).get("subnet_cidr")
+            or (snmp_sys_dict or {}).get("subnet_cidr")
+            or matched_cfg_subnet
+            or None
+        ),
+        "vlan_id": (
+            (host_dict or {}).get("vlan_id")
+            if (host_dict or {}).get("vlan_id") is not None
+            else (
+                (unifi_cli_dict or {}).get("vlan_id")
+                if (unifi_cli_dict or {}).get("vlan_id") is not None
+                else matched_cfg_vlan
+            )
+        ),
+        "discovery_source": " / ".join(src_parts) if src_parts else "manual",
+        "first_seen": _pick_ts(
+            [
+                (host_dict or {}).get("first_seen"),
+                (snmp_sys_dict or {}).get("first_polled"),
+                (snmp_cfg_dict or {}).get("created_at"),
+            ],
+            pick_min=True,
+        ),
+        "last_seen": _pick_ts(
+            [
+                (host_dict or {}).get("last_seen"),
+                (snmp_sys_dict or {}).get("last_polled"),
+                (unifi_dev_dict or {}).get("last_seen"),
+                (unifi_cli_dict or {}).get("last_seen"),
+            ],
+            pick_min=False,
+        ),
+    }
+
     return {
         "ip_address": device_ip,
         "discovered_host": host_dict,
-        "snmp_config": _serialize(snmp_cfg_row),
+        "snmp_config": snmp_cfg_dict,
         "snmp_system": snmp_sys_dict,
         "matched_mib_profile": fallback_mib_match,
+        "resolved_identity": resolved_identity,
         "snmp_interfaces": [_serialize(r) for r in snmp_if_rows],
         "unifi_device": unifi_dev_dict,
         "unifi_client": unifi_cli_dict,
@@ -2600,8 +2737,28 @@ async def trigger_rematch_all_device_mibs() -> Dict[str, str]:
 
 
 @app.post("/api/devices/{device_ip}/poll")
-async def trigger_device_poll(device_ip: str) -> Dict[str, str]:
-    await _notify_worker("rematch_mibs")
+async def trigger_device_poll(device_ip: str) -> Dict[str, Any]:
+    done_key = f"snmp:poll_done:{device_ip}"
+    if redis_client:
+        try:
+            await redis_client.delete(done_key)
+        except Exception:
+            pass
+    await _notify_worker(f"poll_device:{device_ip}")
+    if redis_client:
+        for _ in range(25):
+            await asyncio.sleep(0.2)
+            try:
+                raw_done = await redis_client.get(done_key)
+                if raw_done:
+                    parsed = json.loads(raw_done)
+                    return {
+                        "status": "completed",
+                        "ok": bool(parsed.get("ok")),
+                        "message": f"Completed targeted SNMP poll for {device_ip}.",
+                    }
+            except Exception:
+                break
     return {"status": "triggered", "message": f"Immediate SNMP & MIB poll queued for {device_ip}."}
 
 

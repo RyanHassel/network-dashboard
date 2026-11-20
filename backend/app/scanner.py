@@ -79,6 +79,8 @@ class SubnetScanner:
 
         unifi_by_ip: Dict[str, Dict[str, Any]] = {}
         unifi_by_mac: Dict[str, Dict[str, Any]] = {}
+        infra_by_ip: Dict[str, Dict[str, Any]] = {}
+        infra_by_mac: Dict[str, Dict[str, Any]] = {}
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -93,6 +95,46 @@ class SubnetScanner:
                     unifi_by_ip[entry["ip_address"]] = entry
                 if entry.get("mac"):
                     unifi_by_mac[entry["mac"].lower()] = entry
+
+            udev_rows = await conn.fetch(
+                """
+                SELECT mac, ip_address, lan_ip, name, model
+                FROM unifi_devices
+                """
+            )
+            for r in udev_rows:
+                mac_val = str(r["mac"] or "").lower() or None
+                u_entry = {
+                    "mac": mac_val,
+                    "hostname": r["name"] or r["model"] or "",
+                    "vendor": "Ubiquiti Networks",
+                }
+                for candidate_ip in (r["ip_address"], r["lan_ip"]):
+                    ip_c = str(candidate_ip or "").strip()
+                    if ip_c:
+                        infra_by_ip[ip_c] = u_entry
+                if mac_val:
+                    infra_by_mac[mac_val] = u_entry
+
+            snmp_rows = await conn.fetch(
+                """
+                SELECT device_ip, mac_address, sys_name, vendor_name
+                FROM snmp_devices
+                """
+            )
+            for r in snmp_rows:
+                s_ip = str(r["device_ip"] or "").strip()
+                s_mac = str(r["mac_address"] or "").lower() or None
+                existing = infra_by_ip.get(s_ip, {})
+                merged = {
+                    "mac": existing.get("mac") or s_mac,
+                    "hostname": existing.get("hostname") or r["sys_name"] or "",
+                    "vendor": existing.get("vendor") or r["vendor_name"] or "",
+                }
+                if s_ip:
+                    infra_by_ip[s_ip] = merged
+                if merged["mac"]:
+                    infra_by_mac[merged["mac"]] = merged
 
         for sub_item in subnets:
             cidr = str(sub_item["subnet_cidr"]).strip()
@@ -148,8 +190,26 @@ class SubnetScanner:
                     if not mac and u_match.get("mac"):
                         mac = str(u_match["mac"]).lower()
 
-                    hostname = info.get("hostname") or u_match.get("hostname") or ip_str
-                    vendor = info.get("vendor") or u_match.get("oui_vendor") or ""
+                    infra_match = (
+                        infra_by_ip.get(ip_str)
+                        or (infra_by_mac.get(mac) if mac else None)
+                        or {}
+                    )
+                    if not mac and infra_match.get("mac"):
+                        mac = str(infra_match["mac"]).lower()
+
+                    hostname = (
+                        info.get("hostname")
+                        or u_match.get("hostname")
+                        or infra_match.get("hostname")
+                        or ip_str
+                    )
+                    vendor = (
+                        info.get("vendor")
+                        or u_match.get("oui_vendor")
+                        or infra_match.get("vendor")
+                        or ""
+                    )
                     vlan_id = u_match.get("vlan_id") or cfg_vlan
                     sw_mac = u_match.get("sw_mac")
                     sw_port = u_match.get("sw_port")
