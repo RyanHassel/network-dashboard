@@ -1,7 +1,7 @@
 # ==============================================================================
 # NetDash Vector Syslog Pipeline
-# Listens on UDP/TCP 514, normalizes RFC 3164/5424 & vendor syslogs via VRL,
-# and batch-inserts into TimescaleDB hypertable `device_logs`.
+# Listens on unprivileged UDP/TCP 1514 (mapped from host SYSLOG_PORT 514),
+# and ships batched JSON events to FastAPI (/api/logs/ingest) -> TimescaleDB.
 # ==============================================================================
 
 data_dir: "/var/lib/vector"
@@ -9,14 +9,14 @@ data_dir: "/var/lib/vector"
 sources:
   syslog_udp:
     type: socket
-    address: "0.0.0.0:514"
+    address: "0.0.0.0:1514"
     mode: udp
     max_length: 65536
     host_key: "source_ip"
 
   syslog_tcp:
     type: socket
-    address: "0.0.0.0:514"
+    address: "0.0.0.0:1514"
     mode: tcp
     host_key: "source_ip"
     framing:
@@ -24,92 +24,19 @@ sources:
       newline_delimited:
         max_length: 65536
 
-transforms:
-  normalize_syslog:
-    type: remap
+sinks:
+  netdash_api_logs:
+    type: http
     inputs:
       - syslog_udp
       - syslog_tcp
-    source: |
-      raw_line = replace(to_string(.message) ?? "", "\0", "")
-      src_ip = replace(string(.source_ip) ?? "0.0.0.0", "::ffff:", "")
-      # Strip ':port' when socket host_key includes IPv4:port without breaking IPv6
-      parts = split(src_ip, ":")
-      if length(parts) == 2 {
-        host_part = string(parts[0]) ?? ""
-        if host_part != "" {
-          src_ip = host_part
-        }
-      }
-
-      parsed, err = parse_syslog(raw_line)
-      if err == null {
-        ts = timestamp(parsed.timestamp) ?? now()
-        .time = format_timestamp!(ts, format: "%+")
-        .source_ip = src_ip
-        h = to_string(parsed.hostname) ?? ""
-        .hostname = if h != "" { h } else { src_ip }
-        f = to_string(parsed.facility) ?? ""
-        .facility = if f != "" { f } else { "user" }
-        sev = downcase(to_string(parsed.severity) ?? "info")
-        .severity = sev
-        .severity_num = if sev == "emerg" || sev == "panic" {
-          0
-        } else if sev == "alert" {
-          1
-        } else if sev == "crit" || sev == "critical" {
-          2
-        } else if sev == "err" || sev == "error" {
-          3
-        } else if sev == "warn" || sev == "warning" {
-          4
-        } else if sev == "notice" {
-          5
-        } else if sev == "debug" {
-          7
-        } else {
-          6
-        }
-        app = to_string(parsed.appname) ?? ""
-        .app_name = if app != "" { app } else { "system" }
-        .proc_id = to_string(parsed.procid) ?? ""
-        msg = replace(to_string(parsed.message) ?? "", "\0", "")
-        .message = if msg != "" { msg } else { raw_line }
-        .raw_log = raw_line
-      } else {
-        # Fallback for non-standard vendor syslog payloads (UniFi netconsole, IoT, etc.)
-        .time = format_timestamp!(now(), format: "%+")
-        .source_ip = src_ip
-        .hostname = src_ip
-        .facility = "daemon"
-        low = downcase(raw_line)
-        if contains(low, "error") || contains(low, "fail") || contains(low, "crit") {
-          .severity = "err"
-          .severity_num = 3
-        } else if contains(low, "warn") || contains(low, "drop") || contains(low, "disconnect") {
-          .severity = "warning"
-          .severity_num = 4
-        } else {
-          .severity = "info"
-          .severity_num = 6
-        }
-        .app_name = "raw-syslog"
-        .proc_id = ""
-        .message = strip_whitespace(raw_line)
-        .raw_log = raw_line
-      }
-
-      del(.source_type)
-      del(.port)
-      del(.timestamp)
-
-sinks:
-  timescaledb_logs:
-    type: postgres
-    inputs:
-      - normalize_syslog
-    endpoint: "${DATABASE_URL}"
-    table: "device_logs"
+    uri: "http://api:8000/api/logs/ingest"
+    method: post
+    compression: none
+    encoding:
+      codec: json
+    framing:
+      method: newline_delimited
     batch:
       max_events: 100
       timeout_secs: 2
@@ -117,3 +44,5 @@ sinks:
       type: memory
       max_events: 10000
       when_full: drop_newest
+    healthcheck:
+      enabled: false

@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 import importlib.metadata
 import ipaddress
 import json
@@ -8,6 +9,7 @@ import platform
 import re
 import shutil
 import socket
+import struct
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -17,7 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import asyncpg
 import httpx
 import redis.asyncio as aioredis
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -33,6 +35,7 @@ from app.mib_catalog import (
     match_device_vendor_profile,
     parse_mib_text,
 )
+from app.syslog_parser import parse_ingest_payload, parse_syslog_event
 
 logging.basicConfig(
     level=logging.INFO,
@@ -846,6 +849,129 @@ async def _run_git_info() -> Dict[str, Any]:
     }
 
 
+DOCKER_SOCKET_PATH = os.getenv("DOCKER_SOCKET_PATH", "/var/run/docker.sock")
+
+MANAGED_DOCKER_SERVICES: Dict[str, Dict[str, Any]] = {
+    "api": {"name": "NetDash API Server", "container": "netdash-api", "critical": True},
+    "worker": {"name": "Background Telemetry Worker", "container": "netdash-worker", "critical": False},
+    "timescaledb": {"name": "TimescaleDB / PostgreSQL", "container": "netdash-timescaledb", "critical": True},
+    "redis": {"name": "Redis Cache & Pub/Sub", "container": "netdash-redis", "critical": False},
+    "vector": {"name": "Vector Syslog Receiver", "container": "netdash-vector", "critical": False},
+    "frontend": {"name": "Nginx Web Frontend", "container": "netdash-frontend", "critical": True},
+    "proxy": {"name": "Web Edge Proxy", "container": "netdash-proxy", "critical": True},
+}
+
+
+def _docker_socket_available() -> bool:
+    sock = Path(DOCKER_SOCKET_PATH)
+    try:
+        return sock.exists() and sock.is_socket()
+    except OSError:
+        return False
+
+
+async def _docker_api_request(
+    method: str,
+    path: str,
+    timeout: float = 20.0,
+) -> Tuple[int, bytes]:
+    transport = httpx.AsyncHTTPTransport(uds=DOCKER_SOCKET_PATH)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://docker",
+        timeout=timeout,
+    ) as client:
+        resp = await client.request(method, path)
+        return resp.status_code, resp.content
+
+
+def _decode_docker_log_stream(raw: bytes) -> str:
+    """Decodes Docker Engine API multiplexed stdout/stderr frames or falls back to plain UTF-8."""
+    if not raw:
+        return ""
+    chunks: List[bytes] = []
+    pos = 0
+    n = len(raw)
+    matched_frames = 0
+    while pos + 8 <= n:
+        stream_type = raw[pos]
+        if stream_type not in (0, 1, 2) or raw[pos + 1 : pos + 4] != b"\x00\x00\x00":
+            break
+        frame_len = struct.unpack(">I", raw[pos + 4 : pos + 8])[0]
+        if frame_len > n - (pos + 8):
+            break
+        chunks.append(raw[pos + 8 : pos + 8 + frame_len])
+        pos += 8 + frame_len
+        matched_frames += 1
+    if matched_frames > 0 and pos == n:
+        return b"".join(chunks).decode("utf-8", errors="replace")
+    return raw.decode("utf-8", errors="replace")
+
+
+async def _inspect_docker_container(container_name: str) -> Optional[Dict[str, Any]]:
+    try:
+        status_code, raw_body = await _docker_api_request(
+            "GET", f"/containers/{container_name}/json", timeout=2.5
+        )
+        if status_code != 200:
+            return None
+        data = json.loads(raw_body.decode("utf-8", errors="replace"))
+        state = data.get("State") or {}
+        status_str = str(state.get("Status") or "").lower()
+        running = bool(state.get("Running"))
+        restarting = bool(state.get("Restarting"))
+        exit_code = state.get("ExitCode")
+        err_msg = str(state.get("Error") or "").strip()
+        restart_count = int(data.get("RestartCount") or 0)
+        started_at = str(state.get("StartedAt") or "")
+        uptime_sec: Optional[int] = None
+        if running and started_at and not started_at.startswith("0001-01-01"):
+            try:
+                iso = re.sub(r"\.(\d{6})\d+", r".\1", started_at.replace("Z", "+00:00"))
+                dt = datetime.fromisoformat(iso)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                uptime_sec = max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+            except Exception:
+                uptime_sec = None
+        return {
+            "state": status_str or ("running" if running else "exited"),
+            "running": running,
+            "restarting": restarting,
+            "exit_code": exit_code,
+            "error": err_msg,
+            "restart_count": restart_count,
+            "started_at": started_at,
+            "uptime_sec": uptime_sec,
+        }
+    except Exception:
+        return None
+
+
+async def _execute_docker_service_action(
+    container_name: str, action: str
+) -> Tuple[int, bytes]:
+    if action == "start":
+        return await _docker_api_request("POST", f"/containers/{container_name}/start", timeout=20.0)
+    if action == "stop":
+        return await _docker_api_request(
+            "POST", f"/containers/{container_name}/stop?t=10", timeout=20.0
+        )
+    if action == "restart":
+        return await _docker_api_request(
+            "POST", f"/containers/{container_name}/restart?t=10", timeout=25.0
+        )
+    raise ValueError(f"Unsupported Docker action: {action}")
+
+
+async def _delayed_docker_action(container_name: str, action: str) -> None:
+    await asyncio.sleep(0.35)
+    try:
+        await _execute_docker_service_action(container_name, action)
+    except Exception as exc:
+        logger.warning("Deferred Docker action %s on %s failed: %s", action, container_name, exc)
+
+
 @app.get("/api/system/info")
 async def get_system_info() -> Dict[str, Any]:
     """Returns server host information and live status/versions of all background services."""
@@ -1076,7 +1202,7 @@ async def get_system_info() -> Dict[str, Any]:
         try:
             t0 = time.perf_counter()
             _, writer = await asyncio.wait_for(
-                asyncio.open_connection("vector", 514),
+                asyncio.open_connection("vector", 1514),
                 timeout=1.5,
             )
             writer.close()
@@ -1093,7 +1219,7 @@ async def get_system_info() -> Dict[str, Any]:
                 "version": f"Vector {clean_tag}",
                 "uptime_sec": None,
                 "latency_ms": latency_ms,
-                "detail": f"UDP/TCP :{syslog_port} listening • {logs_24h} logs ingested (24h)",
+                "detail": f"UDP/TCP :{syslog_port} -> :1514 listening • {logs_24h} logs ingested (24h)",
             }
         except Exception:
             return {
@@ -1104,7 +1230,7 @@ async def get_system_info() -> Dict[str, Any]:
                 "version": f"Vector {clean_tag}",
                 "uptime_sec": None,
                 "latency_ms": None,
-                "detail": f"Port 514 unreachable • {logs_24h} logs stored (24h)",
+                "detail": f"Port {syslog_port} (internal :1514) unreachable • {logs_24h} logs stored (24h)",
             }
 
     async def _probe_frontend() -> Dict[str, Any]:
@@ -1187,10 +1313,59 @@ async def get_system_info() -> Dict[str, Any]:
         "detail": f"API v{app.version} • {mib_count} backend MIB files loaded",
     }
 
+    docker_ctrl_ok = _docker_socket_available()
+    inspected: Dict[str, Optional[Dict[str, Any]]] = {}
+    if docker_ctrl_ok:
+        svc_keys = list(MANAGED_DOCKER_SERVICES.keys())
+        inspected_list = await asyncio.gather(
+            *[
+                _inspect_docker_container(MANAGED_DOCKER_SERVICES[k]["container"])
+                for k in svc_keys
+            ]
+        )
+        inspected = dict(zip(svc_keys, inspected_list))
+
     db_size_bytes = ts_svc.pop("db_size_bytes", None)
     services = [api_svc, worker_svc, ts_svc, redis_svc, vector_svc, frontend_svc]
     if proxy_svc is not None:
         services.append(proxy_svc)
+    elif inspected.get("proxy") is not None:
+        services.append(
+            {
+                "id": "proxy",
+                "name": "Web Edge Proxy",
+                "container": "netdash-proxy",
+                "status": "stopped",
+                "version": "nginx/1.27",
+                "uptime_sec": None,
+                "latency_ms": None,
+                "detail": f"Container present on host port :{web_port}",
+            }
+        )
+
+    for svc in services:
+        sid = str(svc.get("id") or "")
+        meta = MANAGED_DOCKER_SERVICES.get(sid, {})
+        c_info = inspected.get(sid)
+        svc["docker_state"] = c_info["state"] if c_info else None
+        svc["exit_code"] = c_info["exit_code"] if c_info else None
+        svc["restart_count"] = c_info["restart_count"] if c_info else None
+        svc["can_control"] = bool(docker_ctrl_ok and meta)
+        svc["critical"] = bool(meta.get("critical", False))
+        if svc.get("uptime_sec") is None and c_info and c_info.get("uptime_sec") is not None:
+            svc["uptime_sec"] = c_info["uptime_sec"]
+        if c_info:
+            d_state = c_info["state"]
+            d_exit = c_info["exit_code"]
+            if svc["status"] == "stopped" and d_state:
+                if d_state == "restarting":
+                    svc["status"] = "degraded"
+                suffix = f"Docker: {d_state}" + (
+                    f", exit {d_exit}" if d_exit not in (None, 0) else ""
+                )
+                svc["detail"] = f"{svc['detail']} ({suffix})"
+            elif d_state == "restarting":
+                svc["status"] = "degraded"
 
     return {
         "server": {
@@ -1206,6 +1381,7 @@ async def get_system_info() -> Dict[str, Any]:
             "db_size_bytes": db_size_bytes,
             "api_uptime_sec": api_uptime_sec,
             "server_time_utc": now_utc.isoformat(),
+            "docker_control_available": docker_ctrl_ok,
             "git": git_info,
             "config": {
                 "web_port": web_port,
@@ -1218,6 +1394,92 @@ async def get_system_info() -> Dict[str, Any]:
             },
         },
         "services": services,
+    }
+
+
+@app.post("/api/system/services/{service_id}/{action}")
+async def control_managed_service(service_id: str, action: str) -> Dict[str, Any]:
+    """Starts, stops, or restarts an allowlisted NetDash container via Docker Engine socket."""
+    svc_meta = MANAGED_DOCKER_SERVICES.get(service_id)
+    if not svc_meta:
+        raise HTTPException(status_code=404, detail=f"Unknown service: {service_id}")
+    norm_action = (action or "").strip().lower()
+    if norm_action not in ("start", "stop", "restart"):
+        raise HTTPException(status_code=400, detail="Action must be 'start', 'stop', or 'restart'.")
+    if not _docker_socket_available():
+        raise HTTPException(
+            status_code=503,
+            detail="Docker socket unavailable. Mount /var/run/docker.sock on netdash-api to manage services.",
+        )
+
+    container_name = svc_meta["container"]
+    if service_id in ("api", "proxy") and norm_action in ("stop", "restart"):
+        asyncio.create_task(_delayed_docker_action(container_name, norm_action))
+        return {
+            "ok": True,
+            "service_id": service_id,
+            "container": container_name,
+            "action": norm_action,
+            "deferred": True,
+            "message": f"Scheduled {norm_action} for {svc_meta['name']} ({container_name}).",
+        }
+
+    status_code, body = await _execute_docker_service_action(container_name, norm_action)
+    ok_codes = (204, 304) if norm_action in ("start", "stop") else (204,)
+    if status_code not in ok_codes:
+        err_detail = body.decode("utf-8", errors="replace").strip() or f"HTTP {status_code}"
+        raise HTTPException(
+            status_code=500,
+            detail=f"Docker {norm_action} failed for {container_name}: {err_detail}",
+        )
+
+    if norm_action in ("start", "restart"):
+        await asyncio.sleep(0.6)
+    c_info = await _inspect_docker_container(container_name)
+    docker_state = c_info["state"] if c_info else None
+    return {
+        "ok": True,
+        "service_id": service_id,
+        "container": container_name,
+        "action": norm_action,
+        "deferred": False,
+        "docker_state": docker_state,
+        "message": f"Completed {norm_action} on {svc_meta['name']} ({container_name}).",
+    }
+
+
+@app.get("/api/system/services/{service_id}/logs")
+async def get_managed_service_logs(
+    service_id: str,
+    tail: int = Query(default=100, ge=10, le=500),
+) -> Dict[str, Any]:
+    """Returns recent stdout/stderr logs for an allowlisted NetDash container."""
+    svc_meta = MANAGED_DOCKER_SERVICES.get(service_id)
+    if not svc_meta:
+        raise HTTPException(status_code=404, detail=f"Unknown service: {service_id}")
+    if not _docker_socket_available():
+        raise HTTPException(
+            status_code=503,
+            detail="Docker socket unavailable. Mount /var/run/docker.sock on netdash-api to view logs.",
+        )
+
+    container_name = svc_meta["container"]
+    status_code, raw_body = await _docker_api_request(
+        "GET",
+        f"/containers/{container_name}/logs?stdout=1&stderr=1&timestamps=1&tail={tail}",
+        timeout=5.0,
+    )
+    if status_code != 200:
+        err_detail = raw_body.decode("utf-8", errors="replace").strip() or f"HTTP {status_code}"
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to read logs for {container_name}: {err_detail}",
+        )
+
+    return {
+        "service_id": service_id,
+        "container": container_name,
+        "logs": _decode_docker_log_stream(raw_body),
     }
 
 
@@ -4056,6 +4318,68 @@ async def get_device_logs(
         "logs": logs,
         "sources": sources_out,
     }
+
+
+@app.post("/api/logs/ingest")
+async def ingest_syslog_events(request: Request) -> Dict[str, int]:
+    """Ingests batched JSON/NDJSON syslog events from Vector into TimescaleDB `device_logs`."""
+    raw_body = await request.body()
+    content_encoding = request.headers.get("content-encoding", "")
+    raw_events = parse_ingest_payload(raw_body, content_encoding=content_encoding)
+    if not raw_events:
+        return {"ingested": 0}
+
+    rows_to_insert: List[Tuple[Any, ...]] = []
+    for raw_evt in raw_events:
+        norm = parse_syslog_event(raw_evt)
+        if norm is None:
+            continue
+        rows_to_insert.append(
+            (
+                norm["time"],
+                norm["source_ip"],
+                norm["hostname"],
+                norm["facility"],
+                norm["severity"],
+                norm["severity_num"],
+                norm["app_name"],
+                norm["proc_id"],
+                norm["message"],
+                norm["raw_log"],
+            )
+        )
+
+    if not rows_to_insert:
+        return {"ingested": 0}
+
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            """
+            INSERT INTO device_logs (
+                time, source_ip, hostname, facility, severity, severity_num,
+                app_name, proc_id, message, raw_log
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            """,
+            rows_to_insert,
+        )
+
+    if redis_client:
+        try:
+            await redis_client.publish(
+                "netdash:live",
+                json.dumps(
+                    {
+                        "type": "syslog_update",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "data": {"count": len(rows_to_insert)},
+                    }
+                ),
+            )
+        except Exception:
+            pass
+
+    return {"ingested": len(rows_to_insert)}
 
 
 @app.websocket("/ws/live")

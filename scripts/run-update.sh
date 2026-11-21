@@ -305,7 +305,8 @@ if [[ -f backend/Dockerfile && -f frontend/Dockerfile ]]; then
   MESSAGE="Ensuring core services are running..."
   write_progress
 
-  "${COMPOSE_CMD[@]}" up -d --no-deps timescaledb redis vector
+  "${COMPOSE_CMD[@]}" up -d --no-deps timescaledb redis
+  "${COMPOSE_CMD[@]}" up -d --no-deps --force-recreate vector
 
   MESSAGE="Restarting Backend API container..."
   API_PCT=94

@@ -34,6 +34,7 @@ import {
   Server,
   Settings,
   ShieldCheck,
+  Square,
   Terminal,
   Thermometer,
   Trash2,
@@ -135,6 +136,11 @@ interface BackgroundServiceInfo {
   uptime_sec: number | null;
   latency_ms: number | null;
   detail: string;
+  docker_state?: string | null;
+  exit_code?: number | null;
+  restart_count?: number | null;
+  can_control?: boolean;
+  critical?: boolean;
   sub_services?: BackgroundSubService[];
 }
 
@@ -162,6 +168,7 @@ interface ServerSystemInfo {
     db_size_bytes: number | null;
     api_uptime_sec: number;
     server_time_utc: string;
+    docker_control_available?: boolean;
     git: {
       current_sha: string;
       current_version?: string;
@@ -1981,6 +1988,20 @@ export const App: React.FC = () => {
   // Server Information & Background Service Health State
   const [serverInfo, setServerInfo] = useState<ServerSystemInfo | null>(null);
   const [loadingServerInfo, setLoadingServerInfo] = useState(false);
+  const [serviceActionBusy, setServiceActionBusy] = useState<
+    Record<string, "start" | "stop" | "restart" | null>
+  >({});
+  const [serviceActionBanner, setServiceActionBanner] = useState<{
+    type: "ok" | "err";
+    text: string;
+  } | null>(null);
+  const [viewingLogsService, setViewingLogsService] = useState<{
+    id: string;
+    name: string;
+    container: string;
+  } | null>(null);
+  const [serviceLogsText, setServiceLogsText] = useState("");
+  const [loadingServiceLogs, setLoadingServiceLogs] = useState(false);
 
   // First-Time Setup Onboarding Modal & Dynamic Config State
   const [config, setConfig] = useState<AllConfigPayload | null>(null);
@@ -3095,6 +3116,81 @@ export const App: React.FC = () => {
     }
   };
 
+  const handleViewServiceLogs = async (svc: BackgroundServiceInfo) => {
+    setViewingLogsService({ id: svc.id, name: svc.name, container: svc.container });
+    setLoadingServiceLogs(true);
+    try {
+      const resp = await fetch(
+        `/api/system/services/${encodeURIComponent(svc.id)}/logs?tail=100`,
+        { cache: "no-store" },
+      );
+      if (resp.ok) {
+        const data = await resp.json();
+        setServiceLogsText(data.logs || "(No recent container output)");
+      } else {
+        const errBody = await resp.json().catch(() => null);
+        setServiceLogsText(
+          `Failed to load logs (HTTP ${resp.status}): ${errBody?.detail || "Unknown error"}`,
+        );
+      }
+    } catch {
+      setServiceLogsText("Network error loading container logs.");
+    } finally {
+      setLoadingServiceLogs(false);
+    }
+  };
+
+  const handleControlService = async (
+    svc: BackgroundServiceInfo,
+    action: "start" | "stop" | "restart",
+  ) => {
+    if (svc.critical && action === "stop") {
+      const confirmed = window.confirm(
+        `Stopping "${svc.name}" (${svc.container}) will interrupt NetDash UI or API access until restarted from the host CLI. Continue?`,
+      );
+      if (!confirmed) return;
+    }
+
+    setServiceActionBusy((prev) => ({ ...prev, [svc.id]: action }));
+    try {
+      const resp = await fetch(
+        `/api/system/services/${encodeURIComponent(svc.id)}/${action}`,
+        { method: "POST" },
+      );
+      const body = await resp.json().catch(() => null);
+      if (resp.ok) {
+        setServiceActionBanner({
+          type: "ok",
+          text:
+            body?.message ||
+            `${action.toUpperCase()} completed on ${svc.name} (${svc.container}).`,
+        });
+        await fetchServerInfo(false);
+        const followUpMs = svc.id === "api" || svc.id === "proxy" ? 4000 : 2500;
+        window.setTimeout(() => {
+          fetchServerInfo(false);
+          if (viewingLogsService?.id === svc.id) {
+            handleViewServiceLogs(svc);
+          }
+        }, followUpMs);
+      } else {
+        setServiceActionBanner({
+          type: "err",
+          text:
+            body?.detail ||
+            `Failed to ${action} ${svc.name} (${svc.container}) (HTTP ${resp.status}).`,
+        });
+      }
+    } catch {
+      setServiceActionBanner({
+        type: "err",
+        text: `Network error executing ${action} on ${svc.name}.`,
+      });
+    } finally {
+      setServiceActionBusy((prev) => ({ ...prev, [svc.id]: null }));
+    }
+  };
+
   const mergeLiveTrafficSamples = (
     prev: LiveTrafficSample[],
     incoming: LiveTrafficSample[],
@@ -3719,6 +3815,9 @@ export const App: React.FC = () => {
             fetchScanner();
             fetchOverview();
             fetchAllDevices();
+          }
+          if (msg.type === "syslog_update") {
+            fetchOverview();
           }
         } catch {
           // ignore
@@ -9230,10 +9329,10 @@ export const App: React.FC = () => {
                 <div>
                   <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
                     <Server className="h-4 w-4 text-sky-400" />
-                    Background Services & Versions
+                    Background Services &amp; Versions
                   </h3>
                   <p className="mt-0.5 text-xs text-slate-400">
-                    Live health checks, container identifiers, running software versions, and probe
+                    Live health checks, container controls (start/stop/restart), logs, and probe
                     latency across the NetDash stack.
                   </p>
                 </div>
@@ -9246,6 +9345,35 @@ export const App: React.FC = () => {
                 </span>
               </div>
 
+              {serviceActionBanner && (
+                <div
+                  className={`mb-3 flex items-center justify-between gap-2 rounded-lg border px-3 py-2 text-xs ${
+                    serviceActionBanner.type === "ok"
+                      ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-300"
+                      : "border-rose-500/35 bg-rose-500/10 text-rose-300"
+                  }`}
+                >
+                  <span>{serviceActionBanner.text}</span>
+                  <button
+                    type="button"
+                    onClick={() => setServiceActionBanner(null)}
+                    className="rounded p-0.5 opacity-80 hover:opacity-100"
+                    aria-label="Dismiss service message"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
+
+              {serverInfo?.server && serverInfo.server.docker_control_available === false && (
+                <div className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+                  Docker socket control is not active yet. Mount{" "}
+                  <code className="font-mono-tabular">/var/run/docker.sock</code> on{" "}
+                  <code className="font-mono-tabular">netdash-api</code> (included in this update)
+                  to enable Start / Stop / Restart controls and container log viewing.
+                </div>
+              )}
+
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs">
                   <thead>
@@ -9257,12 +9385,13 @@ export const App: React.FC = () => {
                       <th className="pb-2.5 font-medium">Uptime</th>
                       <th className="pb-2.5 font-medium">Latency</th>
                       <th className="pb-2.5 font-medium">Runtime Details</th>
+                      <th className="pb-2.5 text-right font-medium">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800/60 font-mono-tabular">
                     {!serverInfo?.services ? (
                       <tr>
-                        <td colSpan={7} className="py-8 text-center font-sans text-slate-500">
+                        <td colSpan={8} className="py-8 text-center font-sans text-slate-500">
                           Probing background services...
                         </td>
                       </tr>
@@ -9280,6 +9409,17 @@ export const App: React.FC = () => {
                             : svc.status === "degraded"
                               ? "bg-amber-400"
                               : "bg-rose-400";
+                        const busyAction = serviceActionBusy[svc.id] || null;
+                        const dockerReady = Boolean(
+                          svc.can_control ?? serverInfo?.server?.docker_control_available,
+                        );
+                        const canStart =
+                          dockerReady && !busyAction && svc.status !== "running";
+                        const canStop =
+                          dockerReady &&
+                          !busyAction &&
+                          (svc.status !== "stopped" || svc.docker_state === "restarting");
+                        const canRestart = dockerReady && !busyAction;
                         return (
                           <tr key={svc.id} className="hover:bg-slate-800/30">
                             <td className="py-3 pr-3">
@@ -9301,7 +9441,73 @@ export const App: React.FC = () => {
                             <td className="py-3 pr-3 text-slate-400">
                               {svc.latency_ms != null ? `${svc.latency_ms.toFixed(1)} ms` : "—"}
                             </td>
-                            <td className="py-3 font-sans text-slate-300">{svc.detail}</td>
+                            <td className="py-3 pr-3 font-sans text-slate-300">{svc.detail}</td>
+                            <td className="py-3 text-right font-sans">
+                              <div className="inline-flex items-center justify-end gap-1">
+                                <button
+                                  type="button"
+                                  disabled={!canStart}
+                                  onClick={() => handleControlService(svc, "start")}
+                                  title={
+                                    dockerReady
+                                      ? `Start ${svc.container}`
+                                      : "Docker socket control unavailable"
+                                  }
+                                  className="inline-flex items-center gap-1 rounded border border-emerald-500/30 bg-emerald-500/10 px-2 py-1 text-[11px] font-medium text-emerald-300 transition hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                                >
+                                  <Play className="h-3 w-3" />
+                                  <span>{busyAction === "start" ? "..." : "Start"}</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={!canStop}
+                                  onClick={() => handleControlService(svc, "stop")}
+                                  title={
+                                    dockerReady
+                                      ? svc.critical
+                                        ? `Stop ${svc.container} (critical service)`
+                                        : `Stop ${svc.container}`
+                                      : "Docker socket control unavailable"
+                                  }
+                                  className="inline-flex items-center gap-1 rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[11px] font-medium text-rose-300 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                                >
+                                  <Square className="h-3 w-3" />
+                                  <span>{busyAction === "stop" ? "..." : "Stop"}</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={!canRestart}
+                                  onClick={() => handleControlService(svc, "restart")}
+                                  title={
+                                    dockerReady
+                                      ? `Restart ${svc.container}`
+                                      : "Docker socket control unavailable"
+                                  }
+                                  className="inline-flex items-center gap-1 rounded border border-sky-500/30 bg-sky-500/10 px-2 py-1 text-[11px] font-medium text-sky-300 transition hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                                >
+                                  <RefreshCw
+                                    className={`h-3 w-3 ${
+                                      busyAction === "restart" ? "animate-spin" : ""
+                                    }`}
+                                  />
+                                  <span>{busyAction === "restart" ? "..." : "Restart"}</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={!dockerReady}
+                                  onClick={() => handleViewServiceLogs(svc)}
+                                  title={
+                                    dockerReady
+                                      ? `View recent logs for ${svc.container}`
+                                      : "Docker socket control unavailable"
+                                  }
+                                  className="inline-flex items-center gap-1 rounded border border-slate-700 bg-[#090D16] px-2 py-1 text-[11px] font-medium text-slate-300 transition hover:border-slate-600 hover:bg-slate-800 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                                >
+                                  <Terminal className="h-3 w-3" />
+                                  <span>Logs</span>
+                                </button>
+                              </div>
+                            </td>
                           </tr>
                         );
                       })
@@ -9309,6 +9515,60 @@ export const App: React.FC = () => {
                   </tbody>
                 </table>
               </div>
+
+              {viewingLogsService && (
+                <div className="mt-4 rounded-lg border border-slate-800 bg-[#090D16] p-3.5">
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-xs">
+                      <Terminal className="h-3.5 w-3.5 text-sky-400" />
+                      <span className="font-semibold text-white">{viewingLogsService.name}</span>
+                      <span className="font-mono-tabular text-[11px] text-slate-400">
+                        ({viewingLogsService.container} • last 100 lines)
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        disabled={loadingServiceLogs}
+                        onClick={() =>
+                          handleViewServiceLogs({
+                            id: viewingLogsService.id,
+                            name: viewingLogsService.name,
+                            container: viewingLogsService.container,
+                            status: "running",
+                            version: "",
+                            uptime_sec: null,
+                            latency_ms: null,
+                            detail: "",
+                          })
+                        }
+                        className="inline-flex items-center gap-1 rounded border border-slate-700 bg-[#111827] px-2 py-1 text-[11px] text-slate-300 hover:bg-slate-800 disabled:opacity-50"
+                      >
+                        <RefreshCw
+                          className={`h-3 w-3 ${loadingServiceLogs ? "animate-spin" : ""}`}
+                        />
+                        <span>Refresh</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setViewingLogsService(null);
+                          setServiceLogsText("");
+                        }}
+                        className="inline-flex items-center gap-1 rounded border border-slate-700 bg-[#111827] px-2 py-1 text-[11px] text-slate-400 hover:bg-slate-800 hover:text-white"
+                      >
+                        <X className="h-3 w-3" />
+                        <span>Close</span>
+                      </button>
+                    </div>
+                  </div>
+                  <pre className="max-h-72 overflow-auto rounded border border-slate-800/80 bg-[#060911] p-3 font-mono-tabular text-[11px] leading-relaxed text-slate-300 whitespace-pre-wrap break-all">
+                    {loadingServiceLogs && !serviceLogsText
+                      ? `Loading recent logs for ${viewingLogsService.container}...`
+                      : serviceLogsText || "(No container output yet)"}
+                  </pre>
+                </div>
+              )}
 
               {/* Worker Collector Sub-Loops */}
               {serverInfo?.services

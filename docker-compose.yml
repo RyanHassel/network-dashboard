@@ -65,16 +65,13 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql://netdash:changeme_strong_db_password@timescaledb:5432/netdash}
+      NETDASH_INGEST_URL: http://api:8000/api/logs/ingest
     ports:
-      - "${SYSLOG_PORT:-514}:514/udp"
-      - "${SYSLOG_PORT:-514}:514/tcp"
+      - "${SYSLOG_PORT:-514}:1514/udp"
+      - "${SYSLOG_PORT:-514}:1514/tcp"
     volumes:
       - ./vector/vector.yaml:/etc/vector/vector.yaml:ro
       - vector_data:/var/lib/vector
-    depends_on:
-      timescaledb:
-        condition: service_healthy
     networks:
       - netdash_net
 
@@ -93,6 +90,7 @@ services:
       - .:/opt/netdash-repo
       - ./backend/mibs:/app/mibs
       - ./.netdash-state:/var/lib/netdash-state
+      - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
