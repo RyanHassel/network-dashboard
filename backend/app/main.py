@@ -1058,7 +1058,7 @@ async def get_system_info() -> Dict[str, Any]:
             }
 
     async def _probe_vector() -> Dict[str, Any]:
-        raw_tag = _read_compose_image_tag("vector", "0.42.0-alpine")
+        raw_tag = _read_compose_image_tag("vector", "0.49.0-alpine")
         clean_tag = raw_tag.replace("-alpine", "")
         logs_24h = 0
         if db_pool is not None:

@@ -18,8 +18,11 @@ sources:
     type: socket
     address: "0.0.0.0:514"
     mode: tcp
-    max_length: 65536
     host_key: "source_ip"
+    framing:
+      method: newline_delimited
+      newline_delimited:
+        max_length: 65536
 
 transforms:
   normalize_syslog:
@@ -28,20 +31,26 @@ transforms:
       - syslog_udp
       - syslog_tcp
     source: |
-      raw_line = string!(.message)
-      src_ip = to_string(.source_ip) ?? "0.0.0.0"
-      # Strip port if source_ip includes ':port'
-      if contains(src_ip, ":") {
-        parts = split(src_ip, ":")
-        src_ip = parts[0]
+      raw_line = replace(to_string(.message) ?? "", "\0", "")
+      src_ip = replace(string(.source_ip) ?? "0.0.0.0", "::ffff:", "")
+      # Strip ':port' when socket host_key includes IPv4:port without breaking IPv6
+      parts = split(src_ip, ":")
+      if length(parts) == 2 {
+        host_part = string(parts[0]) ?? ""
+        if host_part != "" {
+          src_ip = host_part
+        }
       }
 
       parsed, err = parse_syslog(raw_line)
       if err == null {
-        .time = format_timestamp!(parsed.timestamp ?? now(), format: "%+")
+        ts = timestamp(parsed.timestamp) ?? now()
+        .time = format_timestamp!(ts, format: "%+")
         .source_ip = src_ip
-        .hostname = to_string(parsed.hostname) ?? src_ip
-        .facility = to_string(parsed.facility) ?? "user"
+        h = to_string(parsed.hostname) ?? ""
+        .hostname = if h != "" { h } else { src_ip }
+        f = to_string(parsed.facility) ?? ""
+        .facility = if f != "" { f } else { "user" }
         sev = downcase(to_string(parsed.severity) ?? "info")
         .severity = sev
         .severity_num = if sev == "emerg" || sev == "panic" {
@@ -61,9 +70,11 @@ transforms:
         } else {
           6
         }
-        .app_name = to_string(parsed.appname) ?? "system"
+        app = to_string(parsed.appname) ?? ""
+        .app_name = if app != "" { app } else { "system" }
         .proc_id = to_string(parsed.procid) ?? ""
-        .message = to_string(parsed.message) ?? raw_line
+        msg = replace(to_string(parsed.message) ?? "", "\0", "")
+        .message = if msg != "" { msg } else { raw_line }
         .raw_log = raw_line
       } else {
         # Fallback for non-standard vendor syslog payloads (UniFi netconsole, IoT, etc.)
@@ -90,6 +101,7 @@ transforms:
 
       del(.source_type)
       del(.port)
+      del(.timestamp)
 
 sinks:
   timescaledb_logs:
@@ -99,7 +111,7 @@ sinks:
     endpoint: "${DATABASE_URL}"
     table: "device_logs"
     batch:
-      max_events: 500
+      max_events: 100
       timeout_secs: 2
     buffer:
       type: memory

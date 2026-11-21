@@ -58,7 +58,7 @@ services:
       - netdash_net
 
   vector:
-    image: timberio/vector:0.42.0-alpine
+    image: timberio/vector:0.49.0-alpine
     container_name: netdash-vector
     restart: unless-stopped
     command: ["--config", "/etc/vector/vector.yaml"]
