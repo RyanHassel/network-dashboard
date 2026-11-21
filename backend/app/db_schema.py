@@ -131,6 +131,25 @@ CREATE TABLE IF NOT EXISTS ups_metrics_raw (
 
 CREATE INDEX IF NOT EXISTS idx_ups_metrics_raw_dev_time
     ON ups_metrics_raw (device_ip, time DESC);
+
+CREATE TABLE IF NOT EXISTS wireless_metrics_raw (
+    time                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    device_ip             TEXT NOT NULL,
+    total_clients         INT,
+    avg_channel_util_pct  DOUBLE PRECISION,
+    max_channel_util_pct  DOUBLE PRECISION,
+    avg_self_rx_pct       DOUBLE PRECISION,
+    avg_self_tx_pct       DOUBLE PRECISION,
+    avg_interference_pct  DOUBLE PRECISION,
+    avg_noise_floor_dbm   DOUBLE PRECISION,
+    avg_ccq_pct           DOUBLE PRECISION,
+    avg_signal_dbm        DOUBLE PRECISION,
+    rx_bps                DOUBLE PRECISION,
+    tx_bps                DOUBLE PRECISION
+);
+
+CREATE INDEX IF NOT EXISTS idx_wireless_metrics_raw_dev_time
+    ON wireless_metrics_raw (device_ip, time DESC);
 """
 
 
@@ -229,7 +248,11 @@ async def ensure_dynamic_config_tables(pool: asyncpg.Pool) -> None:
         await conn.execute(DYNAMIC_CONFIG_DDL)
         await backfill_device_registry(conn)
 
-        for tbl, ret_days in (("snmp_poll_metrics", 30), ("ups_metrics_raw", 180)):
+        for tbl, ret_days in (
+            ("snmp_poll_metrics", 30),
+            ("ups_metrics_raw", 180),
+            ("wireless_metrics_raw", 180),
+        ):
             try:
                 await conn.execute(
                     f"SELECT create_hypertable('{tbl}', 'time', chunk_time_interval => INTERVAL '1 day', if_not_exists => TRUE)"

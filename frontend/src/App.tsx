@@ -28,16 +28,20 @@ import {
   Play,
   Plus,
   Printer,
+  Radio,
   RefreshCw,
   Router,
   Search,
   Server,
   Settings,
   ShieldCheck,
+  Signal,
   Square,
   Terminal,
   Thermometer,
   Trash2,
+  Users,
+  Wifi,
   X,
   Zap,
 } from "lucide-react";
@@ -407,6 +411,141 @@ interface PrinterSupply {
   pct: number | null;
 }
 
+interface WirelessRadio {
+  index: string;
+  name: string;
+  radio_code?: string;
+  band: string;
+  channel: number | null;
+  ext_channel?: number | null;
+  freq_mhz?: number | null;
+  channel_width_mhz?: number | null;
+  tx_power_dbm: number | null;
+  clients: number;
+  ssid_count?: number;
+  ssids?: string[];
+  is_up?: boolean;
+  cu_total_pct?: number | null;
+  cu_self_rx_pct?: number | null;
+  cu_self_tx_pct?: number | null;
+  cu_other_bss_pct?: number | null;
+  noise_floor_dbm?: number | null;
+  ccq_pct?: number | null;
+  signal_dbm?: number | null;
+  rx_packets?: number | null;
+  tx_packets?: number | null;
+  mode?: string;
+}
+
+interface WirelessVap {
+  index: string;
+  ssid: string;
+  bssid?: string;
+  interface_name?: string;
+  if_index?: number | null;
+  radio_code?: string;
+  band: string;
+  channel: number | null;
+  ext_channel?: number | null;
+  freq_mhz?: number | null;
+  tx_power_dbm: number | null;
+  clients: number;
+  up?: boolean;
+  usage?: string;
+  ccq_pct?: number | null;
+  rx_bytes?: number | null;
+  tx_bytes?: number | null;
+  rx_packets?: number | null;
+  tx_packets?: number | null;
+  rx_errors?: number | null;
+  tx_errors?: number | null;
+  rx_dropped?: number | null;
+  tx_dropped?: number | null;
+  tx_retries?: number | null;
+  rx_bps?: number | null;
+  tx_bps?: number | null;
+}
+
+interface WirelessStation {
+  mac: string;
+  name: string;
+  ip?: string;
+  ssid?: string;
+  interface_name?: string;
+  signal_dbm?: number | null;
+  noise_dbm?: number | null;
+  snr_db?: number | null;
+  tx_rate_bps?: number | null;
+  rx_rate_bps?: number | null;
+  rx_bytes?: number | null;
+  tx_bytes?: number | null;
+  uptime_sec?: number | null;
+}
+
+interface WirelessInterfaceSummary {
+  if_index: number;
+  if_name: string;
+  if_descr: string;
+  if_alias?: string;
+  if_type?: number;
+  mac_address?: string;
+  speed_bps: number;
+  oper_status: number;
+  in_octets: number;
+  out_octets: number;
+  in_bps: number;
+  out_bps: number;
+  in_errors: number;
+  out_errors: number;
+}
+
+interface WirelessTelemetry {
+  source_mibs: string[];
+  mode?: string;
+  is_isolated?: boolean | null;
+  summary: {
+    total_clients: number;
+    active_radios: number;
+    total_radios: number;
+    active_ssids: number;
+    total_vaps?: number;
+    unique_ssids?: string[];
+    bands?: string[];
+    clients_by_band?: Record<string, number>;
+    avg_channel_util_pct?: number | null;
+    max_channel_util_pct?: number | null;
+    avg_self_rx_pct?: number | null;
+    avg_self_tx_pct?: number | null;
+    avg_interference_pct?: number | null;
+    avg_noise_floor_dbm?: number | null;
+    avg_ccq_pct?: number | null;
+    avg_signal_dbm?: number | null;
+    total_rx_bps?: number;
+    total_tx_bps?: number;
+    wireless_if_count?: number;
+    station_count?: number;
+  };
+  radios: WirelessRadio[];
+  vaps: WirelessVap[];
+  stations: WirelessStation[];
+  wireless_interfaces: WirelessInterfaceSummary[];
+}
+
+interface WirelessHistoryPoint {
+  time: string;
+  total_clients: number | null;
+  avg_channel_util_pct: number | null;
+  max_channel_util_pct: number | null;
+  avg_self_rx_pct: number | null;
+  avg_self_tx_pct: number | null;
+  avg_interference_pct: number | null;
+  avg_noise_floor_dbm: number | null;
+  avg_ccq_pct: number | null;
+  avg_signal_dbm: number | null;
+  rx_bps: number | null;
+  tx_bps: number | null;
+}
+
 interface SNMPTelemetrySeriesPoint {
   time: string;
   oids_collected: number;
@@ -572,13 +711,14 @@ interface DeviceDetailPayload {
       }>;
       ups_telemetry?: UPSTelemetry | null;
       printer_supplies?: PrinterSupply[];
+      wireless_telemetry?: WirelessTelemetry | null;
       vendor_scalars?: Record<string, string | number>;
     } | null;
     is_reachable: boolean;
     last_poll_duration_ms: number;
     last_polled: string | null;
   } | null;
-  device_profile_type?: "ups" | "nas" | "printer" | "network" | "server" | string;
+  device_profile_type?: "ups" | "wireless" | "nas" | "printer" | "network" | "server" | string;
   matched_mib_profile?: {
     vendor_name?: string;
     vendor?: string;
@@ -2151,6 +2291,13 @@ export const App: React.FC = () => {
   const [upsChartMode, setUpsChartMode] = useState<"battery_load" | "voltage" | "runtime" | "watts">(
     "battery_load",
   );
+  const [wirelessHistory, setWirelessHistory] = useState<WirelessHistoryPoint[]>([]);
+  const [wirelessHistoryRange, setWirelessHistoryRange] = useState<
+    "1h" | "6h" | "24h" | "7d" | "30d"
+  >("24h");
+  const [wirelessChartMode, setWirelessChartMode] = useState<
+    "clients" | "utilization" | "traffic" | "ccq" | "rf_dbm"
+  >("clients");
 
   const [subnets, setSubnets] = useState<string[]>([]);
   const [selectedSubnet, setSelectedSubnet] = useState<string>("");
@@ -2489,6 +2636,15 @@ export const App: React.FC = () => {
           fetchUpsHistory(data.ip_address, upsHistoryRange);
         } else {
           setUpsHistory([]);
+        }
+        if (
+          data.device_profile_type === "wireless" ||
+          Boolean(data.snmp_system?.extended_metrics?.wireless_telemetry) ||
+          (data.snmp_system?.extended_metrics?.wireless_radios?.length ?? 0) > 0
+        ) {
+          fetchWirelessHistory(data.ip_address, wirelessHistoryRange);
+        } else {
+          setWirelessHistory([]);
         }
       } else {
         setDeviceDetail(null);
@@ -3301,6 +3457,21 @@ export const App: React.FC = () => {
     }
   };
 
+  const fetchWirelessHistory = async (ip: string, rk = wirelessHistoryRange) => {
+    if (!ip) return;
+    try {
+      const r = await fetch(
+        `/api/devices/${encodeURIComponent(ip)}/wireless-history?range=${encodeURIComponent(rk)}`,
+      );
+      if (r.ok) {
+        const data = await r.json();
+        setWirelessHistory(data.series || []);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
   const fetchScanner = async () => {
     try {
       const r = await fetch("/api/scanner/hosts");
@@ -3474,6 +3645,23 @@ export const App: React.FC = () => {
     deviceDetail?.ip_address,
     selectedDeviceDetailIp,
     upsHistoryRange,
+    deviceDetail?.device_profile_type,
+  ]);
+
+  useEffect(() => {
+    const devIp = deviceDetail?.ip_address || selectedDeviceDetailIp;
+    if (
+      devIp &&
+      (deviceDetail?.device_profile_type === "wireless" ||
+        Boolean(deviceDetail?.snmp_system?.extended_metrics?.wireless_telemetry) ||
+        (deviceDetail?.snmp_system?.extended_metrics?.wireless_radios?.length ?? 0) > 0)
+    ) {
+      fetchWirelessHistory(devIp, wirelessHistoryRange);
+    }
+  }, [
+    deviceDetail?.ip_address,
+    selectedDeviceDetailIp,
+    wirelessHistoryRange,
     deviceDetail?.device_profile_type,
   ]);
 
@@ -4178,15 +4366,95 @@ export const App: React.FC = () => {
     navigateToTab(tabId);
   };
 
-  const detailProfileType =
-    deviceDetail?.device_profile_type ||
-    (deviceDetail?.snmp_system?.extended_metrics?.ups_telemetry ? "ups" : "network");
   const detailUps = deviceDetail?.snmp_system?.extended_metrics?.ups_telemetry || null;
   const detailPrinterSupplies =
     deviceDetail?.snmp_system?.extended_metrics?.printer_supplies || [];
+  const rawWirelessTelemetry =
+    deviceDetail?.snmp_system?.extended_metrics?.wireless_telemetry || null;
+  const legacyWirelessRadios =
+    deviceDetail?.snmp_system?.extended_metrics?.wireless_radios || [];
+  const detailWireless: WirelessTelemetry | null = rawWirelessTelemetry
+    ? rawWirelessTelemetry
+    : legacyWirelessRadios.length > 0
+      ? {
+          source_mibs: ["UBNT-UniFi-MIB"],
+          mode: "Access Point",
+          summary: {
+            total_clients: legacyWirelessRadios.reduce(
+              (acc, r) => acc + Number(r.stations || 0),
+              0,
+            ),
+            active_radios: new Set(legacyWirelessRadios.map((r) => r.radio || "WLAN")).size,
+            total_radios: new Set(legacyWirelessRadios.map((r) => r.radio || "WLAN")).size,
+            active_ssids: legacyWirelessRadios.length,
+            total_vaps: legacyWirelessRadios.length,
+            unique_ssids: Array.from(
+              new Set(legacyWirelessRadios.map((r) => r.ssid).filter(Boolean)),
+            ),
+            bands: Array.from(new Set(legacyWirelessRadios.map((r) => r.radio).filter(Boolean))),
+          },
+          radios: [],
+          vaps: legacyWirelessRadios.map((r, idx) => ({
+            index: String(idx + 1),
+            ssid: r.ssid,
+            band: r.radio || "WLAN",
+            channel: r.channel && !Number.isNaN(Number(r.channel)) ? Number(r.channel) : null,
+            tx_power_dbm:
+              r.tx_power && !Number.isNaN(parseInt(r.tx_power, 10))
+                ? parseInt(r.tx_power, 10)
+                : null,
+            clients: Number(r.stations || 0),
+            up: true,
+            usage: "user",
+          })),
+          stations: [],
+          wireless_interfaces: [],
+        }
+      : null;
+  const detailProfileType =
+    deviceDetail?.device_profile_type ||
+    (detailUps ? "ups" : detailWireless ? "wireless" : "network");
   const hasUpsWatts =
     detailUps?.output_watts != null || upsHistory.some((p) => p.output_watts != null);
   const activeUpsChartMode = upsChartMode === "watts" && !hasUpsWatts ? "battery_load" : upsChartMode;
+
+  const hasWlClients =
+    wirelessHistory.some((p) => p.total_clients != null) ||
+    Boolean((detailWireless?.vaps?.length ?? 0) > 0 || (detailWireless?.stations?.length ?? 0) > 0);
+  const hasWlUtil =
+    detailWireless?.summary?.avg_channel_util_pct != null ||
+    wirelessHistory.some((p) => p.avg_channel_util_pct != null);
+  const hasWlTraffic =
+    ((detailWireless?.summary?.total_rx_bps ?? 0) > 0 ||
+      (detailWireless?.summary?.total_tx_bps ?? 0) > 0) ||
+    wirelessHistory.some((p) => (p.rx_bps ?? 0) > 0 || (p.tx_bps ?? 0) > 0);
+  const hasWlCcq =
+    detailWireless?.summary?.avg_ccq_pct != null ||
+    wirelessHistory.some((p) => p.avg_ccq_pct != null);
+  const hasWlRfDbm =
+    detailWireless?.summary?.avg_signal_dbm != null ||
+    detailWireless?.summary?.avg_noise_floor_dbm != null ||
+    wirelessHistory.some((p) => p.avg_signal_dbm != null || p.avg_noise_floor_dbm != null);
+  const activeWirelessChartMode =
+    wirelessChartMode === "utilization" && hasWlUtil
+      ? "utilization"
+      : wirelessChartMode === "traffic" && hasWlTraffic
+        ? "traffic"
+        : wirelessChartMode === "ccq" && hasWlCcq
+          ? "ccq"
+          : wirelessChartMode === "rf_dbm" && hasWlRfDbm
+            ? "rf_dbm"
+            : hasWlClients
+              ? "clients"
+              : hasWlUtil
+                ? "utilization"
+                : hasWlTraffic
+                  ? "traffic"
+                  : hasWlCcq
+                    ? "ccq"
+                    : hasWlRfDbm
+                      ? "rf_dbm"
+                      : "clients";
 
   return (
     <div className="min-h-screen bg-[#090D16] text-slate-100">
@@ -5588,7 +5856,17 @@ export const App: React.FC = () => {
                             </a>
                           </td>
                           <td className="py-3 font-sans font-medium text-white">
-                            {d.hostname || d.ip_address}
+                            <div className="flex items-center gap-1.5">
+                              <span>{d.hostname || d.ip_address}</span>
+                              {d.device_profile_type === "wireless" && (
+                                <span
+                                  title="Wireless AP / Device (SNMP)"
+                                  className="inline-flex items-center gap-1 rounded border border-teal-500/30 bg-teal-500/15 px-1.5 py-0.5 text-[10px] font-medium text-teal-300"
+                                >
+                                  <Wifi className="h-2.5 w-2.5" /> Wi-Fi
+                                </span>
+                              )}
+                            </div>
                           </td>
                           <td className="py-3 text-slate-300">{d.mac_address || "—"}</td>
                           <td className="max-w-xs py-3 font-sans text-slate-300">
@@ -5700,6 +5978,10 @@ export const App: React.FC = () => {
                       <span className="inline-flex items-center gap-1 rounded border border-amber-500/30 bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-300">
                         <BatteryCharging className="h-3 w-3" /> UPS / Power Backup
                       </span>
+                    ) : detailProfileType === "wireless" ? (
+                      <span className="inline-flex items-center gap-1 rounded border border-teal-500/30 bg-teal-500/15 px-2 py-0.5 text-[11px] font-medium text-teal-300">
+                        <Wifi className="h-3 w-3" /> Wireless AP
+                      </span>
                     ) : detailProfileType === "nas" ? (
                       <span className="inline-flex items-center gap-1 rounded border border-violet-500/30 bg-violet-500/15 px-2 py-0.5 text-[11px] font-medium text-violet-300">
                         <HardDrive className="h-3 w-3" /> NAS / Storage
@@ -5721,9 +6003,11 @@ export const App: React.FC = () => {
                   <p className="text-xs text-slate-400">
                     {detailProfileType === "ups"
                       ? "UPS Power, Battery Health, Runtime Telemetry, Management Interface & Syslogs"
-                      : detailProfileType === "printer"
-                        ? "Printer Toner & Supply Levels, SNMP Counters, and Syslogs"
-                        : "Complete Polled Telemetry — Discovery, SNMP System & Interfaces, and Syslogs"}
+                      : detailProfileType === "wireless"
+                        ? "Wireless Radios, Broadcast SSIDs, Airtime Utilization, Clients & Interfaces (SNMP)"
+                        : detailProfileType === "printer"
+                          ? "Printer Toner & Supply Levels, SNMP Counters, and Syslogs"
+                          : "Complete Polled Telemetry — Discovery, SNMP System & Interfaces, and Syslogs"}
                   </p>
                 </div>
               </div>
@@ -6677,6 +6961,909 @@ export const App: React.FC = () => {
                   </div>
                 )}
 
+                {/* Wireless Radio, SSID & RF Telemetry (SNMP) */}
+                {(detailProfileType === "wireless" || detailWireless !== null) && (
+                  <div className="space-y-5 rounded-xl border border-slate-800 bg-[#111827] p-5">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
+                          <Wifi className="h-4 w-4 text-teal-400" />
+                          Wireless Radio &amp; SSID Telemetry (SNMP)
+                        </h3>
+                        {detailWireless?.mode && (
+                          <span className="rounded border border-teal-500/35 bg-teal-500/15 px-2 py-0.5 font-mono-tabular text-[11px] font-medium text-teal-300">
+                            {detailWireless.mode}
+                          </span>
+                        )}
+                        {detailWireless?.is_isolated === true && (
+                          <span className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-300">
+                            <AlertTriangle className="h-3 w-3" /> Mesh Isolated
+                          </span>
+                        )}
+                      </div>
+                      {detailWireless?.source_mibs && detailWireless.source_mibs.length > 0 && (
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {detailWireless.source_mibs.map((mib) => (
+                            <span
+                              key={mib}
+                              className="rounded border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 font-mono-tabular text-[10px] text-sky-300"
+                            >
+                              {mib}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {!detailWireless ? (
+                      <div className="rounded-lg border border-slate-800 bg-[#090D16] p-5 text-center text-xs text-slate-400">
+                        Waiting for wireless SNMP MIB telemetry (<code>UBNT-UniFi-MIB</code>,{" "}
+                        <code>MIKROTIK-MIB</code>, <code>UBNT-AirMAX-MIB</code>,{" "}
+                        <code>AI-AP-MIB</code>, or <code>IEEE802dot11-MIB</code>).{" "}
+                        {deviceDetail?.snmp_config ? (
+                          <>
+                            Click <strong className="text-white">Poll SNMP Now</strong> above to
+                            collect wireless radios and SSID metrics.
+                          </>
+                        ) : (
+                          <>
+                            Click <strong className="text-white">Enable SNMP Polling</strong> above
+                            to begin collecting wireless SNMP metrics.
+                          </>
+                        )}
+                      </div>
+                    ) : (
+                      <>
+                        {/* 4 Wireless Summary KPI Cards */}
+                        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+                          {/* KPI 1: Connected Wireless Clients */}
+                          <div className="rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                            <div className="flex items-center justify-between text-xs text-slate-400">
+                              <span className="flex items-center gap-1.5">
+                                <Users className="h-3.5 w-3.5 text-emerald-400" />
+                                Wireless Clients
+                              </span>
+                            </div>
+                            <div className="mt-2 font-mono-tabular text-2xl font-bold text-white">
+                              {detailWireless.summary.total_clients}
+                            </div>
+                            <div className="mt-2 flex flex-wrap gap-1.5 font-mono-tabular text-[11px] text-slate-400">
+                              {detailWireless.summary.clients_by_band &&
+                              Object.keys(detailWireless.summary.clients_by_band).length > 0 ? (
+                                Object.entries(detailWireless.summary.clients_by_band).map(
+                                  ([band, cnt]) => (
+                                    <span
+                                      key={band}
+                                      className="rounded border border-slate-800 bg-[#111827] px-1.5 py-0.5 text-slate-300"
+                                    >
+                                      {band}: <strong className="text-emerald-400">{cnt}</strong>
+                                    </span>
+                                  ),
+                                )
+                              ) : (
+                                <span>Connected via SNMP tables</span>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* KPI 2: Active Radios & Channels */}
+                          <div className="rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                            <div className="flex items-center justify-between text-xs text-slate-400">
+                              <span className="flex items-center gap-1.5">
+                                <Radio className="h-3.5 w-3.5 text-sky-400" />
+                                Active Radios
+                              </span>
+                              {detailWireless.summary.bands &&
+                                detailWireless.summary.bands.length > 0 && (
+                                  <span className="font-mono-tabular text-[11px] text-sky-300">
+                                    {detailWireless.summary.bands.join(" • ")}
+                                  </span>
+                                )}
+                            </div>
+                            <div className="mt-2 font-mono-tabular text-2xl font-bold text-white">
+                              {detailWireless.summary.active_radios}{" "}
+                              <span className="text-sm font-normal text-slate-400">
+                                / {detailWireless.summary.total_radios}
+                              </span>
+                            </div>
+                            <div className="mt-2 truncate font-mono-tabular text-[11px] text-slate-400">
+                              {(() => {
+                                const chs = Array.from(
+                                  new Set(
+                                    [
+                                      ...detailWireless.radios.map((r) => r.channel),
+                                      ...detailWireless.vaps.map((v) => v.channel),
+                                    ].filter((c): c is number => c != null && c > 0),
+                                  ),
+                                );
+                                return chs.length > 0
+                                  ? chs.map((c) => `Ch ${c}`).join(" • ")
+                                  : `${detailWireless.summary.wireless_if_count ?? 0} 802.11 interfaces`;
+                              })()}
+                            </div>
+                          </div>
+
+                          {/* KPI 3: Broadcast SSIDs / VAPs */}
+                          <div className="rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                            <div className="flex items-center justify-between text-xs text-slate-400">
+                              <span className="flex items-center gap-1.5">
+                                <Wifi className="h-3.5 w-3.5 text-teal-400" />
+                                Broadcast SSIDs
+                              </span>
+                              <span className="font-mono-tabular text-[11px] text-slate-400">
+                                {detailWireless.summary.unique_ssids?.length ?? 0} unique
+                              </span>
+                            </div>
+                            <div className="mt-2 font-mono-tabular text-2xl font-bold text-white">
+                              {detailWireless.summary.active_ssids}{" "}
+                              <span className="text-sm font-normal text-slate-400">
+                                VAP{detailWireless.summary.active_ssids === 1 ? "" : "s"}
+                              </span>
+                            </div>
+                            <div className="mt-2 truncate text-[11px] text-slate-300">
+                              {detailWireless.summary.unique_ssids &&
+                              detailWireless.summary.unique_ssids.length > 0
+                                ? detailWireless.summary.unique_ssids.join(", ")
+                                : "No active SSIDs reported"}
+                            </div>
+                          </div>
+
+                          {/* KPI 4: Airtime Utilization / RF Quality */}
+                          <div className="rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                            {detailWireless.summary.avg_channel_util_pct != null ? (
+                              <>
+                                <div className="flex items-center justify-between text-xs text-slate-400">
+                                  <span className="flex items-center gap-1.5">
+                                    <Signal className="h-3.5 w-3.5 text-amber-400" />
+                                    Avg Channel Util
+                                  </span>
+                                  {detailWireless.summary.max_channel_util_pct != null && (
+                                    <span className="font-mono-tabular text-[11px] text-slate-300">
+                                      Peak {detailWireless.summary.max_channel_util_pct.toFixed(0)}%
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="mt-2 font-mono-tabular text-2xl font-bold text-white">
+                                  {detailWireless.summary.avg_channel_util_pct.toFixed(1)}%
+                                </div>
+                                <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+                                  <div
+                                    className={`h-full rounded-full transition-all ${
+                                      detailWireless.summary.avg_channel_util_pct < 50
+                                        ? "bg-emerald-500"
+                                        : detailWireless.summary.avg_channel_util_pct < 75
+                                          ? "bg-amber-500"
+                                          : "bg-rose-500"
+                                    }`}
+                                    style={{
+                                      width: `${Math.min(100, Math.max(0, detailWireless.summary.avg_channel_util_pct))}%`,
+                                    }}
+                                  />
+                                </div>
+                              </>
+                            ) : detailWireless.summary.avg_ccq_pct != null ? (
+                              <>
+                                <div className="flex items-center justify-between text-xs text-slate-400">
+                                  <span className="flex items-center gap-1.5">
+                                    <Signal className="h-3.5 w-3.5 text-emerald-400" />
+                                    Avg Link Quality (CCQ)
+                                  </span>
+                                  {detailWireless.summary.avg_noise_floor_dbm != null && (
+                                    <span className="font-mono-tabular text-[11px] text-slate-300">
+                                      Noise {detailWireless.summary.avg_noise_floor_dbm} dBm
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="mt-2 font-mono-tabular text-2xl font-bold text-emerald-400">
+                                  {detailWireless.summary.avg_ccq_pct.toFixed(1)}%
+                                </div>
+                                <div className="mt-2 font-mono-tabular text-[11px] text-slate-400">
+                                  {detailWireless.summary.avg_signal_dbm != null
+                                    ? `Avg Signal: ${detailWireless.summary.avg_signal_dbm} dBm`
+                                    : "Reported by wireless MIB"}
+                                </div>
+                              </>
+                            ) : (
+                              <>
+                                <div className="flex items-center justify-between text-xs text-slate-400">
+                                  <span className="flex items-center gap-1.5">
+                                    <Activity className="h-3.5 w-3.5 text-teal-400" />
+                                    Wireless Traffic
+                                  </span>
+                                </div>
+                                <div className="mt-2 font-mono-tabular text-lg font-bold text-white">
+                                  <span className="text-emerald-400">
+                                    ↓ {formatBps(detailWireless.summary.total_rx_bps ?? 0)}
+                                  </span>
+                                </div>
+                                <div className="mt-1 font-mono-tabular text-xs text-sky-400">
+                                  ↑ {formatBps(detailWireless.summary.total_tx_bps ?? 0)}
+                                </div>
+                              </>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Physical Radios Grid */}
+                        {detailWireless.radios.length > 0 && (
+                          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+                            {detailWireless.radios.map((rad, rIdx) => {
+                              const selfTx = rad.cu_self_tx_pct ?? 0;
+                              const selfRx = rad.cu_self_rx_pct ?? 0;
+                              const otherBss = rad.cu_other_bss_pct ?? 0;
+                              const bandBadgeClass =
+                                rad.band === "6 GHz"
+                                  ? "border-violet-500/35 bg-violet-500/15 text-violet-300"
+                                  : rad.band === "5 GHz"
+                                    ? "border-sky-500/35 bg-sky-500/15 text-sky-300"
+                                    : "border-emerald-500/35 bg-emerald-500/15 text-emerald-300";
+
+                              return (
+                                <div
+                                  key={`${rad.index}-${rad.name}-${rIdx}`}
+                                  className="space-y-3 rounded-lg border border-slate-800 bg-[#090D16] p-4"
+                                >
+                                  <div className="flex items-center justify-between gap-2">
+                                    <div className="flex min-w-0 items-center gap-2">
+                                      <span
+                                        className={`shrink-0 rounded border px-2 py-0.5 font-mono-tabular text-[11px] font-semibold ${bandBadgeClass}`}
+                                      >
+                                        {rad.band}
+                                      </span>
+                                      <span className="truncate font-mono-tabular text-xs font-semibold text-white">
+                                        {rad.name}
+                                      </span>
+                                    </div>
+                                    <span
+                                      className={`rounded px-1.5 py-0.5 font-mono-tabular text-[10px] ${
+                                        rad.is_up !== false
+                                          ? "bg-emerald-500/15 text-emerald-400"
+                                          : "bg-slate-800 text-slate-400"
+                                      }`}
+                                    >
+                                      {rad.is_up !== false ? "UP" : "DOWN"}
+                                    </span>
+                                  </div>
+
+                                  <div className="grid grid-cols-3 gap-2 font-mono-tabular text-xs">
+                                    <div>
+                                      <div className="text-[11px] text-slate-400">Channel</div>
+                                      <div className="mt-0.5 font-semibold text-sky-400">
+                                        {rad.channel != null ? `Ch ${rad.channel}` : "—"}
+                                        {rad.ext_channel != null ? `+${rad.ext_channel}` : ""}
+                                        {rad.channel_width_mhz != null
+                                          ? ` (${rad.channel_width_mhz}MHz)`
+                                          : ""}
+                                      </div>
+                                      {rad.freq_mhz != null && (
+                                        <div className="text-[10px] text-slate-500">
+                                          {rad.freq_mhz} MHz
+                                        </div>
+                                      )}
+                                    </div>
+                                    <div>
+                                      <div className="text-[11px] text-slate-400">TX Power</div>
+                                      <div className="mt-0.5 font-semibold text-slate-200">
+                                        {rad.tx_power_dbm != null ? `${rad.tx_power_dbm} dBm` : "Auto"}
+                                      </div>
+                                    </div>
+                                    <div className="text-right">
+                                      <div className="text-[11px] text-slate-400">Clients</div>
+                                      <div className="mt-0.5 font-semibold text-emerald-400">
+                                        {rad.clients}
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  {rad.cu_total_pct != null && (
+                                    <div className="space-y-1.5 border-t border-slate-800/80 pt-2.5">
+                                      <div className="flex items-center justify-between text-[11px]">
+                                        <span className="text-slate-400">Channel Utilization</span>
+                                        <span className="font-mono-tabular font-semibold text-white">
+                                          {rad.cu_total_pct.toFixed(0)}%
+                                        </span>
+                                      </div>
+                                      <div className="flex h-2 w-full overflow-hidden rounded-full bg-slate-800">
+                                        {selfTx > 0 && (
+                                          <div
+                                            title={`Self TX: ${selfTx}%`}
+                                            className="h-full bg-emerald-500"
+                                            style={{ width: `${Math.min(100, selfTx)}%` }}
+                                          />
+                                        )}
+                                        {selfRx > 0 && (
+                                          <div
+                                            title={`Self RX: ${selfRx}%`}
+                                            className="h-full bg-sky-500"
+                                            style={{
+                                              width: `${Math.min(100 - selfTx, selfRx)}%`,
+                                            }}
+                                          />
+                                        )}
+                                        {otherBss > 0 && (
+                                          <div
+                                            title={`Other BSS / Interference: ${otherBss}%`}
+                                            className="h-full bg-amber-500"
+                                            style={{
+                                              width: `${Math.min(100 - selfTx - selfRx, otherBss)}%`,
+                                            }}
+                                          />
+                                        )}
+                                        {selfTx + selfRx + otherBss === 0 && rad.cu_total_pct > 0 && (
+                                          <div
+                                            className="h-full bg-teal-500"
+                                            style={{ width: `${Math.min(100, rad.cu_total_pct)}%` }}
+                                          />
+                                        )}
+                                      </div>
+                                      {(rad.cu_self_tx_pct != null ||
+                                        rad.cu_self_rx_pct != null ||
+                                        rad.cu_other_bss_pct != null) && (
+                                        <div className="flex flex-wrap items-center justify-between gap-2 font-mono-tabular text-[10px] text-slate-400">
+                                          <span>TX {rad.cu_self_tx_pct ?? 0}%</span>
+                                          <span>RX {rad.cu_self_rx_pct ?? 0}%</span>
+                                          <span>Interf {rad.cu_other_bss_pct ?? 0}%</span>
+                                        </div>
+                                      )}
+                                    </div>
+                                  )}
+
+                                  {(rad.noise_floor_dbm != null ||
+                                    rad.ccq_pct != null ||
+                                    rad.signal_dbm != null ||
+                                    rad.rx_packets != null ||
+                                    rad.tx_packets != null) && (
+                                    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-800/80 pt-2 font-mono-tabular text-[11px] text-slate-400">
+                                      {rad.noise_floor_dbm != null && (
+                                        <span>Noise {rad.noise_floor_dbm} dBm</span>
+                                      )}
+                                      {rad.ccq_pct != null && <span>CCQ {rad.ccq_pct}%</span>}
+                                      {rad.signal_dbm != null && (
+                                        <span>Signal {rad.signal_dbm} dBm</span>
+                                      )}
+                                      {(rad.rx_packets != null || rad.tx_packets != null) && (
+                                        <span>
+                                          Pkts {(rad.rx_packets ?? 0).toLocaleString()} /{" "}
+                                          {(rad.tx_packets ?? 0).toLocaleString()}
+                                        </span>
+                                      )}
+                                    </div>
+                                  )}
+
+                                  {rad.ssids && rad.ssids.length > 0 && (
+                                    <div className="truncate text-[11px] text-slate-400">
+                                      SSIDs:{" "}
+                                      <span className="text-slate-200">{rad.ssids.join(", ")}</span>
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {/* Historical Wireless Telemetry Chart */}
+                        <div className="space-y-3 rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                          <div className="flex flex-wrap items-center justify-between gap-3">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              {hasWlClients && (
+                                <button
+                                  type="button"
+                                  onClick={() => setWirelessChartMode("clients")}
+                                  className={`rounded-md border px-2.5 py-1 text-xs font-medium transition ${
+                                    activeWirelessChartMode === "clients"
+                                      ? "border-emerald-500/50 bg-emerald-600 text-white"
+                                      : "border-slate-700 bg-[#111827] text-slate-300 hover:bg-slate-800"
+                                  }`}
+                                >
+                                  Wireless Clients
+                                </button>
+                              )}
+                              {hasWlUtil && (
+                                <button
+                                  type="button"
+                                  onClick={() => setWirelessChartMode("utilization")}
+                                  className={`rounded-md border px-2.5 py-1 text-xs font-medium transition ${
+                                    activeWirelessChartMode === "utilization"
+                                      ? "border-amber-500/50 bg-amber-600 text-white"
+                                      : "border-slate-700 bg-[#111827] text-slate-300 hover:bg-slate-800"
+                                  }`}
+                                >
+                                  Channel Utilization (%)
+                                </button>
+                              )}
+                              {hasWlTraffic && (
+                                <button
+                                  type="button"
+                                  onClick={() => setWirelessChartMode("traffic")}
+                                  className={`rounded-md border px-2.5 py-1 text-xs font-medium transition ${
+                                    activeWirelessChartMode === "traffic"
+                                      ? "border-sky-500/50 bg-sky-600 text-white"
+                                      : "border-slate-700 bg-[#111827] text-slate-300 hover:bg-slate-800"
+                                  }`}
+                                >
+                                  Wireless Traffic
+                                </button>
+                              )}
+                              {hasWlCcq && (
+                                <button
+                                  type="button"
+                                  onClick={() => setWirelessChartMode("ccq")}
+                                  className={`rounded-md border px-2.5 py-1 text-xs font-medium transition ${
+                                    activeWirelessChartMode === "ccq"
+                                      ? "border-teal-500/50 bg-teal-600 text-white"
+                                      : "border-slate-700 bg-[#111827] text-slate-300 hover:bg-slate-800"
+                                  }`}
+                                >
+                                  Link Quality (CCQ %)
+                                </button>
+                              )}
+                              {hasWlRfDbm && (
+                                <button
+                                  type="button"
+                                  onClick={() => setWirelessChartMode("rf_dbm")}
+                                  className={`rounded-md border px-2.5 py-1 text-xs font-medium transition ${
+                                    activeWirelessChartMode === "rf_dbm"
+                                      ? "border-violet-500/50 bg-violet-600 text-white"
+                                      : "border-slate-700 bg-[#111827] text-slate-300 hover:bg-slate-800"
+                                  }`}
+                                >
+                                  Signal &amp; Noise (dBm)
+                                </button>
+                              )}
+                            </div>
+
+                            <div className="flex items-center gap-1 rounded-lg border border-slate-800 bg-[#111827] p-1">
+                              {(["1h", "6h", "24h", "7d", "30d"] as const).map((rk) => (
+                                <button
+                                  key={rk}
+                                  type="button"
+                                  onClick={() => setWirelessHistoryRange(rk)}
+                                  className={`rounded px-2.5 py-1 font-mono-tabular text-xs font-medium uppercase transition ${
+                                    wirelessHistoryRange === rk
+                                      ? "bg-teal-600 text-white"
+                                      : "text-slate-400 hover:text-slate-200"
+                                  }`}
+                                >
+                                  {rk}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
+                          {activeWirelessChartMode === "clients" && (
+                            <DualAreaSparkChart
+                              showYAxis
+                              hideSecondary
+                              windowMs={rangeKeyToWindowMs(wirelessHistoryRange)}
+                              primaryLabel="Connected Wireless Clients"
+                              primaryShortLabel="Clients"
+                              primaryColor="#10B981"
+                              yAxisLabel="Clients"
+                              formatValue={(v) => `${Math.round(v)}`}
+                              formatAxisTick={(v) => String(Math.round(v))}
+                              emptyMessage="Collecting wireless client count time-series samples..."
+                              points={wirelessHistory.map((pt) => ({
+                                label: pt.time,
+                                inVal: pt.total_clients ?? 0,
+                                outVal: 0,
+                              }))}
+                            />
+                          )}
+                          {activeWirelessChartMode === "utilization" && (
+                            <DualAreaSparkChart
+                              showYAxis
+                              windowMs={rangeKeyToWindowMs(wirelessHistoryRange)}
+                              fixedMaxBps={100}
+                              primaryLabel="Avg Channel Utilization (%)"
+                              secondaryLabel="Other BSS Interference (%)"
+                              primaryShortLabel="Util"
+                              secondaryShortLabel="Interf"
+                              primaryColor="#F59E0B"
+                              secondaryColor="#F43F5E"
+                              yAxisLabel="%"
+                              formatValue={(v) => `${v.toFixed(1)}%`}
+                              formatAxisTick={(v) => `${Math.round(v)}%`}
+                              emptyMessage="Collecting wireless channel utilization samples..."
+                              points={wirelessHistory.map((pt) => ({
+                                label: pt.time,
+                                inVal: pt.avg_channel_util_pct ?? 0,
+                                outVal: pt.avg_interference_pct ?? 0,
+                              }))}
+                            />
+                          )}
+                          {activeWirelessChartMode === "traffic" && (
+                            <DualAreaSparkChart
+                              showYAxis
+                              windowMs={rangeKeyToWindowMs(wirelessHistoryRange)}
+                              primaryLabel="Wireless Inbound (RX)"
+                              secondaryLabel="Wireless Outbound (TX)"
+                              primaryShortLabel="RX"
+                              secondaryShortLabel="TX"
+                              primaryColor="#10B981"
+                              secondaryColor="#38BDF8"
+                              emptyMessage="Collecting wireless throughput samples..."
+                              points={wirelessHistory.map((pt) => ({
+                                label: pt.time,
+                                inVal: pt.rx_bps ?? 0,
+                                outVal: pt.tx_bps ?? 0,
+                              }))}
+                            />
+                          )}
+                          {activeWirelessChartMode === "ccq" && (
+                            <DualAreaSparkChart
+                              showYAxis
+                              hideSecondary
+                              windowMs={rangeKeyToWindowMs(wirelessHistoryRange)}
+                              fixedMaxBps={100}
+                              primaryLabel="Client Connection Quality (CCQ %)"
+                              primaryShortLabel="CCQ"
+                              primaryColor="#14B8A6"
+                              yAxisLabel="%"
+                              formatValue={(v) => `${v.toFixed(1)}%`}
+                              formatAxisTick={(v) => `${Math.round(v)}%`}
+                              emptyMessage="Collecting wireless CCQ quality samples..."
+                              points={wirelessHistory.map((pt) => ({
+                                label: pt.time,
+                                inVal: pt.avg_ccq_pct ?? 0,
+                                outVal: 0,
+                              }))}
+                            />
+                          )}
+                          {activeWirelessChartMode === "rf_dbm" && (
+                            <DualAreaSparkChart
+                              showYAxis
+                              windowMs={rangeKeyToWindowMs(wirelessHistoryRange)}
+                              primaryLabel="Avg Signal (dBm)"
+                              secondaryLabel="Noise Floor (dBm)"
+                              primaryShortLabel="Signal"
+                              secondaryShortLabel="Noise"
+                              primaryColor="#A78BFA"
+                              secondaryColor="#64748B"
+                              yAxisLabel="dBm"
+                              formatValue={(v) => `${(v - 120).toFixed(1)} dBm`}
+                              formatAxisTick={(v) => String(Math.round(v - 120))}
+                              emptyMessage="Collecting wireless signal & noise samples..."
+                              points={wirelessHistory
+                                .filter(
+                                  (pt) =>
+                                    pt.avg_signal_dbm != null || pt.avg_noise_floor_dbm != null,
+                                )
+                                .map((pt) => ({
+                                  label: pt.time,
+                                  inVal:
+                                    pt.avg_signal_dbm != null
+                                      ? Math.max(0, 120 + pt.avg_signal_dbm)
+                                      : 0,
+                                  outVal:
+                                    pt.avg_noise_floor_dbm != null
+                                      ? Math.max(0, 120 + pt.avg_noise_floor_dbm)
+                                      : 0,
+                                }))}
+                            />
+                          )}
+                        </div>
+
+                        {/* Broadcast SSIDs / Virtual APs Table */}
+                        {detailWireless.vaps.length > 0 && (
+                          <div className="space-y-2 rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                                Broadcast SSIDs / Virtual APs ({detailWireless.vaps.length})
+                              </h4>
+                              <span className="text-[11px] text-slate-400">
+                                Click an SSID row linked to an SNMP interface to inspect its port
+                                traffic chart below.
+                              </span>
+                            </div>
+                            <div className="overflow-x-auto">
+                              <table className="w-full text-left font-mono-tabular text-xs">
+                                <thead>
+                                  <tr className="border-b border-slate-800 text-slate-400">
+                                    <th className="pb-2 pr-3 font-medium">SSID / ESSID</th>
+                                    <th className="pb-2 pr-3 font-medium">Band</th>
+                                    <th className="pb-2 pr-3 font-medium">Channel</th>
+                                    <th className="pb-2 pr-3 font-medium">TX Power</th>
+                                    <th className="pb-2 pr-3 font-medium">BSSID</th>
+                                    <th className="pb-2 pr-3 font-medium">Interface</th>
+                                    <th className="pb-2 pr-3 text-right font-medium">Clients</th>
+                                    <th className="pb-2 pr-3 font-medium">Live Rate (RX / TX)</th>
+                                    <th className="pb-2 pr-3 font-medium">Total RX / TX</th>
+                                    <th className="pb-2 pr-3 font-medium">Err / Retries</th>
+                                    <th className="pb-2 text-right font-medium">Status</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-800/60">
+                                  {detailWireless.vaps.map((vap, idx) => {
+                                    const errSum = (vap.rx_errors ?? 0) + (vap.tx_errors ?? 0);
+                                    const hasPort = vap.if_index != null;
+                                    return (
+                                      <tr
+                                        key={`${vap.index}-${vap.bssid || vap.ssid}-${idx}`}
+                                        onClick={() => {
+                                          if (vap.if_index != null) {
+                                            setDetailIfIndex(
+                                              detailIfIndex === vap.if_index ? 0 : vap.if_index,
+                                            );
+                                          }
+                                        }}
+                                        className={`${
+                                          hasPort ? "cursor-pointer hover:bg-slate-800/50" : ""
+                                        } ${
+                                          hasPort && detailIfIndex === vap.if_index
+                                            ? "bg-slate-800/60"
+                                            : ""
+                                        }`}
+                                      >
+                                        <td className="py-2.5 pr-3 font-sans font-semibold text-white">
+                                          <div className="flex items-center gap-1.5">
+                                            <span>{vap.ssid}</span>
+                                            {vap.usage && vap.usage !== "user" && (
+                                              <span
+                                                className={`rounded border px-1.5 py-0.2 text-[10px] font-medium uppercase ${
+                                                  vap.usage === "guest"
+                                                    ? "border-amber-500/35 bg-amber-500/15 text-amber-300"
+                                                    : "border-violet-500/35 bg-violet-500/15 text-violet-300"
+                                                }`}
+                                              >
+                                                {vap.usage === "vwire" ? "Mesh" : vap.usage}
+                                              </span>
+                                            )}
+                                          </div>
+                                        </td>
+                                        <td className="py-2.5 pr-3 text-slate-300">{vap.band}</td>
+                                        <td className="py-2.5 pr-3 text-sky-400">
+                                          {vap.channel != null ? `Ch ${vap.channel}` : "—"}
+                                          {vap.ext_channel != null ? `+${vap.ext_channel}` : ""}
+                                        </td>
+                                        <td className="py-2.5 pr-3 text-slate-300">
+                                          {vap.tx_power_dbm != null
+                                            ? `${vap.tx_power_dbm} dBm`
+                                            : "Auto"}
+                                        </td>
+                                        <td className="py-2.5 pr-3 text-slate-400">
+                                          {vap.bssid || "—"}
+                                        </td>
+                                        <td className="py-2.5 pr-3 text-slate-300">
+                                          {vap.interface_name || "—"}
+                                          {vap.if_index != null ? ` (#${vap.if_index})` : ""}
+                                        </td>
+                                        <td className="py-2.5 pr-3 text-right font-semibold text-emerald-400">
+                                          {vap.clients}
+                                        </td>
+                                        <td className="py-2.5 pr-3">
+                                          {vap.rx_bps != null || vap.tx_bps != null ? (
+                                            <span>
+                                              <span className="text-emerald-400">
+                                                {formatBps(vap.rx_bps ?? 0)}
+                                              </span>
+                                              <span className="text-slate-600"> / </span>
+                                              <span className="text-sky-400">
+                                                {formatBps(vap.tx_bps ?? 0)}
+                                              </span>
+                                            </span>
+                                          ) : (
+                                            <span className="text-slate-500">—</span>
+                                          )}
+                                        </td>
+                                        <td className="py-2.5 pr-3 text-slate-300">
+                                          {vap.rx_bytes != null || vap.tx_bytes != null
+                                            ? `${formatBytes(vap.rx_bytes ?? 0)} / ${formatBytes(
+                                                vap.tx_bytes ?? 0,
+                                              )}`
+                                            : "—"}
+                                        </td>
+                                        <td className="py-2.5 pr-3 text-slate-400">
+                                          {vap.rx_errors != null ||
+                                          vap.tx_errors != null ||
+                                          vap.tx_retries != null ? (
+                                            <>
+                                              <span
+                                                className={
+                                                  errSum > 0 ? "text-amber-300" : "text-slate-400"
+                                                }
+                                              >
+                                                {errSum}
+                                              </span>
+                                              {vap.tx_retries != null
+                                                ? ` / ${vap.tx_retries.toLocaleString()}`
+                                                : ""}
+                                            </>
+                                          ) : (
+                                            "—"
+                                          )}
+                                        </td>
+                                        <td className="py-2.5 text-right">
+                                          <span
+                                            className={`inline-block rounded px-1.5 py-0.5 text-[11px] ${
+                                              vap.up !== false
+                                                ? "bg-emerald-500/15 text-emerald-400"
+                                                : "bg-slate-800 text-slate-400"
+                                            }`}
+                                          >
+                                            {vap.up !== false ? "UP" : "DOWN"}
+                                          </span>
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Connected Wireless Stations Table (MikroTik / airMAX / Aruba) */}
+                        {detailWireless.stations.length > 0 && (
+                          <div className="space-y-2 rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                            <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                              Connected Wireless Stations ({detailWireless.stations.length})
+                            </h4>
+                            <div className="overflow-x-auto">
+                              <table className="w-full text-left font-mono-tabular text-xs">
+                                <thead>
+                                  <tr className="border-b border-slate-800 text-slate-400">
+                                    <th className="pb-2 pr-3 font-medium">Station / Name</th>
+                                    <th className="pb-2 pr-3 font-medium">MAC Address</th>
+                                    <th className="pb-2 pr-3 font-medium">IP Address</th>
+                                    <th className="pb-2 pr-3 font-medium">SSID / Interface</th>
+                                    <th className="pb-2 pr-3 font-medium">Signal / SNR</th>
+                                    <th className="pb-2 pr-3 font-medium">PHY Rate (TX / RX)</th>
+                                    <th className="pb-2 pr-3 font-medium">Traffic (RX / TX)</th>
+                                    <th className="pb-2 text-right font-medium">Uptime</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-800/60">
+                                  {detailWireless.stations.map((st, idx) => {
+                                    const sig = st.signal_dbm;
+                                    const snr = st.snr_db;
+                                    const sigGood =
+                                      (sig != null && sig >= -65) ||
+                                      (sig == null && snr != null && snr >= 25);
+                                    const sigFair =
+                                      (sig != null && sig >= -75 && sig < -65) ||
+                                      (sig == null && snr != null && snr >= 15 && snr < 25);
+                                    const sigClass =
+                                      sig == null && snr == null
+                                        ? "border-slate-700 bg-slate-800 text-slate-300"
+                                        : sigGood
+                                          ? "border-emerald-500/35 bg-emerald-500/15 text-emerald-300"
+                                          : sigFair
+                                            ? "border-amber-500/35 bg-amber-500/15 text-amber-300"
+                                            : "border-rose-500/35 bg-rose-500/15 text-rose-300";
+
+                                    return (
+                                      <tr key={`${st.mac}-${idx}`}>
+                                        <td className="py-2 pr-3 font-sans font-semibold text-white">
+                                          {st.name || st.mac || "Station"}
+                                        </td>
+                                        <td className="py-2 pr-3 text-slate-300">{st.mac || "—"}</td>
+                                        <td className="py-2 pr-3 text-sky-400">{st.ip || "—"}</td>
+                                        <td className="py-2 pr-3 text-slate-300">
+                                          {st.ssid || "—"}
+                                          {st.interface_name ? ` (${st.interface_name})` : ""}
+                                        </td>
+                                        <td className="py-2 pr-3">
+                                          <span
+                                            className={`inline-block rounded border px-1.5 py-0.5 text-[11px] ${sigClass}`}
+                                          >
+                                            {sig != null ? `${sig} dBm` : ""}
+                                            {sig != null && snr != null ? " / " : ""}
+                                            {snr != null ? `${snr} dB` : ""}
+                                            {sig == null && snr == null ? "—" : ""}
+                                          </span>
+                                        </td>
+                                        <td className="py-2 pr-3 text-slate-300">
+                                          {st.tx_rate_bps != null || st.rx_rate_bps != null
+                                            ? `${formatBps(st.tx_rate_bps ?? 0)} / ${formatBps(
+                                                st.rx_rate_bps ?? 0,
+                                              )}`
+                                            : "—"}
+                                        </td>
+                                        <td className="py-2 pr-3 text-slate-300">
+                                          {st.rx_bytes != null || st.tx_bytes != null
+                                            ? `${formatBytes(st.rx_bytes ?? 0)} / ${formatBytes(
+                                                st.tx_bytes ?? 0,
+                                              )}`
+                                            : "—"}
+                                        </td>
+                                        <td className="py-2 text-right text-slate-400">
+                                          {formatDurationCompact(st.uptime_sec)}
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Fallback 802.11 Wireless Interfaces Table (when only IF-MIB is present) */}
+                        {detailWireless.vaps.length === 0 &&
+                          detailWireless.wireless_interfaces.length > 0 && (
+                            <div className="space-y-2 rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                              <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                                802.11 Wireless Interfaces (IF-MIB)
+                              </h4>
+                              <div className="overflow-x-auto">
+                                <table className="w-full text-left font-mono-tabular text-xs">
+                                  <thead>
+                                    <tr className="border-b border-slate-800 text-slate-400">
+                                      <th className="pb-2 pr-3 font-medium">ifIndex</th>
+                                      <th className="pb-2 pr-3 font-medium">Interface</th>
+                                      <th className="pb-2 pr-3 font-medium">Description</th>
+                                      <th className="pb-2 pr-3 font-medium">MAC / BSSID</th>
+                                      <th className="pb-2 pr-3 font-medium">Speed</th>
+                                      <th className="pb-2 pr-3 font-medium">RX / TX Rate</th>
+                                      <th className="pb-2 pr-3 font-medium">Total RX / TX</th>
+                                      <th className="pb-2 pr-3 font-medium">Errors</th>
+                                      <th className="pb-2 text-right font-medium">Status</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody className="divide-y divide-slate-800/60">
+                                    {detailWireless.wireless_interfaces.map((wif) => (
+                                      <tr
+                                        key={wif.if_index}
+                                        onClick={() =>
+                                          setDetailIfIndex(
+                                            detailIfIndex === wif.if_index ? 0 : wif.if_index,
+                                          )
+                                        }
+                                        className="cursor-pointer hover:bg-slate-800/50"
+                                      >
+                                        <td className="py-2 pr-3 text-slate-400">#{wif.if_index}</td>
+                                        <td className="py-2 pr-3 font-semibold text-white">
+                                          {wif.if_name}
+                                        </td>
+                                        <td className="py-2 pr-3 font-sans text-slate-400">
+                                          {wif.if_alias || wif.if_descr || "—"}
+                                        </td>
+                                        <td className="py-2 pr-3 text-slate-400">
+                                          {wif.mac_address || "—"}
+                                        </td>
+                                        <td className="py-2 pr-3 text-slate-300">
+                                          {wif.speed_bps > 0 ? formatBps(wif.speed_bps) : "Auto"}
+                                        </td>
+                                        <td className="py-2 pr-3">
+                                          <span className="text-emerald-400">
+                                            {formatBps(wif.in_bps)}
+                                          </span>
+                                          <span className="text-slate-600"> / </span>
+                                          <span className="text-sky-400">
+                                            {formatBps(wif.out_bps)}
+                                          </span>
+                                        </td>
+                                        <td className="py-2 pr-3 text-slate-300">
+                                          {formatBytes(wif.in_octets)} /{" "}
+                                          {formatBytes(wif.out_octets)}
+                                        </td>
+                                        <td className="py-2 pr-3 text-slate-400">
+                                          {wif.in_errors} / {wif.out_errors}
+                                        </td>
+                                        <td className="py-2 text-right">
+                                          <span
+                                            className={`inline-block rounded px-1.5 py-0.5 text-[11px] ${
+                                              wif.oper_status === 1
+                                                ? "bg-emerald-500/15 text-emerald-400"
+                                                : "bg-slate-800 text-slate-400"
+                                            }`}
+                                          >
+                                            {wif.oper_status === 1 ? "UP" : "DOWN"}
+                                          </span>
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </div>
+                          )}
+                      </>
+                    )}
+                  </div>
+                )}
+
                 {/* Extended Vendor MIB Telemetry: Sensors, CPU/RAM/Storage, Wireless VAPs, and LLDP Neighbors */}
                 {deviceDetail?.snmp_system?.extended_metrics && (
                   <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
@@ -6793,8 +7980,9 @@ export const App: React.FC = () => {
                         </div>
                       )}
 
-                    {/* Wireless VAPs (UBNT-UniFi-MIB) */}
-                    {deviceDetail.snmp_system.extended_metrics.wireless_radios &&
+                    {/* Wireless VAPs (Legacy Fallback Only) */}
+                    {!detailWireless &&
+                      deviceDetail.snmp_system.extended_metrics.wireless_radios &&
                       deviceDetail.snmp_system.extended_metrics.wireless_radios.length > 0 && (
                         <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
                           <h3 className="mb-3 text-sm font-semibold text-white">
@@ -7441,13 +8629,15 @@ export const App: React.FC = () => {
                               className={`mr-1.5 inline-block rounded border px-1.5 py-0.5 text-[10px] uppercase ${
                                 t.device_profile_type === "ups"
                                   ? "border-amber-500/30 bg-amber-500/15 text-amber-300"
-                                  : t.device_profile_type === "nas"
-                                    ? "border-violet-500/30 bg-violet-500/15 text-violet-300"
-                                    : t.device_profile_type === "printer"
-                                      ? "border-fuchsia-500/30 bg-fuchsia-500/15 text-fuchsia-300"
-                                      : t.device_profile_type === "server"
-                                        ? "border-sky-500/30 bg-sky-500/15 text-sky-300"
-                                        : "border-cyan-500/30 bg-cyan-500/15 text-cyan-300"
+                                  : t.device_profile_type === "wireless"
+                                    ? "border-teal-500/30 bg-teal-500/15 text-teal-300"
+                                    : t.device_profile_type === "nas"
+                                      ? "border-violet-500/30 bg-violet-500/15 text-violet-300"
+                                      : t.device_profile_type === "printer"
+                                        ? "border-fuchsia-500/30 bg-fuchsia-500/15 text-fuchsia-300"
+                                        : t.device_profile_type === "server"
+                                          ? "border-sky-500/30 bg-sky-500/15 text-sky-300"
+                                          : "border-cyan-500/30 bg-cyan-500/15 text-cyan-300"
                               }`}
                             >
                               {t.device_profile_type}

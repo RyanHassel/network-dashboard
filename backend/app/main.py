@@ -1772,10 +1772,11 @@ async def get_overview_graph_options() -> Dict[str, Any]:
             """
         )
         snmp_rows = await conn.fetch(
-            """
+            f"""
             SELECT device_ip, sys_name, sys_descr, vendor_name, device_category,
                    matched_mibs, is_reachable,
-                   (extended_metrics ? 'ups_telemetry') AS has_ups_telemetry
+                   (extended_metrics ? 'ups_telemetry') AS has_ups_telemetry,
+                   {_HAS_WIRELESS_SQL} AS has_wireless_telemetry
             FROM snmp_devices
             """
         )
@@ -2800,12 +2801,48 @@ async def get_snmp_interfaces(device_ip: Optional[str] = None) -> Dict[str, Any]
     return {"interfaces": items}
 
 
+_HAS_WIRELESS_SQL = (
+    "COALESCE(((extended_metrics ? 'wireless_telemetry')"
+    " OR jsonb_array_length(COALESCE(extended_metrics->'wireless_radios', '[]'::jsonb)) > 0), FALSE)"
+)
+_HAS_WIRELESS_SQL_D = (
+    "COALESCE(((d.extended_metrics ? 'wireless_telemetry')"
+    " OR jsonb_array_length(COALESCE(d.extended_metrics->'wireless_radios', '[]'::jsonb)) > 0), FALSE)"
+)
+
+
+def _has_wireless_telemetry(snmp_sys: Optional[Dict[str, Any]]) -> tuple:
+    """Returns (has_ap_or_station_telemetry, has_any_wireless_telemetry)."""
+    if not isinstance(snmp_sys, dict):
+        return (False, False)
+    ext = snmp_sys.get("extended_metrics")
+    has_ap = False
+    has_any = bool(snmp_sys.get("has_wireless_telemetry"))
+    if isinstance(ext, dict):
+        wl = ext.get("wireless_telemetry")
+        if isinstance(wl, dict):
+            radios = wl.get("radios") or []
+            vaps = wl.get("vaps") or []
+            stations = wl.get("stations") or []
+            wl_ifs = wl.get("wireless_interfaces") or []
+            if radios or vaps or stations:
+                has_ap = True
+                has_any = True
+            elif wl_ifs:
+                has_any = True
+        w_rad = ext.get("wireless_radios")
+        if isinstance(w_rad, list) and len(w_rad) > 0:
+            has_ap = True
+            has_any = True
+    return (has_ap, has_any)
+
+
 def _classify_device_profile(
     snmp_sys: Optional[Dict[str, Any]],
     unifi_dev: Optional[Dict[str, Any]],
     fallback_mib: Optional[Dict[str, Any]],
 ) -> str:
-    """Classifies a managed device into ups, nas, printer, network, or server."""
+    """Classifies a managed device into ups, wireless, printer, nas, network, or server."""
     if snmp_sys:
         ext = snmp_sys.get("extended_metrics")
         if isinstance(ext, dict) and ext.get("ups_telemetry"):
@@ -2833,12 +2870,27 @@ def _classify_device_profile(
         combined,
     ):
         return "ups"
+
+    has_ap_wl, has_any_wl = _has_wireless_telemetry(snmp_sys)
+    if has_ap_wl:
+        return "wireless"
+
     if "Printer-MIB" in mibs or re.search(r"\b(printer|mfp|laserjet|officejet)\b", combined):
         return "printer"
     if any(
         m in ("SYNOLOGY-SYSTEM-MIB", "SYNOLOGY-DISK-MIB", "SYNOLOGY-RAID-MIB") for m in mibs
     ) or re.search(r"\b(nas|storage server|storage appliance|synology|truenas|freenas|qnap)\b", combined):
         return "nas"
+
+    if has_any_wl:
+        return "wireless"
+    if isinstance(unifi_dev, dict) and str(unifi_dev.get("device_type") or "").lower() == "uap":
+        return "wireless"
+    if re.search(
+        r"(?:^|[^a-z0-9])(uap|u6(?:\+|[\s-]|$)|u7(?:\+|[\s-]|$)|nanohd|flexhd|beaconhd|iw-hd|uk-ultra|uwb|airmax|nanobeam|powerbeam|litebeam|airfiber|access point|wireless ap|eap\d+|aironet|iap-\d+|ruckus)",
+        combined,
+    ):
+        return "wireless"
     if unifi_dev or re.search(
         r"\b(switch|gateway|router|firewall|ubiquiti|unifi|udm|mikrotik|cisco|fortinet|juniper|aruba|arista|netgear|access point)\b",
         combined,
@@ -2944,7 +2996,7 @@ async def get_snmp_telemetry(
         )
 
         target_rows = await conn.fetch(
-            """
+            f"""
             SELECT t.device_ip, t.label, t.enabled,
                    COALESCE(p.name, 'Default') AS profile_name,
                    COALESCE(p.version, 'v2c') AS snmp_version,
@@ -2952,6 +3004,7 @@ async def get_snmp_telemetry(
                    d.device_category, d.matched_mibs, d.interface_count,
                    d.is_reachable, d.last_poll_duration_ms, d.last_polled,
                    (d.extended_metrics ? 'ups_telemetry') AS has_ups_telemetry,
+                   {_HAS_WIRELESS_SQL_D} AS has_wireless_telemetry,
                    d.extended_metrics -> 'responding_mibs' AS responding_mibs
             FROM snmp_targets_config t
             LEFT JOIN snmp_profiles p ON p.id = t.profile_id
@@ -3024,6 +3077,7 @@ async def get_snmp_telemetry(
                 "sys_name": r.get("sys_name") or r.get("label"),
                 "matched_mibs": matched_mibs,
                 "has_ups_telemetry": bool(r.get("has_ups_telemetry")),
+                "has_wireless_telemetry": bool(r.get("has_wireless_telemetry")),
             },
             None,
             None,
@@ -3524,12 +3578,13 @@ async def get_all_devices() -> Dict[str, Any]:
         )
 
         snmp_dev_rows = await conn.fetch(
-            """
+            f"""
             SELECT device_ip, sys_name, sys_descr, sys_object_id, sys_location, sys_contact,
                    sys_uptime_ticks, cpu_usage_pct, mem_usage_pct, temp_celsius, interface_count,
                    vendor_name, device_category, matched_mibs, hardware_model, serial_number,
                    firmware_version, mac_address, subnet_cidr, first_polled,
                    (extended_metrics ? 'ups_telemetry') AS has_ups_telemetry,
+                   {_HAS_WIRELESS_SQL} AS has_wireless_telemetry,
                    is_reachable, last_poll_duration_ms, last_polled
             FROM snmp_devices
             """
@@ -3666,6 +3721,8 @@ async def get_all_devices() -> Dict[str, Any]:
         item["device_category"] = r.get("device_category") or item["device_category"]
         if r.get("has_ups_telemetry"):
             item["has_ups_telemetry"] = True
+        if r.get("has_wireless_telemetry"):
+            item["has_wireless_telemetry"] = True
         raw_mibs = r.get("matched_mibs")
         if isinstance(raw_mibs, str):
             try:
@@ -3701,6 +3758,8 @@ async def get_all_devices() -> Dict[str, Any]:
                 item["is_online"] = True
             item["cpu_usage_pct"] = float(r["cpu_usage_pct"] or 0.0)
             item["uptime_sec"] = int(r["uptime_sec"] or 0)
+            if r["device_type"]:
+                item["_unifi_device_type"] = str(r["device_type"])
             if "UniFi" not in item["sources"]:
                 item["sources"].append("UniFi")
             if r["last_seen"]:
@@ -3741,6 +3800,11 @@ async def get_all_devices() -> Dict[str, Any]:
                 "Generic / Standard RFC",
             ):
                 item["vendor"] = matched_vendor
+        unifi_hint = (
+            {"device_type": item.get("_unifi_device_type")}
+            if item.get("_unifi_device_type")
+            else ({"device_type": "unknown"} if "UniFi" in item.get("sources", []) else None)
+        )
         item["device_profile_type"] = _classify_device_profile(
             {
                 "device_category": item.get("device_category"),
@@ -3749,11 +3813,14 @@ async def get_all_devices() -> Dict[str, Any]:
                 "sys_name": item.get("hostname"),
                 "matched_mibs": item.get("matched_mibs") or [],
                 "has_ups_telemetry": bool(item.get("has_ups_telemetry")),
+                "has_wireless_telemetry": bool(item.get("has_wireless_telemetry")),
             },
-            True if "UniFi" in item.get("sources", []) else None,
+            unifi_hint,
             None,
         )
         item.pop("has_ups_telemetry", None)
+        item.pop("has_wireless_telemetry", None)
+        item.pop("_unifi_device_type", None)
 
     def _ip_sort_key(d: Dict[str, Any]):
         try:
@@ -4131,6 +4198,103 @@ async def get_device_ups_history(
             "output_voltage_v": _opt_round(r["output_voltage_v"], 1),
             "output_watts": _opt_round(r["output_watts"], 1),
             "battery_temp_c": _opt_round(r["battery_temp_c"], 1),
+        }
+        for r in rows
+    ]
+    return {"device_id": device_id, "device_ip": device_ip, "range": rk, "series": series}
+
+
+@app.get("/api/devices/{device_ref}/wireless-history")
+async def get_device_wireless_history(
+    device_ref: str,
+    range_key: str = Query(default="24h", alias="range"),
+) -> Dict[str, Any]:
+    """Returns time-series wireless clients, channel utilization, interference, noise, CCQ, signal, and bps."""
+    rk = (range_key or "24h").strip().lower()
+    if rk == "1d":
+        rk = "24h"
+    if rk not in ("1h", "6h", "24h", "7d", "30d"):
+        rk = "24h"
+
+    range_map = {
+        "1h": ("1 hour", None),
+        "6h": ("6 hours", None),
+        "24h": ("24 hours", "5 minutes"),
+        "7d": ("7 days", "15 minutes"),
+        "30d": ("30 days", "1 hour"),
+    }
+    sql_interval, bucket_size = range_map[rk]
+
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        device_id, device_ip = await _resolve_device_ref(conn, device_ref)
+        if bucket_size is None:
+            rows = await conn.fetch(
+                f"""
+                SELECT time AS bucket,
+                       total_clients,
+                       avg_channel_util_pct,
+                       max_channel_util_pct,
+                       avg_self_rx_pct,
+                       avg_self_tx_pct,
+                       avg_interference_pct,
+                       avg_noise_floor_dbm,
+                       avg_ccq_pct,
+                       avg_signal_dbm,
+                       rx_bps,
+                       tx_bps
+                FROM wireless_metrics_raw
+                WHERE device_ip = $1
+                  AND time > NOW() - INTERVAL '{sql_interval}'
+                ORDER BY time ASC
+                """,
+                device_ip,
+            )
+        else:
+            rows = await conn.fetch(
+                f"""
+                SELECT time_bucket('{bucket_size}', time) AS bucket,
+                       AVG(total_clients) AS total_clients,
+                       AVG(avg_channel_util_pct) AS avg_channel_util_pct,
+                       MAX(max_channel_util_pct) AS max_channel_util_pct,
+                       AVG(avg_self_rx_pct) AS avg_self_rx_pct,
+                       AVG(avg_self_tx_pct) AS avg_self_tx_pct,
+                       AVG(avg_interference_pct) AS avg_interference_pct,
+                       AVG(avg_noise_floor_dbm) AS avg_noise_floor_dbm,
+                       AVG(avg_ccq_pct) AS avg_ccq_pct,
+                       AVG(avg_signal_dbm) AS avg_signal_dbm,
+                       AVG(rx_bps) AS rx_bps,
+                       AVG(tx_bps) AS tx_bps
+                FROM wireless_metrics_raw
+                WHERE device_ip = $1
+                  AND time > NOW() - INTERVAL '{sql_interval}'
+                GROUP BY bucket
+                ORDER BY bucket ASC
+                """,
+                device_ip,
+            )
+
+    def _opt_round(v: Any, digits: int = 1) -> Optional[float]:
+        return round(float(v), digits) if v is not None else None
+
+    series = [
+        {
+            "time": r["bucket"].isoformat(),
+            "total_clients": (
+                int(round(float(r["total_clients"])))
+                if r["total_clients"] is not None
+                else None
+            ),
+            "avg_channel_util_pct": _opt_round(r["avg_channel_util_pct"], 1),
+            "max_channel_util_pct": _opt_round(r["max_channel_util_pct"], 1),
+            "avg_self_rx_pct": _opt_round(r["avg_self_rx_pct"], 1),
+            "avg_self_tx_pct": _opt_round(r["avg_self_tx_pct"], 1),
+            "avg_interference_pct": _opt_round(r["avg_interference_pct"], 1),
+            "avg_noise_floor_dbm": _opt_round(r["avg_noise_floor_dbm"], 1),
+            "avg_ccq_pct": _opt_round(r["avg_ccq_pct"], 1),
+            "avg_signal_dbm": _opt_round(r["avg_signal_dbm"], 1),
+            "rx_bps": _opt_round(r["rx_bps"], 1),
+            "tx_bps": _opt_round(r["tx_bps"], 1),
         }
         for r in rows
     ]

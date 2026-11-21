@@ -18,6 +18,7 @@ logger = logging.getLogger("netdash.snmp")
 
 # Standard MIB-II / IF-MIB OIDs
 OID_IF_DESCR = "1.3.6.1.2.1.2.2.1.2"
+OID_IF_TYPE = "1.3.6.1.2.1.2.2.1.3"
 OID_IF_SPEED = "1.3.6.1.2.1.2.2.1.5"
 OID_IF_PHYS_ADDR = "1.3.6.1.2.1.2.2.1.6"
 OID_IF_OPER_STATUS = "1.3.6.1.2.1.2.2.1.8"
@@ -184,11 +185,14 @@ def _parse_sys_descr_metadata(sys_descr: str, vendor_key: str) -> Dict[str, str]
         return out
 
     if vendor_key == "ubiquiti" or any(
-        kw in descr.lower() for kw in ("ubiquiti", "unifi", "ubnt", "edgeos", "udm", "usw", "uap")
+        kw in descr.lower()
+        for kw in ("ubiquiti", "unifi", "ubnt", "edgeos", "udm", "usw", "uap", "u6", "u7")
     ):
-        # Match UniFi model names: UDM-Pro, UDM-SE, UCG-Ultra, UXG-Pro, USW-Pro-24-PoE, UAP-AC-Pro, U6-Pro, U7-Pro, etc.
+        # Match UniFi model names: UDM-Pro, USW-Pro-24-PoE, UAP-nanoHD, U6+, U6 Pro, U7 Pro Max, etc.
         m_unifi = re.search(
-            r"\b((?:UDM|UCG|UXG|USG|USW|USL|UAP|U6|U7|UK|UNVR|UCK)[A-Za-z0-9-]*)\b(?:\s+v?(\d+\.\d+(?:\.\d+)+))?",
+            r"(?<!\w)((?:UDM|UCG|UXG|USG|USW|USL|UAP|U6\+?|U7\+?|UK|UNVR|UCK|UWB)"
+            r"(?:-[A-Za-z0-9+]+|\s+(?!v?\d+\.\d+)(?:Pro|Max|Enterprise|Mesh|Lite|LR|IW|Ultra|Wall|In-Wall|Outdoor|Flex|nanoHD|FlexHD|BeaconHD|HD|AC|XG|SE|Plus|Base|Extender))*)"
+            r"(?:\s+v?(\d+\.\d+(?:\.\d+)+))?",
             descr,
         )
         if m_unifi:
@@ -691,6 +695,1193 @@ def _parse_printer_supplies(prt_mib: Dict[str, str]) -> List[Dict[str, Any]]:
     return supplies[:16]
 
 
+def _opt_int(val: Optional[str]) -> Optional[int]:
+    """Parses an optional integer SNMP scalar/column, returning None when absent or non-numeric."""
+    if val is None:
+        return None
+    s = str(val).strip().strip('"')
+    if not s or "No Such" in s or "End of MIB" in s or "Wrong Type" in s:
+        return None
+    token = s.split()[0]
+    m_enum = re.search(r"\((-?\d+)\)", s)
+    try:
+        return int(float(token))
+    except ValueError:
+        if m_enum:
+            return int(m_enum.group(1))
+        return None
+
+
+def _opt_float(val: Optional[str]) -> Optional[float]:
+    """Parses an optional float SNMP scalar/column, returning None when absent or non-numeric."""
+    if val is None:
+        return None
+    s = str(val).strip().strip('"')
+    if not s or "No Such" in s or "End of MIB" in s or "Wrong Type" in s:
+        return None
+    token = s.split()[0]
+    try:
+        return float(token)
+    except ValueError:
+        return None
+
+
+def _clamp_pct(val: Optional[float]) -> Optional[float]:
+    """Validates a percentage value in 0..100, returning None for sentinel/out-of-range values."""
+    if val is None or val < 0.0 or val > 100.0:
+        return None
+    return round(val, 1)
+
+
+def _parse_truth_bool(val: Optional[str]) -> Optional[bool]:
+    """Parses SMIv2 TruthValue (1=true, 2=false) or boolean string representations."""
+    if val is None:
+        return None
+    s = str(val).strip().strip('"').lower()
+    if not s or "no such" in s:
+        return None
+    if s in ("1", "true", "true(1)", "up", "up(1)", "enabled"):
+        return True
+    if s in ("2", "0", "false", "false(2)", "down", "down(2)", "disabled"):
+        return False
+    return None
+
+
+def _decode_mac_from_oid_parts(parts: List[str]) -> Optional[str]:
+    """Converts 6 decimal SNMP index octets into a validated unicast aa:bb:cc:dd:ee:ff MAC."""
+    if len(parts) < 6:
+        return None
+    octets: List[str] = []
+    for p in parts[:6]:
+        if not p.isdigit():
+            return None
+        num = int(p)
+        if num < 0 or num > 255:
+            return None
+        octets.append(f"{num:02x}")
+    mac = ":".join(octets)
+    if mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+        return None
+    if int(octets[0], 16) & 1:
+        return None
+    return mac
+
+
+def _freq_to_channel(freq_mhz: Optional[int]) -> Optional[int]:
+    """Converts an IEEE 802.11 center frequency in MHz to its channel number."""
+    if freq_mhz is None or freq_mhz <= 0:
+        return None
+    if freq_mhz == 2484:
+        return 14
+    if 2412 <= freq_mhz <= 2472 and (freq_mhz - 2407) % 5 == 0:
+        return (freq_mhz - 2407) // 5
+    if 5000 <= freq_mhz <= 5925 and (freq_mhz - 5000) % 5 == 0:
+        return (freq_mhz - 5000) // 5
+    if freq_mhz == 5935:
+        return 2
+    if 5955 <= freq_mhz <= 7115 and (freq_mhz - 5950) % 5 == 0:
+        return (freq_mhz - 5950) // 5
+    return None
+
+
+def _infer_wireless_band(
+    radio_raw: str = "", channel: Optional[int] = None, freq_mhz: Optional[int] = None
+) -> str:
+    """Infers frequency band (2.4 GHz, 5 GHz, 6 GHz), evaluating radio_raw and freq_mhz before channel."""
+    r = (radio_raw or "").strip().lower()
+    if r:
+        if any(tok in r for tok in ("6e", "6g", "6ghz", "6 ghz", "wifi6e")):
+            return "6 GHz"
+        if any(tok in r for tok in ("ng", "2.4", "2g", "2ghz", "2 ghz", "11b", "11g")):
+            return "2.4 GHz"
+        if any(tok in r for tok in ("na", "5g", "5ghz", "5 ghz", "11a", "11ac")):
+            return "5 GHz"
+
+    if freq_mhz is not None and freq_mhz > 0:
+        if 2400 <= freq_mhz <= 2500:
+            return "2.4 GHz"
+        if 4900 <= freq_mhz <= 5925:
+            return "5 GHz"
+        if 5926 <= freq_mhz <= 7200:
+            return "6 GHz"
+
+    if channel is not None and channel > 0:
+        if 1 <= channel <= 14:
+            return "2.4 GHz"
+        if 32 <= channel <= 177:
+            return "5 GHz"
+
+    return (radio_raw or "").strip() or "Wireless"
+
+
+def _is_wireless_interface(if_type: int, name: str, descr: str = "") -> bool:
+    """Identifies IEEE 802.11 / wireless radio interfaces from IF-MIB type, name, or description."""
+    if _is_loopback_interface(name, descr):
+        return False
+    if if_type == 71:  # ieee80211
+        return True
+    nm = (name or "").strip().lower()
+    if re.match(r"^(?:ath|wifi|ra|rai|rax|wlan|wl|dot11radio|vwire)\d+", nm):
+        return True
+    ds = (descr or "").strip().lower()
+    if any(kw in ds for kw in ("802.11", "wireless", "wlan")):
+        return True
+    return False
+
+
+def _has_wireless_ap_hint(sys_descr: str, sys_name: str = "") -> bool:
+    """Checks sysDescr/sysName for dedicated wireless AP/bridge keywords."""
+    combined = f"{sys_descr or ''} {sys_name or ''}".lower()
+    return bool(
+        re.search(
+            r"(?:^|[^a-z0-9])(uap|u6(?:\+|[\s-]|$)|u7(?:\+|[\s-]|$)|nanohd|flexhd|beaconhd|iw-hd|uk-ultra|uwb|"
+            r"airmax|nanobeam|powerbeam|litebeam|airfiber|access point|wireless ap|eap\d+|aironet|iap-\d+|aruba|ruckus|routeros)",
+            combined,
+        )
+    )
+
+
+def _table_indices(walk_map: Dict[str, str], col_prefixes: Tuple[str, ...]) -> List[str]:
+    """Collects unique table row index suffixes sorted naturally."""
+    idx_set: Set[str] = set()
+    for k in walk_map.keys():
+        if "." not in k:
+            continue
+        col, idx = k.split(".", 1)
+        if idx and col in col_prefixes:
+            idx_set.add(idx)
+
+    def _sort_key(item: str) -> Tuple[int, Any]:
+        parts = item.split(".")
+        if all(p.isdigit() for p in parts):
+            return (0, tuple(int(p) for p in parts))
+        return (1, item)
+
+    return sorted(idx_set, key=_sort_key)
+
+
+def _parse_unifi_wireless(
+    ubnt_radio: Dict[str, str],
+    ubnt_vap: Dict[str, str],
+    ubnt_sys: Dict[str, str],
+) -> Optional[Dict[str, Any]]:
+    """Parses UBNT-UniFi-MIB unifiRadioTable, unifiVapTable, and unifiApSystem."""
+    if not ubnt_radio and not ubnt_vap:
+        return None
+
+    radios: List[Dict[str, Any]] = []
+    for rid in _table_indices(ubnt_radio, ("1", "2", "3", "6")):
+        r_name = (ubnt_radio.get(f"2.{rid}") or "").strip() or f"radio{rid}"
+        r_code = (ubnt_radio.get(f"3.{rid}") or "").strip()
+        rx_pkt = _parse_counter_int(ubnt_radio.get(f"4.{rid}"))
+        tx_pkt = _parse_counter_int(ubnt_radio.get(f"5.{rid}"))
+        cu_total = _clamp_pct(_opt_float(ubnt_radio.get(f"6.{rid}")))
+        cu_rx = _clamp_pct(_opt_float(ubnt_radio.get(f"7.{rid}")))
+        cu_tx = _clamp_pct(_opt_float(ubnt_radio.get(f"8.{rid}")))
+        cu_other = _clamp_pct(_opt_float(ubnt_radio.get(f"9.{rid}")))
+        radios.append(
+            {
+                "index": rid,
+                "name": r_name,
+                "radio_code": r_code,
+                "band": _infer_wireless_band(r_code, None, None),
+                "channel": None,
+                "ext_channel": None,
+                "freq_mhz": None,
+                "channel_width_mhz": None,
+                "tx_power_dbm": None,
+                "clients": 0,
+                "ssid_count": 0,
+                "ssids": [],
+                "is_up": True,
+                "cu_total_pct": cu_total,
+                "cu_self_rx_pct": cu_rx,
+                "cu_self_tx_pct": cu_tx,
+                "cu_other_bss_pct": cu_other,
+                "noise_floor_dbm": None,
+                "ccq_pct": None,
+                "signal_dbm": None,
+                "rx_packets": rx_pkt,
+                "tx_packets": tx_pkt,
+                "mode": "Access Point",
+            }
+        )
+
+    vaps: List[Dict[str, Any]] = []
+    for vid in _table_indices(ubnt_vap, ("1", "2", "4", "6", "7")):
+        raw_essid = (ubnt_vap.get(f"6.{vid}") or "").strip()
+        usage = (ubnt_vap.get(f"23.{vid}") or "user").strip().lower() or "user"
+        if not raw_essid and usage != "vwire":
+            continue
+        essid = raw_essid or "Mesh Backhaul"
+        bssid = _normalize_mac(ubnt_vap.get(f"2.{vid}")) or ""
+        ccq_raw = _opt_float(ubnt_vap.get(f"3.{vid}"))
+        ccq_pct: Optional[float] = None
+        if ccq_raw is not None:
+            if 100.0 < ccq_raw <= 1000.0:
+                ccq_pct = round(ccq_raw / 10.0, 1)
+            elif 0.0 < ccq_raw <= 100.0:
+                ccq_pct = round(ccq_raw, 1)
+
+        chan_raw = _opt_int(ubnt_vap.get(f"4.{vid}"))
+        channel = chan_raw if chan_raw is not None and chan_raw > 0 else None
+        ext_raw = _opt_int(ubnt_vap.get(f"5.{vid}"))
+        ext_channel = ext_raw if ext_raw is not None and ext_raw > 0 else None
+        if_name = (ubnt_vap.get(f"7.{vid}") or "").strip()
+        clients = max(0, _to_int(ubnt_vap.get(f"8.{vid}"), 0))
+        r_code = (ubnt_vap.get(f"9.{vid}") or "").strip()
+        rx_bytes = _parse_counter_int(ubnt_vap.get(f"10.{vid}"))
+        rx_crypts = _parse_counter_int(ubnt_vap.get(f"11.{vid}"))
+        rx_dropped = _parse_counter_int(ubnt_vap.get(f"12.{vid}"))
+        rx_errors = _parse_counter_int(ubnt_vap.get(f"13.{vid}"))
+        rx_frags = _parse_counter_int(ubnt_vap.get(f"14.{vid}"))
+        rx_packets = _parse_counter_int(ubnt_vap.get(f"15.{vid}"))
+        tx_bytes = _parse_counter_int(ubnt_vap.get(f"16.{vid}"))
+        tx_dropped = _parse_counter_int(ubnt_vap.get(f"17.{vid}"))
+        tx_errors = _parse_counter_int(ubnt_vap.get(f"18.{vid}"))
+        tx_packets = _parse_counter_int(ubnt_vap.get(f"19.{vid}"))
+        tx_retries = _parse_counter_int(ubnt_vap.get(f"20.{vid}"))
+        txp_raw = _opt_int(ubnt_vap.get(f"21.{vid}"))
+        tx_power_dbm = txp_raw if (txp_raw is not None and 1 <= txp_raw <= 50) else None
+        up_flag = _parse_truth_bool(ubnt_vap.get(f"22.{vid}"))
+        is_up = True if up_flag is None else up_flag
+
+        vaps.append(
+            {
+                "index": vid,
+                "ssid": essid,
+                "bssid": bssid,
+                "interface_name": if_name,
+                "if_index": None,
+                "radio_code": r_code,
+                "band": _infer_wireless_band(r_code, channel, None),
+                "channel": channel,
+                "ext_channel": ext_channel,
+                "freq_mhz": None,
+                "tx_power_dbm": tx_power_dbm,
+                "clients": clients,
+                "up": is_up,
+                "usage": usage,
+                "ccq_pct": ccq_pct,
+                "rx_bytes": rx_bytes,
+                "tx_bytes": tx_bytes,
+                "rx_packets": rx_packets,
+                "tx_packets": tx_packets,
+                "rx_errors": rx_errors,
+                "tx_errors": tx_errors,
+                "rx_dropped": rx_dropped,
+                "tx_dropped": tx_dropped,
+                "rx_crypts": rx_crypts,
+                "rx_frags": rx_frags,
+                "tx_retries": tx_retries,
+                "rx_bps": None,
+                "tx_bps": None,
+            }
+        )
+
+    if not radios and vaps:
+        synth_groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for v in vaps:
+            key = (v.get("radio_code") or "", v.get("band") or "Wireless")
+            synth_groups.setdefault(key, []).append(v)
+        for idx_num, ((r_code, band), group_vaps) in enumerate(synth_groups.items(), start=1):
+            first_v = group_vaps[0]
+            radios.append(
+                {
+                    "index": str(idx_num),
+                    "name": first_v.get("interface_name") or (r_code or band),
+                    "radio_code": r_code,
+                    "band": band,
+                    "channel": None,
+                    "ext_channel": None,
+                    "freq_mhz": None,
+                    "channel_width_mhz": None,
+                    "tx_power_dbm": None,
+                    "clients": 0,
+                    "ssid_count": 0,
+                    "ssids": [],
+                    "is_up": True,
+                    "cu_total_pct": None,
+                    "cu_self_rx_pct": None,
+                    "cu_self_tx_pct": None,
+                    "cu_other_bss_pct": None,
+                    "noise_floor_dbm": None,
+                    "ccq_pct": None,
+                    "signal_dbm": None,
+                    "rx_packets": None,
+                    "tx_packets": None,
+                    "mode": "Access Point",
+                }
+            )
+
+    for rad in radios:
+        matched_vaps = [
+            v
+            for v in vaps
+            if (rad["radio_code"] and v.get("radio_code") == rad["radio_code"])
+            or (not rad["radio_code"] and v.get("band") == rad["band"])
+            or (rad["name"] and v.get("interface_name") == rad["name"])
+        ]
+        if matched_vaps:
+            rad["clients"] = sum(int(v.get("clients") or 0) for v in matched_vaps)
+            ssids_seen: List[str] = []
+            for v in matched_vaps:
+                if v["ssid"] and v["ssid"] not in ssids_seen:
+                    ssids_seen.append(v["ssid"])
+            rad["ssids"] = ssids_seen
+            rad["ssid_count"] = len(ssids_seen)
+            rad["is_up"] = any(bool(v.get("up", True)) for v in matched_vaps)
+            for v in matched_vaps:
+                if rad["channel"] is None and v.get("channel") is not None:
+                    rad["channel"] = v["channel"]
+                if rad["ext_channel"] is None and v.get("ext_channel") is not None:
+                    rad["ext_channel"] = v["ext_channel"]
+                if rad["tx_power_dbm"] is None and v.get("tx_power_dbm") is not None:
+                    rad["tx_power_dbm"] = v["tx_power_dbm"]
+            if rad["band"] in ("Wireless", "", None):
+                rad["band"] = _infer_wireless_band(rad.get("radio_code", ""), rad.get("channel"), None)
+            ccq_vals = [float(v["ccq_pct"]) for v in matched_vaps if v.get("ccq_pct") is not None]
+            if ccq_vals and rad["ccq_pct"] is None:
+                rad["ccq_pct"] = round(sum(ccq_vals) / len(ccq_vals), 1)
+
+    if not radios and not vaps:
+        return None
+
+    isolated_raw = (ubnt_sys.get("2.0") or "").strip().lower()
+    is_isolated: Optional[bool] = None
+    if isolated_raw in ("1", "true", "true(1)"):
+        is_isolated = True
+    elif isolated_raw in ("2", "0", "false", "false(2)"):
+        is_isolated = False
+
+    return {
+        "source_mibs": ["UBNT-UniFi-MIB"],
+        "mode": "Access Point",
+        "is_isolated": is_isolated,
+        "radios": radios,
+        "vaps": vaps,
+        "stations": [],
+    }
+
+
+def _parse_airmax_wireless(
+    air_radio: Dict[str, str],
+    air_wlstat: Dict[str, str],
+    air_sta: Dict[str, str],
+) -> Optional[Dict[str, Any]]:
+    """Parses UBNT-AirMAX-MIB ubntRadioTable, ubntWlStatTable, and ubntStaTable."""
+    if not air_radio and not air_wlstat and not air_sta:
+        return None
+
+    mode_map = {1: "Station", 2: "Access Point", 3: "AP Repeater", 4: "AP WDS"}
+    radios: List[Dict[str, Any]] = []
+    for rid in _table_indices(air_radio, ("1", "2", "4", "6")):
+        mode_code = _opt_int(air_radio.get(f"2.{rid}"))
+        mode_str = mode_map.get(mode_code or 0, "Wireless Radio")
+        freq = _opt_int(air_radio.get(f"4.{rid}"))
+        if freq is not None and freq <= 0:
+            freq = None
+        tx_pwr = _opt_int(air_radio.get(f"6.{rid}"))
+        if tx_pwr is not None and (tx_pwr < -20 or tx_pwr > 60):
+            tx_pwr = None
+        chan = _freq_to_channel(freq)
+        radios.append(
+            {
+                "index": rid,
+                "name": f"airMAX Radio {rid}",
+                "radio_code": mode_str,
+                "band": _infer_wireless_band("", chan, freq),
+                "channel": chan,
+                "ext_channel": None,
+                "freq_mhz": freq,
+                "channel_width_mhz": None,
+                "tx_power_dbm": tx_pwr,
+                "clients": 0,
+                "ssid_count": 0,
+                "ssids": [],
+                "is_up": True,
+                "cu_total_pct": None,
+                "cu_self_rx_pct": None,
+                "cu_self_tx_pct": None,
+                "cu_other_bss_pct": None,
+                "noise_floor_dbm": None,
+                "ccq_pct": None,
+                "signal_dbm": None,
+                "rx_packets": None,
+                "tx_packets": None,
+                "mode": mode_str,
+            }
+        )
+
+    vaps: List[Dict[str, Any]] = []
+    for wid in _table_indices(air_wlstat, ("1", "3", "5", "7", "15")):
+        ssid = (air_wlstat.get(f"1.{wid}") or "").strip()
+        bssid = _normalize_mac(air_wlstat.get(f"3.{wid}")) or ""
+        sig = _opt_int(air_wlstat.get(f"5.{wid}"))
+        if sig is not None and sig == 0:
+            sig = None
+        ccq = _clamp_pct(_opt_float(air_wlstat.get(f"7.{wid}")))
+        noise = _opt_int(air_wlstat.get(f"8.{wid}"))
+        if noise is not None and noise >= 0:
+            noise = None
+        chan_width = _opt_int(air_wlstat.get(f"14.{wid}"))
+        sta_count = max(0, _to_int(air_wlstat.get(f"15.{wid}"), 0))
+
+        ref_radio = radios[0] if radios else None
+        if ref_radio is not None:
+            ref_radio["clients"] = max(int(ref_radio.get("clients") or 0), sta_count)
+            if ssid and ssid not in ref_radio["ssids"]:
+                ref_radio["ssids"].append(ssid)
+                ref_radio["ssid_count"] = len(ref_radio["ssids"])
+            if chan_width and chan_width > 0:
+                ref_radio["channel_width_mhz"] = chan_width
+            if noise is not None:
+                ref_radio["noise_floor_dbm"] = noise
+            if ccq is not None:
+                ref_radio["ccq_pct"] = ccq
+            if sig is not None:
+                ref_radio["signal_dbm"] = sig
+
+        if ssid or bssid or sta_count > 0:
+            vaps.append(
+                {
+                    "index": wid,
+                    "ssid": ssid or "airMAX Link",
+                    "bssid": bssid,
+                    "interface_name": "ath0",
+                    "if_index": None,
+                    "radio_code": ref_radio["radio_code"] if ref_radio else "airMAX",
+                    "band": ref_radio["band"] if ref_radio else "5 GHz",
+                    "channel": ref_radio["channel"] if ref_radio else None,
+                    "ext_channel": None,
+                    "freq_mhz": ref_radio["freq_mhz"] if ref_radio else None,
+                    "tx_power_dbm": ref_radio["tx_power_dbm"] if ref_radio else None,
+                    "clients": sta_count,
+                    "up": True,
+                    "usage": "user",
+                    "ccq_pct": ccq,
+                    "rx_bytes": None,
+                    "tx_bytes": None,
+                    "rx_packets": None,
+                    "tx_packets": None,
+                    "rx_errors": None,
+                    "tx_errors": None,
+                    "rx_dropped": None,
+                    "tx_dropped": None,
+                    "rx_crypts": None,
+                    "rx_frags": None,
+                    "tx_retries": None,
+                    "rx_bps": None,
+                    "tx_bps": None,
+                }
+            )
+
+    stations: List[Dict[str, Any]] = []
+    for sid in _table_indices(air_sta, ("1", "2", "3", "11", "12")):
+        mac = _normalize_mac(air_sta.get(f"1.{sid}")) or _decode_mac_from_oid_parts(sid.split(".")) or ""
+        name = (air_sta.get(f"2.{sid}") or "").strip()
+        sig = _opt_int(air_sta.get(f"3.{sid}"))
+        noise = _opt_int(air_sta.get(f"4.{sid}"))
+        tx_rate = _opt_int(air_sta.get(f"11.{sid}"))
+        rx_rate = _opt_int(air_sta.get(f"12.{sid}"))
+        snr = (sig - noise) if (sig is not None and noise is not None and sig < 0 and noise < 0) else None
+        if mac or name:
+            stations.append(
+                {
+                    "mac": mac,
+                    "name": name or mac,
+                    "ip": "",
+                    "ssid": vaps[0]["ssid"] if vaps else "",
+                    "interface_name": "ath0",
+                    "signal_dbm": sig,
+                    "noise_dbm": noise,
+                    "snr_db": snr,
+                    "tx_rate_bps": tx_rate,
+                    "rx_rate_bps": rx_rate,
+                    "rx_bytes": None,
+                    "tx_bytes": None,
+                    "uptime_sec": None,
+                }
+            )
+
+    if not radios and not vaps and not stations:
+        return None
+
+    if stations and vaps and vaps[0]["clients"] == 0:
+        vaps[0]["clients"] = len(stations)
+    if stations and radios and radios[0]["clients"] == 0:
+        radios[0]["clients"] = len(stations)
+
+    return {
+        "source_mibs": ["UBNT-AirMAX-MIB"],
+        "mode": (radios[0]["mode"] if radios else "Wireless Bridge"),
+        "is_isolated": None,
+        "radios": radios,
+        "vaps": vaps,
+        "stations": stations[:128],
+    }
+
+
+def _parse_mikrotik_wireless(
+    mt_ap: Dict[str, str],
+    mt_stat: Dict[str, str],
+    mt_rtab: Dict[str, str],
+    if_names: Optional[Dict[str, str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Parses MIKROTIK-MIB mtxrWlApTable, mtxrWlStatTable, and mtxrWlRtabTable."""
+    if not mt_ap and not mt_stat and not mt_rtab:
+        return None
+
+    radios: List[Dict[str, Any]] = []
+    vaps: List[Dict[str, Any]] = []
+    mode_label = "Access Point"
+
+    ap_ids = _table_indices(mt_ap, ("4", "5", "6", "7", "8"))
+    for idx in ap_ids:
+        if_idx_num = _opt_int(idx.split(".")[0]) if "." in idx or idx.isdigit() else None
+        if_name = (if_names or {}).get(str(idx), "") or f"wlan{idx}"
+        ssid = (mt_ap.get(f"4.{idx}") or "").strip()
+        bssid = _normalize_mac(mt_ap.get(f"5.{idx}")) or ""
+        clients = max(0, _to_int(mt_ap.get(f"6.{idx}"), 0))
+        freq = _opt_int(mt_ap.get(f"7.{idx}"))
+        band_raw = (mt_ap.get(f"8.{idx}") or "").strip()
+        noise = _opt_int(mt_ap.get(f"9.{idx}"))
+        if noise is not None and noise >= 0:
+            noise = None
+        ccq = _clamp_pct(_opt_float(mt_ap.get(f"10.{idx}")))
+        chan = _freq_to_channel(freq)
+        band = _infer_wireless_band(band_raw, chan, freq)
+
+        radios.append(
+            {
+                "index": idx,
+                "name": if_name,
+                "radio_code": band_raw or band,
+                "band": band,
+                "channel": chan,
+                "ext_channel": None,
+                "freq_mhz": freq,
+                "channel_width_mhz": None,
+                "tx_power_dbm": None,
+                "clients": clients,
+                "ssid_count": 1 if ssid else 0,
+                "ssids": [ssid] if ssid else [],
+                "is_up": True,
+                "cu_total_pct": None,
+                "cu_self_rx_pct": None,
+                "cu_self_tx_pct": None,
+                "cu_other_bss_pct": None,
+                "noise_floor_dbm": noise,
+                "ccq_pct": ccq,
+                "signal_dbm": None,
+                "rx_packets": None,
+                "tx_packets": None,
+                "mode": "Access Point",
+            }
+        )
+        vaps.append(
+            {
+                "index": idx,
+                "ssid": ssid or if_name,
+                "bssid": bssid,
+                "interface_name": if_name,
+                "if_index": if_idx_num,
+                "radio_code": band_raw or band,
+                "band": band,
+                "channel": chan,
+                "ext_channel": None,
+                "freq_mhz": freq,
+                "tx_power_dbm": None,
+                "clients": clients,
+                "up": True,
+                "usage": "user",
+                "ccq_pct": ccq,
+                "rx_bytes": None,
+                "tx_bytes": None,
+                "rx_packets": None,
+                "tx_packets": None,
+                "rx_errors": None,
+                "tx_errors": None,
+                "rx_dropped": None,
+                "tx_dropped": None,
+                "rx_crypts": None,
+                "rx_frags": None,
+                "tx_retries": None,
+                "rx_bps": None,
+                "tx_bps": None,
+            }
+        )
+
+    if not ap_ids and mt_stat:
+        mode_label = "Station"
+        for idx in _table_indices(mt_stat, ("4", "5", "6", "7", "8")):
+            if_idx_num = _opt_int(idx.split(".")[0]) if "." in idx or idx.isdigit() else None
+            if_name = (if_names or {}).get(str(idx), "") or f"wlan{idx}"
+            sig = _opt_int(mt_stat.get(f"4.{idx}"))
+            ssid = (mt_stat.get(f"5.{idx}") or "").strip()
+            bssid = _normalize_mac(mt_stat.get(f"6.{idx}")) or ""
+            freq = _opt_int(mt_stat.get(f"7.{idx}"))
+            band_raw = (mt_stat.get(f"8.{idx}") or "").strip()
+            tx_ccq = _clamp_pct(_opt_float(mt_stat.get(f"9.{idx}")))
+            chan = _freq_to_channel(freq)
+            band = _infer_wireless_band(band_raw, chan, freq)
+            radios.append(
+                {
+                    "index": idx,
+                    "name": if_name,
+                    "radio_code": band_raw or band,
+                    "band": band,
+                    "channel": chan,
+                    "ext_channel": None,
+                    "freq_mhz": freq,
+                    "channel_width_mhz": None,
+                    "tx_power_dbm": None,
+                    "clients": 1 if bssid else 0,
+                    "ssid_count": 1 if ssid else 0,
+                    "ssids": [ssid] if ssid else [],
+                    "is_up": True,
+                    "cu_total_pct": None,
+                    "cu_self_rx_pct": None,
+                    "cu_self_tx_pct": None,
+                    "cu_other_bss_pct": None,
+                    "noise_floor_dbm": None,
+                    "ccq_pct": tx_ccq,
+                    "signal_dbm": sig,
+                    "rx_packets": None,
+                    "tx_packets": None,
+                    "mode": "Station",
+                }
+            )
+            vaps.append(
+                {
+                    "index": idx,
+                    "ssid": ssid or if_name,
+                    "bssid": bssid,
+                    "interface_name": if_name,
+                    "if_index": if_idx_num,
+                    "radio_code": band_raw or band,
+                    "band": band,
+                    "channel": chan,
+                    "ext_channel": None,
+                    "freq_mhz": freq,
+                    "tx_power_dbm": None,
+                    "clients": 1 if bssid else 0,
+                    "up": True,
+                    "usage": "user",
+                    "ccq_pct": tx_ccq,
+                    "rx_bytes": None,
+                    "tx_bytes": None,
+                    "rx_packets": None,
+                    "tx_packets": None,
+                    "rx_errors": None,
+                    "tx_errors": None,
+                    "rx_dropped": None,
+                    "tx_dropped": None,
+                    "rx_crypts": None,
+                    "rx_frags": None,
+                    "tx_retries": None,
+                    "rx_bps": None,
+                    "tx_bps": None,
+                }
+            )
+
+    if_to_ssid = {
+        str(v["if_index"]): v["ssid"]
+        for v in vaps
+        if v.get("if_index") is not None and v.get("ssid")
+    }
+    stations: List[Dict[str, Any]] = []
+    for sid in _table_indices(mt_rtab, ("1", "2", "3", "4", "8", "9")):
+        parts = sid.split(".")
+        mac = _normalize_mac(mt_rtab.get(f"1.{sid}")) or _decode_mac_from_oid_parts(parts) or ""
+        iface_col = mt_rtab.get(f"2.{sid}") or (parts[6] if len(parts) >= 7 else "")
+        iface_name = (if_names or {}).get(str(iface_col), "") or (f"if{iface_col}" if iface_col else "")
+        sig = _opt_int(mt_rtab.get(f"3.{sid}"))
+        tx_b = _parse_counter_int(mt_rtab.get(f"4.{sid}"))
+        rx_b = _parse_counter_int(mt_rtab.get(f"5.{sid}"))
+        tx_rate = _opt_int(mt_rtab.get(f"8.{sid}"))
+        rx_rate = _opt_int(mt_rtab.get(f"9.{sid}"))
+        up_ticks = _parse_timeticks(mt_rtab.get(f"11.{sid}"))
+        snr = _opt_int(mt_rtab.get(f"12.{sid}"))
+        if mac:
+            stations.append(
+                {
+                    "mac": mac,
+                    "name": mac,
+                    "ip": "",
+                    "ssid": if_to_ssid.get(str(iface_col), ""),
+                    "interface_name": iface_name,
+                    "signal_dbm": sig,
+                    "noise_dbm": None,
+                    "snr_db": snr,
+                    "tx_rate_bps": tx_rate,
+                    "rx_rate_bps": rx_rate,
+                    "rx_bytes": rx_b,
+                    "tx_bytes": tx_b,
+                    "uptime_sec": (up_ticks // 100) if up_ticks > 0 else None,
+                }
+            )
+
+    if not radios and not vaps and not stations:
+        return None
+
+    return {
+        "source_mibs": ["MIKROTIK-MIB"],
+        "mode": mode_label,
+        "is_isolated": None,
+        "radios": radios,
+        "vaps": vaps,
+        "stations": stations[:128],
+    }
+
+
+def _parse_aruba_wireless(
+    ai_radio: Dict[str, str],
+    ai_wlan: Dict[str, str],
+    ai_client: Dict[str, str],
+) -> Optional[Dict[str, Any]]:
+    """Parses Aruba Instant AI-AP-MIB radio, WLAN/SSID, and client tables."""
+    if not ai_radio and not ai_wlan and not ai_client:
+        return None
+
+    radios: List[Dict[str, Any]] = []
+    for rid in _table_indices(ai_radio, ("4", "5", "6", "7", "8")):
+        chan = _opt_int(ai_radio.get(f"4.{rid}"))
+        if chan is not None and chan <= 0:
+            chan = None
+        txp = _opt_int(ai_radio.get(f"5.{rid}"))
+        noise = _opt_int(ai_radio.get(f"6.{rid}"))
+        if noise is not None and noise >= 0:
+            noise = None
+        util64 = _clamp_pct(_opt_float(ai_radio.get(f"8.{rid}")))
+        util4 = _clamp_pct(_opt_float(ai_radio.get(f"7.{rid}")))
+        util = util64 if util64 is not None else util4
+        band = _infer_wireless_band("", chan, None)
+        radios.append(
+            {
+                "index": rid,
+                "name": f"Radio {rid.split('.')[-1]}",
+                "radio_code": band,
+                "band": band,
+                "channel": chan,
+                "ext_channel": None,
+                "freq_mhz": None,
+                "channel_width_mhz": None,
+                "tx_power_dbm": txp if (txp is not None and 1 <= txp <= 50) else None,
+                "clients": 0,
+                "ssid_count": 0,
+                "ssids": [],
+                "is_up": True,
+                "cu_total_pct": util,
+                "cu_self_rx_pct": None,
+                "cu_self_tx_pct": None,
+                "cu_other_bss_pct": None,
+                "noise_floor_dbm": noise,
+                "ccq_pct": None,
+                "signal_dbm": None,
+                "rx_packets": None,
+                "tx_packets": None,
+                "mode": "Access Point",
+            }
+        )
+
+    stations: List[Dict[str, Any]] = []
+    clients_by_bssid: Dict[str, int] = {}
+    for cid in _table_indices(ai_client, ("1", "2", "3", "5", "7")):
+        mac = _normalize_mac(ai_client.get(f"1.{cid}")) or _decode_mac_from_oid_parts(cid.split(".")) or ""
+        bssid = _normalize_mac(ai_client.get(f"2.{cid}")) or ""
+        ip_addr = (ai_client.get(f"3.{cid}") or "").strip()
+        cname = (ai_client.get(f"5.{cid}") or "").strip()
+        snr = _opt_int(ai_client.get(f"7.{cid}"))
+        if bssid:
+            clients_by_bssid[bssid] = clients_by_bssid.get(bssid, 0) + 1
+        if mac:
+            stations.append(
+                {
+                    "mac": mac,
+                    "name": cname or mac,
+                    "ip": ip_addr,
+                    "ssid": bssid,
+                    "interface_name": "",
+                    "signal_dbm": None,
+                    "noise_dbm": None,
+                    "snr_db": snr,
+                    "tx_rate_bps": None,
+                    "rx_rate_bps": None,
+                    "rx_bytes": None,
+                    "tx_bytes": None,
+                    "uptime_sec": None,
+                }
+            )
+
+    vaps: List[Dict[str, Any]] = []
+    bssid_to_essid: Dict[str, str] = {}
+    for wid in _table_indices(ai_wlan, ("3", "4")):
+        essid = (ai_wlan.get(f"3.{wid}") or "").strip()
+        bssid = _normalize_mac(ai_wlan.get(f"4.{wid}")) or ""
+        if essid:
+            if bssid:
+                bssid_to_essid[bssid] = essid
+            vaps.append(
+                {
+                    "index": wid,
+                    "ssid": essid,
+                    "bssid": bssid,
+                    "interface_name": "",
+                    "if_index": None,
+                    "radio_code": "",
+                    "band": radios[0]["band"] if len(radios) == 1 else "Wireless",
+                    "channel": radios[0]["channel"] if len(radios) == 1 else None,
+                    "ext_channel": None,
+                    "freq_mhz": None,
+                    "tx_power_dbm": None,
+                    "clients": clients_by_bssid.get(bssid, 0),
+                    "up": True,
+                    "usage": "user",
+                    "ccq_pct": None,
+                    "rx_bytes": None,
+                    "tx_bytes": None,
+                    "rx_packets": None,
+                    "tx_packets": None,
+                    "rx_errors": None,
+                    "tx_errors": None,
+                    "rx_dropped": None,
+                    "tx_dropped": None,
+                    "rx_crypts": None,
+                    "rx_frags": None,
+                    "tx_retries": None,
+                    "rx_bps": None,
+                    "tx_bps": None,
+                }
+            )
+
+    for st in stations:
+        if st["ssid"] in bssid_to_essid:
+            st["ssid"] = bssid_to_essid[st["ssid"]]
+
+    if len(radios) == 1 and vaps:
+        radios[0]["ssids"] = list(dict.fromkeys(v["ssid"] for v in vaps if v.get("ssid")))
+        radios[0]["ssid_count"] = len(radios[0]["ssids"])
+        radios[0]["clients"] = max(len(stations), sum(int(v.get("clients") or 0) for v in vaps))
+
+    if not radios and not vaps and not stations:
+        return None
+
+    return {
+        "source_mibs": ["AI-AP-MIB"],
+        "mode": "Access Point",
+        "is_isolated": None,
+        "radios": radios,
+        "vaps": vaps,
+        "stations": stations[:128],
+    }
+
+
+def _parse_ieee80211_wireless(
+    dot11_ssid: Dict[str, str],
+    dot11_mac: Dict[str, str],
+    dot11_chan: Dict[str, str],
+    if_names: Optional[Dict[str, str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Parses standard IEEE802dot11-MIB (1.2.840.10036) tables indexed by ifIndex."""
+    indices = sorted(
+        set(dot11_ssid.keys()) | set(dot11_mac.keys()) | set(dot11_chan.keys()),
+        key=lambda x: int(x) if x.isdigit() else 999999,
+    )
+    if not indices:
+        return None
+
+    radios: List[Dict[str, Any]] = []
+    vaps: List[Dict[str, Any]] = []
+    for idx in indices:
+        ssid = (dot11_ssid.get(idx) or "").strip()
+        bssid = _normalize_mac(dot11_mac.get(idx)) or ""
+        chan_raw = _opt_int(dot11_chan.get(idx))
+        channel = chan_raw if (chan_raw is not None and chan_raw > 0) else None
+        if_name = (if_names or {}).get(idx, "") or f"wlan{idx}"
+        if not ssid and not bssid and channel is None:
+            continue
+        band = _infer_wireless_band("", channel, None)
+        if_idx_num = int(idx) if idx.isdigit() else None
+        radios.append(
+            {
+                "index": idx,
+                "name": if_name,
+                "radio_code": band,
+                "band": band,
+                "channel": channel,
+                "ext_channel": None,
+                "freq_mhz": None,
+                "channel_width_mhz": None,
+                "tx_power_dbm": None,
+                "clients": 0,
+                "ssid_count": 1 if ssid else 0,
+                "ssids": [ssid] if ssid else [],
+                "is_up": True,
+                "cu_total_pct": None,
+                "cu_self_rx_pct": None,
+                "cu_self_tx_pct": None,
+                "cu_other_bss_pct": None,
+                "noise_floor_dbm": None,
+                "ccq_pct": None,
+                "signal_dbm": None,
+                "rx_packets": None,
+                "tx_packets": None,
+                "mode": "IEEE 802.11",
+            }
+        )
+        vaps.append(
+            {
+                "index": idx,
+                "ssid": ssid or if_name,
+                "bssid": bssid,
+                "interface_name": if_name,
+                "if_index": if_idx_num,
+                "radio_code": band,
+                "band": band,
+                "channel": channel,
+                "ext_channel": None,
+                "freq_mhz": None,
+                "tx_power_dbm": None,
+                "clients": 0,
+                "up": True,
+                "usage": "user",
+                "ccq_pct": None,
+                "rx_bytes": None,
+                "tx_bytes": None,
+                "rx_packets": None,
+                "tx_packets": None,
+                "rx_errors": None,
+                "tx_errors": None,
+                "rx_dropped": None,
+                "tx_dropped": None,
+                "rx_crypts": None,
+                "rx_frags": None,
+                "tx_retries": None,
+                "rx_bps": None,
+                "tx_bps": None,
+            }
+        )
+
+    if not radios and not vaps:
+        return None
+
+    return {
+        "source_mibs": ["IEEE802dot11-MIB"],
+        "mode": "IEEE 802.11",
+        "is_isolated": None,
+        "radios": radios,
+        "vaps": vaps,
+        "stations": [],
+    }
+
+
+def _finalize_wireless_telemetry(
+    wireless_data: Optional[Dict[str, Any]],
+    if_meta_list: List[Dict[str, Any]],
+    wireless_if_list: List[Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Correlates wireless VAPs with IF-MIB rates, computes summary KPIs, and emits legacy wireless_radios."""
+    if wireless_data is None and not wireless_if_list:
+        return (None, [])
+
+    if wireless_data is None:
+        wireless_data = {
+            "source_mibs": ["IF-MIB"],
+            "mode": "Wireless Interface",
+            "is_isolated": None,
+            "radios": [],
+            "vaps": [],
+            "stations": [],
+        }
+
+    by_name: Dict[str, Dict[str, Any]] = {}
+    by_mac: Dict[str, Dict[str, Any]] = {}
+    by_idx: Dict[int, Dict[str, Any]] = {}
+    for ifm in if_meta_list:
+        idx = int(ifm["if_index"])
+        by_idx[idx] = ifm
+        nm = str(ifm.get("if_name") or "").strip().lower()
+        if nm and nm not in by_name:
+            by_name[nm] = ifm
+        ds = str(ifm.get("if_descr") or "").strip().lower()
+        if ds and ds not in by_name:
+            by_name[ds] = ifm
+        mac = str(ifm.get("mac_address") or "").strip().lower()
+        if mac and mac not in by_mac:
+            by_mac[mac] = ifm
+
+    radios = list(wireless_data.get("radios") or [])
+    vaps = list(wireless_data.get("vaps") or [])
+    stations = list(wireless_data.get("stations") or [])
+
+    matched_if_indices: Set[int] = set()
+    for vap in vaps:
+        ifm: Optional[Dict[str, Any]] = None
+        if vap.get("if_index") is not None:
+            ifm = by_idx.get(int(vap["if_index"]))
+        if ifm is None and vap.get("interface_name"):
+            ifm = by_name.get(str(vap["interface_name"]).strip().lower())
+        if ifm is None and vap.get("bssid"):
+            ifm = by_mac.get(str(vap["bssid"]).strip().lower())
+        if ifm is not None:
+            idx = int(ifm["if_index"])
+            matched_if_indices.add(idx)
+            vap["if_index"] = idx
+            vap["rx_bps"] = float(ifm.get("in_bps") or 0.0)
+            vap["tx_bps"] = float(ifm.get("out_bps") or 0.0)
+            real_if_name = str(ifm.get("if_name") or "").strip()
+            if real_if_name and (
+                not vap.get("interface_name")
+                or vap.get("interface_name") == f"wlan{vap.get('index')}"
+            ):
+                vap["interface_name"] = real_if_name
+            if vap.get("rx_bytes") is None:
+                vap["rx_bytes"] = int(ifm.get("in_octets") or 0)
+            if vap.get("tx_bytes") is None:
+                vap["tx_bytes"] = int(ifm.get("out_octets") or 0)
+            if vap.get("rx_errors") is None:
+                vap["rx_errors"] = int(ifm.get("in_errors") or 0)
+            if vap.get("tx_errors") is None:
+                vap["tx_errors"] = int(ifm.get("out_errors") or 0)
+
+    for rad in radios:
+        idx_str = str(rad.get("index") or "")
+        if idx_str.isdigit() and int(idx_str) in by_idx:
+            real_if = str(by_idx[int(idx_str)].get("if_name") or "").strip()
+            if real_if and (not rad.get("name") or rad.get("name") == f"wlan{idx_str}"):
+                rad["name"] = real_if
+    for st in stations:
+        ifn = str(st.get("interface_name") or "")
+        if ifn.startswith("if") and ifn[2:].isdigit():
+            st_idx = int(ifn[2:])
+            if st_idx in by_idx and by_idx[st_idx].get("if_name"):
+                st["interface_name"] = str(by_idx[st_idx]["if_name"])
+
+    # Deduplicated aggregate wireless traffic across unique wireless / matched interfaces
+    rate_if_indices: Set[int] = set(matched_if_indices) | {
+        int(w["if_index"]) for w in wireless_if_list
+    }
+    total_rx_bps = round(
+        sum(float(by_idx[i].get("in_bps") or 0.0) for i in rate_if_indices if i in by_idx),
+        2,
+    )
+    total_tx_bps = round(
+        sum(float(by_idx[i].get("out_bps") or 0.0) for i in rate_if_indices if i in by_idx),
+        2,
+    )
+
+    if vaps:
+        total_clients = sum(int(v.get("clients") or 0) for v in vaps)
+        if total_clients == 0 and stations:
+            total_clients = len(stations)
+    elif radios:
+        total_clients = sum(int(r.get("clients") or 0) for r in radios)
+        if total_clients == 0 and stations:
+            total_clients = len(stations)
+    else:
+        total_clients = len(stations)
+
+    active_radios = sum(1 for r in radios if r.get("is_up", True))
+    active_vaps = [v for v in vaps if v.get("up", True)]
+    unique_ssids = list(dict.fromkeys(v["ssid"] for v in active_vaps if v.get("ssid")))
+    bands = list(
+        dict.fromkeys(
+            b
+            for b in [r.get("band") for r in radios] + [v.get("band") for v in active_vaps]
+            if b and b != "Wireless"
+        )
+    )
+
+    clients_by_band: Dict[str, int] = {}
+    client_src = vaps if vaps else radios
+    for entry in client_src:
+        b = str(entry.get("band") or "Wireless")
+        c = int(entry.get("clients") or 0)
+        if b in clients_by_band or c > 0:
+            clients_by_band[b] = clients_by_band.get(b, 0) + c
+
+    def _avg_numeric(items: List[Dict[str, Any]], key: str) -> Optional[float]:
+        vals = [float(it[key]) for it in items if it.get(key) is not None]
+        return round(sum(vals) / len(vals), 1) if vals else None
+
+    cu_totals = [float(r["cu_total_pct"]) for r in radios if r.get("cu_total_pct") is not None]
+    avg_cu_total = round(sum(cu_totals) / len(cu_totals), 1) if cu_totals else None
+    max_cu_total = round(max(cu_totals), 1) if cu_totals else None
+    avg_cu_rx = _avg_numeric(radios, "cu_self_rx_pct")
+    avg_cu_tx = _avg_numeric(radios, "cu_self_tx_pct")
+    avg_cu_other = _avg_numeric(radios, "cu_other_bss_pct")
+    avg_noise = _avg_numeric(radios, "noise_floor_dbm")
+    avg_ccq = _avg_numeric(radios, "ccq_pct") or _avg_numeric(vaps, "ccq_pct")
+    avg_signal = _avg_numeric(radios, "signal_dbm") or _avg_numeric(stations, "signal_dbm")
+
+    source_mibs = list(dict.fromkeys(wireless_data.get("source_mibs") or []))
+    if wireless_if_list and "IF-MIB" not in source_mibs:
+        source_mibs.append("IF-MIB")
+
+    finalized: Dict[str, Any] = {
+        "source_mibs": source_mibs,
+        "mode": wireless_data.get("mode") or "Access Point",
+        "is_isolated": wireless_data.get("is_isolated"),
+        "summary": {
+            "total_clients": total_clients,
+            "active_radios": active_radios,
+            "total_radios": len(radios),
+            "active_ssids": len(active_vaps),
+            "total_vaps": len(vaps),
+            "unique_ssids": unique_ssids,
+            "bands": bands,
+            "clients_by_band": clients_by_band,
+            "avg_channel_util_pct": avg_cu_total,
+            "max_channel_util_pct": max_cu_total,
+            "avg_self_rx_pct": avg_cu_rx,
+            "avg_self_tx_pct": avg_cu_tx,
+            "avg_interference_pct": avg_cu_other,
+            "avg_noise_floor_dbm": avg_noise,
+            "avg_ccq_pct": avg_ccq,
+            "avg_signal_dbm": avg_signal,
+            "total_rx_bps": total_rx_bps,
+            "total_tx_bps": total_tx_bps,
+            "wireless_if_count": len(wireless_if_list),
+            "station_count": len(stations),
+        },
+        "radios": radios[:16],
+        "vaps": vaps[:32],
+        "stations": stations[:128],
+        "wireless_interfaces": wireless_if_list[:24],
+    }
+
+    # Build backward-compatible wireless_radios list for legacy consumers
+    legacy_radios: List[Dict[str, Any]] = []
+    for v in vaps[:24]:
+        legacy_radios.append(
+            {
+                "ssid": v["ssid"],
+                "radio": v.get("band") or v.get("radio_code") or "WLAN",
+                "channel": str(v["channel"]) if v.get("channel") is not None else "—",
+                "stations": int(v.get("clients") or 0),
+                "tx_power": (
+                    f"{v['tx_power_dbm']} dBm" if v.get("tx_power_dbm") is not None else "Auto"
+                ),
+            }
+        )
+    if not legacy_radios:
+        for r in radios[:24]:
+            legacy_radios.append(
+                {
+                    "ssid": ", ".join(r.get("ssids") or []) or r.get("name") or "Radio",
+                    "radio": r.get("band") or r.get("radio_code") or "WLAN",
+                    "channel": str(r["channel"]) if r.get("channel") is not None else "—",
+                    "stations": int(r.get("clients") or 0),
+                    "tx_power": (
+                        f"{r['tx_power_dbm']} dBm" if r.get("tx_power_dbm") is not None else "Auto"
+                    ),
+                }
+            )
+
+    return (finalized, legacy_radios)
+
+
 class SNMPPoller:
     """Asynchronous SNMPv2c/v3 GETBULK collector with Vendor MIB fingerprinting & enrichment."""
 
@@ -870,6 +2061,7 @@ class SNMPPoller:
         storage_volumes: List[Dict[str, Any]] = []
         lldp_neighbors: List[Dict[str, Any]] = []
         wireless_radios: List[Dict[str, Any]] = []
+        wireless_telemetry: Optional[Dict[str, Any]] = None
         vendor_scalars: Dict[str, Any] = {}
         ups_telemetry: Optional[Dict[str, Any]] = None
         printer_supplies: List[Dict[str, Any]] = []
@@ -1098,12 +2290,13 @@ class SNMPPoller:
         is_ups_hint = vendor_key in ("apc", "cyberpower", "eaton", "ups") or "ups" in f"{sys_descr} {sys_name}".lower()
 
         if vendor_key == "ubiquiti":
-            ubnt_sys, ubnt_vap, frog_mem = await asyncio.gather(
+            ubnt_sys, ubnt_radio, ubnt_vap, frog_mem = await asyncio.gather(
                 self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.6.3", timeout=3.0, sem=sem, stats=poll_stats),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.6.1.2.1", timeout=3.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.6.1.1.1", timeout=3.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.6.1.2.1", timeout=4.0, sem=sem, stats=poll_stats),
                 self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.10002.1.1.1.1", timeout=3.0, sem=sem, stats=poll_stats),
             )
-            if ubnt_sys or ubnt_vap:
+            if ubnt_sys or ubnt_radio or ubnt_vap:
                 _mark_mib("UBNT-UniFi-MIB")
             if ubnt_sys:
                 hardware_model = ubnt_sys.get("3.0") or hardware_model
@@ -1124,34 +2317,27 @@ class SNMPPoller:
                             "avail_bytes": free_k * 1024,
                             "usage_pct": mem_pct,
                         }
-            if ubnt_vap:
-                vap_ids = {
-                    k.split(".", 1)[1] for k in ubnt_vap.keys() if k.startswith("6.") and "." in k
-                }
-                for vid in sorted(vap_ids):
-                    essid = ubnt_vap.get(f"6.{vid}", "")
-                    chan = ubnt_vap.get(f"4.{vid}", "")
-                    radio = ubnt_vap.get(f"9.{vid}", "")
-                    sta = _to_int(ubnt_vap.get(f"8.{vid}"), 0)
-                    txp = ubnt_vap.get(f"21.{vid}", "")
-                    if essid:
-                        wireless_radios.append(
-                            {
-                                "ssid": essid,
-                                "radio": radio or "WLAN",
-                                "channel": chan,
-                                "stations": sta,
-                                "tx_power": f"{txp} dBm" if txp else "Auto",
-                            }
-                        )
+            wireless_telemetry = _parse_unifi_wireless(ubnt_radio, ubnt_vap, ubnt_sys)
+            if wireless_telemetry is None and not ubnt_radio and not ubnt_vap:
+                air_radio, air_wlstat, air_sta = await asyncio.gather(
+                    self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.4.1.1", timeout=3.0, sem=sem, stats=poll_stats),
+                    self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.4.5.1", timeout=3.0, sem=sem, stats=poll_stats),
+                    self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.4.7.1", timeout=4.0, sem=sem, stats=poll_stats),
+                )
+                if air_radio or air_wlstat or air_sta:
+                    _mark_mib("UBNT-AirMAX-MIB")
+                    wireless_telemetry = _parse_airmax_wireless(air_radio, air_wlstat, air_sta)
 
         elif vendor_key == "mikrotik":
-            mt_hl, mt_lic, mt_sys = await asyncio.gather(
+            mt_hl, mt_lic, mt_sys, mt_ap, mt_stat, mt_rtab = await asyncio.gather(
                 self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.3", timeout=3.0, sem=sem, stats=poll_stats),
                 self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.4", timeout=3.0, sem=sem, stats=poll_stats),
                 self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.7", timeout=3.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.1.3.1", timeout=3.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.1.1.1", timeout=3.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14988.1.1.1.2.1", timeout=4.0, sem=sem, stats=poll_stats),
             )
-            if mt_hl or mt_lic or mt_sys:
+            if mt_hl or mt_lic or mt_sys or mt_ap or mt_stat or mt_rtab:
                 _mark_mib("MIKROTIK-MIB")
             if mt_lic:
                 firmware_version = mt_lic.get("4.0") or firmware_version
@@ -1182,6 +2368,17 @@ class SNMPPoller:
                     sensors.append(
                         {"name": "Power Draw", "category": "Power", "value": f"{pwr / 10.0:.1f} W", "status": "ok"}
                     )
+            wireless_telemetry = _parse_mikrotik_wireless(mt_ap, mt_stat, mt_rtab)
+
+        elif vendor_key == "aruba":
+            ai_radio, ai_wlan, ai_client = await asyncio.gather(
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14823.2.3.3.1.2.2.1", timeout=3.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14823.2.3.3.1.2.3.1", timeout=3.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.14823.2.3.3.1.2.4.1", timeout=4.0, sem=sem, stats=poll_stats),
+            )
+            if ai_radio or ai_wlan or ai_client:
+                _mark_mib("AI-AP-MIB")
+                wireless_telemetry = _parse_aruba_wireless(ai_radio, ai_wlan, ai_client)
 
         elif vendor_key == "synology":
             syno_sys, syno_disk, syno_raid = await asyncio.gather(
@@ -1365,6 +2562,8 @@ class SNMPPoller:
             ext_payload["ups_telemetry"] = ups_telemetry
         if printer_supplies:
             ext_payload["printer_supplies"] = printer_supplies
+        if wireless_telemetry is not None:
+            ext_payload["wireless_telemetry"] = wireless_telemetry
 
         return {
             "active_mibs": active_mibs,
@@ -1475,6 +2674,7 @@ class SNMPPoller:
         (
             if_names,
             if_descrs,
+            if_types,
             if_aliases,
             if_speeds,
             if_speed32,
@@ -1492,6 +2692,7 @@ class SNMPPoller:
         ) = await asyncio.gather(
             self._snmp_walk_oid(target, port, auth_args, OID_IF_NAME, sem=dev_sem, stats=poll_stats),
             self._snmp_walk_oid(target, port, auth_args, OID_IF_DESCR, sem=dev_sem, stats=poll_stats),
+            self._snmp_walk_oid(target, port, auth_args, OID_IF_TYPE, sem=dev_sem, stats=poll_stats),
             self._snmp_walk_oid(target, port, auth_args, OID_IF_ALIAS, sem=dev_sem, stats=poll_stats),
             self._snmp_walk_oid(target, port, auth_args, OID_IF_HIGH_SPEED, sem=dev_sem, stats=poll_stats),
             self._snmp_walk_oid(target, port, auth_args, OID_IF_SPEED, sem=dev_sem, stats=poll_stats),
@@ -1595,6 +2796,60 @@ class SNMPPoller:
             {int(k) for k in set(if_names.keys()) | set(if_descrs.keys()) if k.isdigit()}
         )
 
+        # Fallback wireless MIB probe when vendor profile matched generic/Linux (e.g. UniFi AP reporting Net-SNMP PEN)
+        has_wireless_if = any(
+            _is_wireless_interface(
+                _to_int(if_types.get(str(idx)), 0),
+                if_names.get(str(idx)) or if_descrs.get(str(idx)) or "",
+                if_descrs.get(str(idx)) or "",
+            )
+            for idx in all_indices
+        )
+        if not enrichment["extended_metrics"].get("wireless_telemetry") and (
+            has_wireless_if or _has_wireless_ap_hint(sys_descr, sys_name)
+        ):
+            extra_wl: Optional[Dict[str, Any]] = None
+            if vendor_profile["key"] != "ubiquiti":
+                fb_sys, fb_radio, fb_vap = await asyncio.gather(
+                    self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.6.3", timeout=3.0, sem=dev_sem, stats=poll_stats),
+                    self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.6.1.1.1", timeout=3.0, sem=dev_sem, stats=poll_stats),
+                    self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.41112.1.6.1.2.1", timeout=4.0, sem=dev_sem, stats=poll_stats),
+                )
+                if fb_sys or fb_radio or fb_vap:
+                    if "UBNT-UniFi-MIB" not in responding_mibs:
+                        responding_mibs.append("UBNT-UniFi-MIB")
+                    if "UBNT-UniFi-MIB" not in active_mibs:
+                        active_mibs.append("UBNT-UniFi-MIB")
+                    if fb_sys:
+                        if not enrichment["hardware_model"] and fb_sys.get("3.0"):
+                            enrichment["hardware_model"] = fb_sys.get("3.0")
+                        if not enrichment["firmware_version"] and fb_sys.get("6.0"):
+                            enrichment["firmware_version"] = fb_sys.get("6.0")
+                        if hr_uptime_ticks <= 0 and sys_uptime == snmpd_uptime_ticks and fb_sys.get("5.0"):
+                            fb_up = _to_int(fb_sys.get("5.0"), 0) * 100
+                            if fb_up > 0:
+                                sys_uptime = fb_up
+                    extra_wl = _parse_unifi_wireless(fb_radio, fb_vap, fb_sys)
+
+            if extra_wl is None:
+                d_ssid, d_mac, d_chan = await asyncio.gather(
+                    self._snmp_walk_oid(target, port, auth_args, "1.2.840.10036.1.1.1.9", timeout=3.0, sem=dev_sem, stats=poll_stats),
+                    self._snmp_walk_oid(target, port, auth_args, "1.2.840.10036.2.1.1.1", timeout=3.0, sem=dev_sem, stats=poll_stats),
+                    self._snmp_walk_oid(target, port, auth_args, "1.2.840.10036.4.5.1.1", timeout=3.0, sem=dev_sem, stats=poll_stats),
+                )
+                if d_ssid or d_mac or d_chan:
+                    if "IEEE802dot11-MIB" not in responding_mibs:
+                        responding_mibs.append("IEEE802dot11-MIB")
+                    if "IEEE802dot11-MIB" not in active_mibs:
+                        active_mibs.append("IEEE802dot11-MIB")
+                    extra_wl = _parse_ieee80211_wireless(
+                        d_ssid, d_mac, d_chan, if_names or if_descrs
+                    )
+
+            if extra_wl is not None:
+                enrichment["extended_metrics"]["wireless_telemetry"] = extra_wl
+            enrichment["extended_metrics"]["responding_mibs"] = responding_mibs
+
         if_speed_map: Dict[int, int] = {}
         for idx in all_indices:
             k = str(idx)
@@ -1614,11 +2869,15 @@ class SNMPPoller:
 
         rows_to_insert: List[Tuple[Any, ...]] = []
         loopback_indices: Set[int] = set()
+        if_meta_list: List[Dict[str, Any]] = []
+        wireless_if_list: List[Dict[str, Any]] = []
         for idx in all_indices:
             k = str(idx)
             name = if_names.get(k) or if_descrs.get(k) or f"if{idx}"
             descr = if_descrs.get(k) or name
-            if _is_loopback_interface(name, descr):
+            if_type_val = _to_int(if_types.get(k), 0)
+            is_lb = _is_loopback_interface(name, descr)
+            if is_lb:
                 loopback_indices.add(idx)
             alias = if_aliases.get(k, "")
             speed_bps = if_speed_map.get(idx, 0)
@@ -1769,6 +3028,37 @@ class SNMPPoller:
                     sys_uptime,
                 )
             )
+            if not is_lb:
+                if_mac = _normalize_mac(if_phys.get(k)) or ""
+                if_meta_row = {
+                    "if_index": idx,
+                    "if_name": name,
+                    "if_descr": descr,
+                    "if_alias": alias,
+                    "if_type": if_type_val,
+                    "mac_address": if_mac,
+                    "speed_bps": speed_bps,
+                    "oper_status": oper_status,
+                    "in_octets": db_in_oct,
+                    "out_octets": db_out_oct,
+                    "in_bps": in_bps,
+                    "out_bps": out_bps,
+                    "in_errors": in_err,
+                    "out_errors": out_err,
+                }
+                if_meta_list.append(if_meta_row)
+                if _is_wireless_interface(if_type_val, name, descr):
+                    wireless_if_list.append(if_meta_row)
+
+        wireless_t, legacy_wireless = _finalize_wireless_telemetry(
+            enrichment["extended_metrics"].get("wireless_telemetry"),
+            if_meta_list,
+            wireless_if_list,
+        )
+        if wireless_t is not None:
+            enrichment["extended_metrics"]["wireless_telemetry"] = wireless_t
+        if legacy_wireless:
+            enrichment["extended_metrics"]["wireless_radios"] = legacy_wireless
 
         self._live_ignore_indices[target] = loopback_indices
         poll_ms = round((time.perf_counter() - start_ts) * 1000.0, 2)
@@ -1908,6 +3198,34 @@ class SNMPPoller:
                     )
                 except Exception as exc:
                     logger.debug("ups_metrics_raw insert skipped: %s", exc)
+
+            if isinstance(wireless_t, dict):
+                w_sum = wireless_t.get("summary") or {}
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO wireless_metrics_raw (
+                            time, device_ip, total_clients, avg_channel_util_pct,
+                            max_channel_util_pct, avg_self_rx_pct, avg_self_tx_pct,
+                            avg_interference_pct, avg_noise_floor_dbm, avg_ccq_pct,
+                            avg_signal_dbm, rx_bps, tx_bps
+                        ) VALUES (NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                        """,
+                        target,
+                        w_sum.get("total_clients"),
+                        w_sum.get("avg_channel_util_pct"),
+                        w_sum.get("max_channel_util_pct"),
+                        w_sum.get("avg_self_rx_pct"),
+                        w_sum.get("avg_self_tx_pct"),
+                        w_sum.get("avg_interference_pct"),
+                        w_sum.get("avg_noise_floor_dbm"),
+                        w_sum.get("avg_ccq_pct"),
+                        w_sum.get("avg_signal_dbm"),
+                        w_sum.get("total_rx_bps"),
+                        w_sum.get("total_tx_bps"),
+                    )
+                except Exception as exc:
+                    logger.debug("wireless_metrics_raw insert skipped: %s", exc)
 
         return {
             "device_ip": target,

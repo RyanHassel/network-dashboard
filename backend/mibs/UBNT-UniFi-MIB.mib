@@ -57,6 +57,95 @@ unifiApSystemVersion OBJECT-TYPE
     DESCRIPTION "UniFi Firmware Version"
     ::= { unifiApSystem 6 }
 
+unifiRadioTable OBJECT-TYPE
+    SYNTAX      SEQUENCE OF UnifiRadioEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    DESCRIPTION "UniFi Physical Wireless Radio Table"
+    ::= { unifiApWireless 1 }
+
+unifiRadioEntry OBJECT-TYPE
+    SYNTAX      UnifiRadioEntry
+    MAX-ACCESS  not-accessible
+    STATUS      current
+    INDEX       { unifiRadioIndex }
+    ::= { unifiRadioTable 1 }
+
+UnifiRadioEntry ::= SEQUENCE {
+    unifiRadioIndex     Integer32,
+    unifiRadioName      DisplayString,
+    unifiRadioRadio     DisplayString,
+    unifiRadioRxPackets Unsigned32,
+    unifiRadioTxPackets Unsigned32,
+    unifiRadioCuTotal   Integer32,
+    unifiRadioCuSelfRx  Integer32,
+    unifiRadioCuSelfTx  Integer32,
+    unifiRadioOtherBss  Integer32
+}
+
+unifiRadioIndex OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Unique index identifying the radio interface"
+    ::= { unifiRadioEntry 1 }
+
+unifiRadioName OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Radio interface name"
+    ::= { unifiRadioEntry 2 }
+
+unifiRadioRadio OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Radio band identifier (ng, na, 6e)"
+    ::= { unifiRadioEntry 3 }
+
+unifiRadioRxPackets OBJECT-TYPE
+    SYNTAX      Unsigned32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Total packets received on this radio"
+    ::= { unifiRadioEntry 4 }
+
+unifiRadioTxPackets OBJECT-TYPE
+    SYNTAX      Unsigned32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Total packets transmitted on this radio"
+    ::= { unifiRadioEntry 5 }
+
+unifiRadioCuTotal OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Total channel utilization percentage"
+    ::= { unifiRadioEntry 6 }
+
+unifiRadioCuSelfRx OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Self receive channel utilization percentage"
+    ::= { unifiRadioEntry 7 }
+
+unifiRadioCuSelfTx OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Self transmit channel utilization percentage"
+    ::= { unifiRadioEntry 8 }
+
+unifiRadioOtherBss OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Other BSS interference utilization percentage"
+    ::= { unifiRadioEntry 9 }
+
 unifiVapTable OBJECT-TYPE
     SYNTAX      SEQUENCE OF UnifiVapEntry
     MAX-ACCESS  not-accessible
@@ -73,14 +162,50 @@ unifiVapEntry OBJECT-TYPE
 
 UnifiVapEntry ::= SEQUENCE {
     unifiVapIndex       Integer32,
-    unifiVapBss         MacAddress,
+    unifiVapBssId       MacAddress,
+    unifiVapCcq         Integer32,
     unifiVapChannel     Integer32,
+    unifiVapExtChannel  Integer32,
     unifiVapEssId       DisplayString,
     unifiVapName        DisplayString,
     unifiVapNumStations Integer32,
     unifiVapRadio       DisplayString,
-    unifiVapTxPower     Integer32
+    unifiVapRxBytes     Counter64,
+    unifiVapRxCrypts    Unsigned32,
+    unifiVapRxDropped   Unsigned32,
+    unifiVapRxErrors    Unsigned32,
+    unifiVapRxFrags     Unsigned32,
+    unifiVapRxPackets   Counter64,
+    unifiVapTxBytes     Counter64,
+    unifiVapTxDropped   Unsigned32,
+    unifiVapTxErrors    Unsigned32,
+    unifiVapTxPackets   Counter64,
+    unifiVapTxRetries   Unsigned32,
+    unifiVapTxPower     Integer32,
+    unifiVapUp          Integer32,
+    unifiVapUsage       DisplayString
 }
+
+unifiVapIndex OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Virtual AP Index"
+    ::= { unifiVapEntry 1 }
+
+unifiVapBssId OBJECT-TYPE
+    SYNTAX      MacAddress
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Virtual AP BSSID MAC Address"
+    ::= { unifiVapEntry 2 }
+
+unifiVapCcq OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Client Connection Quality"
+    ::= { unifiVapEntry 3 }
 
 unifiVapChannel OBJECT-TYPE
     SYNTAX      Integer32
@@ -88,6 +213,13 @@ unifiVapChannel OBJECT-TYPE
     STATUS      current
     DESCRIPTION "Wireless Channel"
     ::= { unifiVapEntry 4 }
+
+unifiVapExtChannel OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "Extended / Secondary Wireless Channel"
+    ::= { unifiVapEntry 5 }
 
 unifiVapEssId OBJECT-TYPE
     SYNTAX      DisplayString
@@ -117,11 +249,102 @@ unifiVapRadio OBJECT-TYPE
     DESCRIPTION "Wireless Band / Radio"
     ::= { unifiVapEntry 9 }
 
+unifiVapRxBytes OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "VAP Received Bytes"
+    ::= { unifiVapEntry 10 }
+
+unifiVapRxCrypts OBJECT-TYPE
+    SYNTAX      Unsigned32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "VAP Receive Decryption Errors"
+    ::= { unifiVapEntry 11 }
+
+unifiVapRxDropped OBJECT-TYPE
+    SYNTAX      Unsigned32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "VAP Receive Dropped Packets"
+    ::= { unifiVapEntry 12 }
+
+unifiVapRxErrors OBJECT-TYPE
+    SYNTAX      Unsigned32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "VAP Receive Errors"
+    ::= { unifiVapEntry 13 }
+
+unifiVapRxFrags OBJECT-TYPE
+    SYNTAX      Unsigned32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "VAP Receive Fragments"
+    ::= { unifiVapEntry 14 }
+
+unifiVapRxPackets OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "VAP Received Packets"
+    ::= { unifiVapEntry 15 }
+
+unifiVapTxBytes OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "VAP Transmitted Bytes"
+    ::= { unifiVapEntry 16 }
+
+unifiVapTxDropped OBJECT-TYPE
+    SYNTAX      Unsigned32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "VAP Transmit Dropped Packets"
+    ::= { unifiVapEntry 17 }
+
+unifiVapTxErrors OBJECT-TYPE
+    SYNTAX      Unsigned32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "VAP Transmit Errors"
+    ::= { unifiVapEntry 18 }
+
+unifiVapTxPackets OBJECT-TYPE
+    SYNTAX      Counter64
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "VAP Transmitted Packets"
+    ::= { unifiVapEntry 19 }
+
+unifiVapTxRetries OBJECT-TYPE
+    SYNTAX      Unsigned32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "VAP Transmit Retries"
+    ::= { unifiVapEntry 20 }
+
 unifiVapTxPower OBJECT-TYPE
     SYNTAX      Integer32
     MAX-ACCESS  read-only
     STATUS      current
     DESCRIPTION "Transmit Power (dBm)"
     ::= { unifiVapEntry 21 }
+
+unifiVapUp OBJECT-TYPE
+    SYNTAX      Integer32
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "VAP Operational Status (1=true, 2=false)"
+    ::= { unifiVapEntry 22 }
+
+unifiVapUsage OBJECT-TYPE
+    SYNTAX      DisplayString
+    MAX-ACCESS  read-only
+    STATUS      current
+    DESCRIPTION "VAP Usage Type (user, guest, vwire)"
+    ::= { unifiVapEntry 23 }
 
 END
