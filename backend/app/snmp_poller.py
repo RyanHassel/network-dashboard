@@ -187,6 +187,8 @@ def _parse_cisco_ucs_telemetry(
     ucs_luns: Dict[str, str],
     ucs_fans: Dict[str, str],
     ucs_psus: Dict[str, str],
+    ucs_mem: Optional[Dict[str, str]] = None,
+    ucs_psu_in: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Parses CISCO-UNIFIED-COMPUTING-MIB (1.3.6.1.4.1.9.9.719.1.*) tables for Cisco UCS servers."""
     hardware_model = ""
@@ -200,7 +202,7 @@ def _parse_cisco_ucs_telemetry(
     vendor_scalars: Dict[str, Any] = {}
     has_data = False
 
-    def _group_by_inst(tbl: Dict[str, str]) -> Dict[str, Dict[str, str]]:
+    def _group_by_inst(tbl: Optional[Dict[str, str]]) -> Dict[str, Dict[str, str]]:
         grouped: Dict[str, Dict[str, str]] = {}
         for k, v in (tbl or {}).items():
             if "." not in k:
@@ -228,9 +230,17 @@ def _parse_cisco_ucs_telemetry(
                 hardware_model = row["32"]
             if not serial_number and row.get("47"):
                 serial_number = row["47"]
-            num_cpus = _to_int(row.get("35"), 0)
-            num_cores = _to_int(row.get("34"), 0)
-            num_threads = _to_int(row.get("38"), 0)
+            part_number = (row.get("58") or "").strip()
+            if part_number and "Part Number" not in vendor_scalars:
+                vendor_scalars["Part Number"] = part_number
+            num_cpus = _to_int(row.get("37"), 0)
+            if num_cpus > 0:
+                num_cores = _to_int(row.get("35") or row.get("34"), 0)
+            else:
+                num_cores = _to_int(row.get("34") or row.get("35"), 0)
+                if row.get("34") and row.get("35") and row.get("34") != row.get("35"):
+                    num_cpus = _to_int(row.get("35"), 0)
+            num_threads = _to_int(row.get("39") or row.get("38"), 0)
             if num_cores > 0:
                 cpu_details["core_count"] = num_cores
                 vendor_scalars["CPU Cores"] = num_cores
@@ -240,8 +250,8 @@ def _parse_cisco_ucs_telemetry(
             if num_threads > 0:
                 cpu_details["thread_count"] = num_threads
                 vendor_scalars["CPU Threads"] = num_threads
-            total_mem_mb = _to_int(row.get("51"), 0)
-            avail_mem_mb = _to_int(row.get("7"), 0)
+            total_mem_mb = _to_int(row.get("49") or row.get("51"), 0)
+            avail_mem_mb = _to_int(row.get("9") or row.get("7"), 0)
             if total_mem_mb > 0:
                 total_bytes = total_mem_mb * 1024 * 1024
                 avail_bytes = (
@@ -264,6 +274,42 @@ def _parse_cisco_ucs_telemetry(
                 }
             if hardware_model or serial_number or total_mem_mb > 0:
                 break
+
+    # 1b. DIMM Inventory (cucsMemoryUnitTable)
+    if ucs_mem:
+        has_data = True
+        mem_rows = _group_by_inst(ucs_mem)
+        dimm_count = 0
+        dimm_total_mb = 0
+        dimm_clock = 0
+        for inst in _sorted_insts(mem_rows):
+            row = mem_rows[inst]
+            presence = (row.get("15") or "").strip().lower()
+            if presence in ("11", "missing", "unequipped"):
+                continue
+            cap_mb = _to_int(row.get("6"), 0)
+            if cap_mb <= 0:
+                continue
+            dimm_count += 1
+            dimm_total_mb += cap_mb
+            if dimm_clock <= 0:
+                spd = _to_int(row.get("7"), 0)
+                if spd > 0:
+                    dimm_clock = spd
+        if dimm_count > 0:
+            gb_val = round(dimm_total_mb / 1024.0, 1)
+            gb_txt = f"{int(gb_val)}" if gb_val == int(gb_val) else f"{gb_val}"
+            clock_txt = f" @ {dimm_clock} MHz" if dimm_clock > 0 else ""
+            vendor_scalars["Installed DIMMs"] = f"{dimm_count} DIMMs ({gb_txt} GB{clock_txt})"
+            if not memory_details and dimm_total_mb > 0:
+                total_bytes = dimm_total_mb * 1024 * 1024
+                mem_pct = 0.0
+                memory_details = {
+                    "total_bytes": total_bytes,
+                    "used_bytes": 0,
+                    "avail_bytes": total_bytes,
+                    "usage_pct": 0.0,
+                }
 
     # 2. Processor Inventory (cucsProcessorUnitTable)
     if ucs_proc:
@@ -458,13 +504,13 @@ def _parse_cisco_ucs_telemetry(
                     }
                 )
 
-    # 8. Power Supply Units (cucsEquipmentPsuStatsTable)
+    # 8. Power Supply Units (cucsEquipmentPsuStatsTable & cucsEquipmentPsuInputStatsTable)
     if ucs_psus:
         has_data = True
         psu_rows = _group_by_inst(ucs_psus)
         for idx, inst in enumerate(_sorted_insts(psu_rows)):
             row = psu_rows[inst]
-            psu_out = _to_float(row.get("16"), -1.0)
+            psu_out = _to_float(row.get("16") or row.get("14"), -1.0)
             psu_temp = _valid_temp(row.get("4"))
             if 0.0 < psu_out < 10000.0:
                 sensors.append(
@@ -484,6 +530,32 @@ def _parse_cisco_ucs_telemetry(
                         "category": "Temperature",
                         "value": f"{psu_temp:.1f} °C",
                         "status": "warning" if psu_temp >= 75.0 else "ok",
+                    }
+                )
+
+    if ucs_psu_in:
+        has_data = True
+        pin_rows = _group_by_inst(ucs_psu_in)
+        for idx, inst in enumerate(_sorted_insts(pin_rows)):
+            row = pin_rows[inst]
+            psu_in_w = _to_float(row.get("10"), -1.0)
+            psu_in_v = _to_float(row.get("14"), -1.0)
+            if 0.0 < psu_in_w < 10000.0:
+                sensors.append(
+                    {
+                        "name": f"PSU {idx + 1} Input Power",
+                        "category": "Power",
+                        "value": f"{psu_in_w:.0f} W",
+                        "status": "ok",
+                    }
+                )
+            if 50.0 <= psu_in_v <= 500.0:
+                sensors.append(
+                    {
+                        "name": f"PSU {idx + 1} Input Voltage",
+                        "category": "Power",
+                        "value": f"{psu_in_v:.1f} V",
+                        "status": "ok",
                     }
                 )
 
@@ -2452,6 +2524,8 @@ class SNMPPoller:
         firmware_version = ""
         software_version = ""
         manufacturer = ""
+        detected_vendor_name = ""
+        detected_device_category = ""
         sensors: List[Dict[str, Any]] = []
         storage_volumes: List[Dict[str, Any]] = []
         lldp_neighbors: List[Dict[str, Any]] = []
@@ -2856,30 +2930,12 @@ class SNMPPoller:
                 c_emem,
                 c_env,
                 c_sb,
-                ucs_rack,
-                ucs_proc,
-                ucs_proc_env,
-                ucs_mb_temp,
-                ucs_mb_power,
-                ucs_disks,
-                ucs_luns,
-                ucs_fans,
-                ucs_psus,
             ) = await asyncio.gather(
                 self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.109.1.1.1.1", timeout=5.0, sem=sem, stats=poll_stats),
                 self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.48.1.1.1", timeout=5.0, sem=sem, stats=poll_stats),
                 self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.221.1.1.1.1", timeout=5.0, sem=sem, stats=poll_stats),
                 self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.13.1.3.1", timeout=5.0, sem=sem, stats=poll_stats),
                 self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.6.1.101.1", timeout=5.0, sem=sem, stats=poll_stats),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.9.35.1", timeout=3.5, sem=sem, stats=poll_stats),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.41.9.1", timeout=3.5, sem=sem, stats=poll_stats),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.41.2.1", timeout=3.5, sem=sem, stats=poll_stats),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.9.44.1", timeout=3.5, sem=sem, stats=poll_stats),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.9.25.1", timeout=3.5, sem=sem, stats=poll_stats),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.45.4.1", timeout=3.5, sem=sem, stats=poll_stats),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.45.5.1", timeout=3.5, sem=sem, stats=poll_stats),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.15.14.1", timeout=3.5, sem=sem, stats=poll_stats),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.15.58.1", timeout=3.5, sem=sem, stats=poll_stats),
             )
             if c_cpu:
                 _mark_mib("CISCO-PROCESS-MIB")
@@ -3009,36 +3065,6 @@ class SNMPPoller:
                         sensors.append(
                             {"name": s_name, "category": "Temperature", "value": f"{s_val:.0f} °C", "status": "ok"}
                         )
-            ucs_parsed = _parse_cisco_ucs_telemetry(
-                ucs_rack=ucs_rack,
-                ucs_proc=ucs_proc,
-                ucs_proc_env=ucs_proc_env,
-                ucs_mb_temp=ucs_mb_temp,
-                ucs_mb_power=ucs_mb_power,
-                ucs_disks=ucs_disks,
-                ucs_luns=ucs_luns,
-                ucs_fans=ucs_fans,
-                ucs_psus=ucs_psus,
-            )
-            if ucs_parsed["has_data"]:
-                _mark_mib("CISCO-UNIFIED-COMPUTING-MIB")
-                if not hardware_model and ucs_parsed["hardware_model"]:
-                    hardware_model = ucs_parsed["hardware_model"]
-                if not serial_number and ucs_parsed["serial_number"]:
-                    serial_number = ucs_parsed["serial_number"]
-                if ucs_parsed["cpu_details"]:
-                    for ck, cv in ucs_parsed["cpu_details"].items():
-                        cpu_details.setdefault(ck, cv)
-                if mem_pct is None and ucs_parsed["mem_pct"] is not None:
-                    mem_pct = ucs_parsed["mem_pct"]
-                if not memory_details and ucs_parsed["memory_details"]:
-                    memory_details = ucs_parsed["memory_details"]
-                if not storage_volumes and ucs_parsed["storage_volumes"]:
-                    storage_volumes.extend(ucs_parsed["storage_volumes"])
-                if temp_celsius is None and ucs_parsed["temp_celsius"] is not None:
-                    temp_celsius = ucs_parsed["temp_celsius"]
-                sensors.extend(ucs_parsed["sensors"])
-                vendor_scalars.update(ucs_parsed["vendor_scalars"])
 
         elif vendor_key == "fortinet":
             fg_sys = await self._snmp_walk_oid(
@@ -3127,6 +3153,78 @@ class SNMPPoller:
                 serial_number = prt_mib.get("5.1.1.17.1") or serial_number
                 printer_supplies = _parse_printer_supplies(prt_mib)
 
+        # Probe Cisco UCS / CIMC MIBs even if device initially matched Linux Net-SNMP or generic PEN
+        if vendor_key in ("cisco", "cisco_ucs", "linux", "generic"):
+            ucs_rack = await self._snmp_walk_oid(
+                target,
+                port,
+                auth_args,
+                "1.3.6.1.4.1.9.9.719.1.9.35.1",
+                timeout=6.0,
+                snmp_timeout=3,
+                retries=2,
+                sem=sem,
+                stats=poll_stats,
+            )
+            if ucs_rack or vendor_key == "cisco_ucs":
+                (
+                    ucs_proc,
+                    ucs_proc_env,
+                    ucs_mem,
+                    ucs_mb_temp,
+                    ucs_mb_power,
+                    ucs_disks,
+                    ucs_luns,
+                    ucs_fans,
+                    ucs_psus,
+                    ucs_psu_in,
+                ) = await asyncio.gather(
+                    self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.41.9.1", timeout=8.0, snmp_timeout=4, retries=2, sem=sem, stats=poll_stats),
+                    self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.41.2.1", timeout=8.0, snmp_timeout=4, retries=2, sem=sem, stats=poll_stats),
+                    self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.30.11.1", timeout=8.0, snmp_timeout=4, retries=2, sem=sem, stats=poll_stats),
+                    self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.9.44.1", timeout=8.0, snmp_timeout=4, retries=2, sem=sem, stats=poll_stats),
+                    self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.9.14.1", timeout=8.0, snmp_timeout=4, retries=2, sem=sem, stats=poll_stats),
+                    self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.45.4.1", timeout=8.0, snmp_timeout=4, retries=2, sem=sem, stats=poll_stats),
+                    self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.45.5.1", timeout=8.0, snmp_timeout=4, retries=2, sem=sem, stats=poll_stats),
+                    self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.15.16.1", timeout=8.0, snmp_timeout=4, retries=2, sem=sem, stats=poll_stats),
+                    self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.15.60.1", timeout=8.0, snmp_timeout=4, retries=2, sem=sem, stats=poll_stats),
+                    self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.15.58.1", timeout=8.0, snmp_timeout=4, retries=2, sem=sem, stats=poll_stats),
+                )
+                ucs_parsed = _parse_cisco_ucs_telemetry(
+                    ucs_rack=ucs_rack,
+                    ucs_proc=ucs_proc,
+                    ucs_proc_env=ucs_proc_env,
+                    ucs_mb_temp=ucs_mb_temp,
+                    ucs_mb_power=ucs_mb_power,
+                    ucs_disks=ucs_disks,
+                    ucs_luns=ucs_luns,
+                    ucs_fans=ucs_fans,
+                    ucs_psus=ucs_psus,
+                    ucs_mem=ucs_mem,
+                    ucs_psu_in=ucs_psu_in,
+                )
+                if ucs_parsed["has_data"]:
+                    _mark_mib("CISCO-UNIFIED-COMPUTING-MIB")
+                    detected_vendor_name = "Cisco Systems"
+                    detected_device_category = "Cisco UCS Rack / Blade Server"
+                    if ucs_parsed["hardware_model"]:
+                        hardware_model = hardware_model or ucs_parsed["hardware_model"]
+                    if ucs_parsed["serial_number"]:
+                        serial_number = serial_number or ucs_parsed["serial_number"]
+                    if ucs_parsed["cpu_details"]:
+                        for ck, cv in ucs_parsed["cpu_details"].items():
+                            cpu_details.setdefault(ck, cv)
+                    if mem_pct is None and ucs_parsed["mem_pct"] is not None:
+                        mem_pct = ucs_parsed["mem_pct"]
+                    if not memory_details and ucs_parsed["memory_details"]:
+                        memory_details = ucs_parsed["memory_details"]
+                    if not storage_volumes and ucs_parsed["storage_volumes"]:
+                        storage_volumes.extend(ucs_parsed["storage_volumes"])
+                    if temp_celsius is None and ucs_parsed["temp_celsius"] is not None:
+                        temp_celsius = ucs_parsed["temp_celsius"]
+                    sensors.extend(ucs_parsed["sensors"])
+                    vendor_scalars.update(ucs_parsed["vendor_scalars"])
+
         # Apply sysDescr fallback extraction (UDM-Pro, switches, APs, APC NMC, Linux kernels, etc.)
         descr_meta = _parse_sys_descr_metadata(sys_descr, vendor_key)
         if not hardware_model and descr_meta["hardware_model"]:
@@ -3161,6 +3259,8 @@ class SNMPPoller:
             "serial_number": serial_number,
             "firmware_version": firmware_version or software_version,
             "manufacturer": manufacturer,
+            "detected_vendor_name": detected_vendor_name,
+            "detected_device_category": detected_device_category,
             "temp_celsius": temp_celsius,
             "cpu_pct": cpu_pct,
             "mem_pct": mem_pct,
@@ -3308,6 +3408,10 @@ class SNMPPoller:
                 poll_stats=poll_stats,
             ),
         )
+
+        if enrichment.get("detected_vendor_name"):
+            vendor_name = enrichment["detected_vendor_name"]
+            device_category = enrichment.get("detected_device_category") or device_category
 
         # Fallback to 32-bit IF-MIB counters when 64-bit HC counters are unavailable
         used_counter_bits = 64
