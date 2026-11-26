@@ -2635,11 +2635,11 @@ async def _query_overview_traffic_series(
         rk = "1d"
 
     range_specs = {
-        "1h": ("1 hour", "1 minute", 60),
-        "12h": ("12 hours", "5 minutes", 300),
-        "1d": ("24 hours", "10 minutes", 600),
-        "7d": ("7 days", "1 hour", 3600),
-        "1m": ("30 days", "4 hours", 14400),
+        "1h": ("1 hour", "30 seconds", 30),
+        "12h": ("12 hours", "2 minutes", 120),
+        "1d": ("24 hours", "5 minutes", 300),
+        "7d": ("7 days", "30 minutes", 1800),
+        "1m": ("30 days", "2 hours", 7200),
     }
     sql_interval, sql_bucket, bucket_sec = range_specs[rk]
 

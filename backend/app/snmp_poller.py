@@ -540,6 +540,30 @@ def _parse_sys_descr_metadata(sys_descr: str, vendor_key: str) -> Dict[str, str]
         m_cs = re.search(r"\bVersion\s+([0-9A-Za-z()._-]+)", descr, re.I)
         if m_cs:
             out["firmware_version"] = m_cs.group(1).rstrip(",")
+        m_cmod = re.search(
+            r"\b("
+            r"WS-C\d+[A-Za-z0-9-]*"
+            r"|C(?:1\d{3}|2\d{3}|3\d{3}|4\d{3}|6\d{3}|8\d{3}|9\d{3})[A-Za-z0-9-]*"
+            r"|ISR\d+[A-Za-z0-9/-]*"
+            r"|ASR\d+[A-Za-z0-9/-]*"
+            r"|ASA\d+[A-Za-z0-9-]*"
+            r"|FPR-?\d+[A-Za-z0-9-]*"
+            r"|N\dK-[A-Za-z0-9-]+"
+            r"|SG\d{3}[A-Za-z0-9-]*"
+            r"|CBS\d{3}[A-Za-z0-9-]*"
+            r"|SX\d{3}[A-Za-z0-9-]*"
+            r"|SF\d{3}[A-Za-z0-9-]*"
+            r"|RV\d{3}[A-Za-z0-9-]*"
+            r"|UCSC?-[A-Za-z0-9-]+"
+            r"|UCS-[A-Za-z0-9-]+"
+            r"|Nexus\s*\d+[A-Za-z0-9-]*"
+            r"|Catalyst\s+\d+[A-Za-z0-9-]*"
+            r")\b",
+            descr,
+            re.I,
+        )
+        if m_cmod:
+            out["hardware_model"] = m_cmod.group(1)
 
     elif vendor_key in ("apc", "cyberpower", "eaton", "ups") or any(
         kw in descr.lower() for kw in ("apc ", "smart-ups", "back-ups", "ap96")
@@ -2829,7 +2853,9 @@ class SNMPPoller:
             (
                 c_cpu,
                 c_mem,
+                c_emem,
                 c_env,
+                c_sb,
                 ucs_rack,
                 ucs_proc,
                 ucs_proc_env,
@@ -2840,9 +2866,11 @@ class SNMPPoller:
                 ucs_fans,
                 ucs_psus,
             ) = await asyncio.gather(
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.109.1.1.1.1", timeout=3.5, sem=sem, stats=poll_stats),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.48.1.1.1", timeout=3.5, sem=sem, stats=poll_stats),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.13.1.3.1", timeout=3.5, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.109.1.1.1.1", timeout=5.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.48.1.1.1", timeout=5.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.221.1.1.1.1", timeout=5.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.13.1.3.1", timeout=5.0, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.6.1.101.1", timeout=5.0, sem=sem, stats=poll_stats),
                 self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.9.35.1", timeout=3.5, sem=sem, stats=poll_stats),
                 self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.41.9.1", timeout=3.5, sem=sem, stats=poll_stats),
                 self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.41.2.1", timeout=3.5, sem=sem, stats=poll_stats),
@@ -2856,7 +2884,7 @@ class SNMPPoller:
             if c_cpu:
                 _mark_mib("CISCO-PROCESS-MIB")
                 c_cpu_by_idx: Dict[str, float] = {}
-                for col_pfx in ("10.", "7.", "8.", "4."):
+                for col_pfx in ("6.", "7.", "8.", "3.", "4.", "5."):
                     for k, v in sorted(c_cpu.items()):
                         if not k.startswith(col_pfx) or "." not in k:
                             continue
@@ -2864,8 +2892,8 @@ class SNMPPoller:
                         if c_idx in c_cpu_by_idx:
                             continue
                         val = _to_float(v, -1.0)
-                        if val >= 0.0:
-                            c_cpu_by_idx[c_idx] = round(min(100.0, val), 1)
+                        if 0.0 <= val <= 100.0:
+                            c_cpu_by_idx[c_idx] = round(val, 1)
                     if c_cpu_by_idx:
                         break
                 if c_cpu_by_idx:
@@ -2881,6 +2909,47 @@ class SNMPPoller:
                             for idx, (_, val) in enumerate(ordered_cpus)
                         ]
                         cpu_details.setdefault("core_count", len(ordered_cpus))
+                if mem_pct is None:
+                    cpm_ids = {
+                        k.split(".", 1)[1]
+                        for k in c_cpu.keys()
+                        if k.startswith("12.") and "." in k
+                    }
+                    cpm_used_kb = 0
+                    cpm_free_kb = 0
+                    for cid in cpm_ids:
+                        cpm_used_kb += max(0, _to_int(c_cpu.get(f"12.{cid}"), 0))
+                        cpm_free_kb += max(0, _to_int(c_cpu.get(f"13.{cid}"), 0))
+                    cpm_tot_kb = cpm_used_kb + cpm_free_kb
+                    if cpm_tot_kb > 0:
+                        mem_pct = round((cpm_used_kb / cpm_tot_kb) * 100.0, 1)
+                        memory_details = {
+                            "total_bytes": cpm_tot_kb * 1024,
+                            "used_bytes": cpm_used_kb * 1024,
+                            "avail_bytes": cpm_free_kb * 1024,
+                            "usage_pct": mem_pct,
+                        }
+            if c_sb:
+                _mark_mib("CISCOSB-rndMng")
+                if cpu_pct is None:
+                    for sb_key in ("8.0", "7.0", "9.0"):
+                        if sb_key in c_sb:
+                            sb_val = _to_float(c_sb.get(sb_key), -1.0)
+                            if 0.0 <= sb_val <= 100.0:
+                                cpu_pct = round(sb_val, 1)
+                                break
+            if cpu_pct is None:
+                old_cpu = await self._snmp_walk_oid(
+                    target, port, auth_args, "1.3.6.1.4.1.9.2.1", timeout=3.0, sem=sem, stats=poll_stats
+                )
+                if old_cpu:
+                    for ok_key in ("57.0", "58.0", "56.0"):
+                        if ok_key in old_cpu:
+                            ov = _to_float(old_cpu.get(ok_key), -1.0)
+                            if 0.0 <= ov <= 100.0:
+                                _mark_mib("OLD-CISCO-CPU-MIB")
+                                cpu_pct = round(ov, 1)
+                                break
             if c_mem and mem_pct is None:
                 _mark_mib("CISCO-MEMORY-POOL-MIB")
                 pool_ids = {k.split(".", 1)[1] for k in c_mem.keys() if k.startswith("5.") and "." in k}
@@ -2896,6 +2965,36 @@ class SNMPPoller:
                         "total_bytes": tot_pool,
                         "used_bytes": tot_used,
                         "avail_bytes": tot_free,
+                        "usage_pct": mem_pct,
+                    }
+            if c_emem and mem_pct is None:
+                _mark_mib("CISCO-ENHANCED-MEMPOOL-MIB")
+                emp_hc_ids = {
+                    k.split(".", 1)[1]
+                    for k in c_emem.keys()
+                    if k.startswith("18.") and "." in k
+                }
+                emp_used = 0
+                emp_free = 0
+                for pid in emp_hc_ids:
+                    emp_used += max(0, _to_int(c_emem.get(f"18.{pid}"), 0))
+                    emp_free += max(0, _to_int(c_emem.get(f"20.{pid}"), 0))
+                if emp_used + emp_free <= 0:
+                    emp_ids = {
+                        k.split(".", 1)[1]
+                        for k in c_emem.keys()
+                        if k.startswith("7.") and "." in k
+                    }
+                    for pid in emp_ids:
+                        emp_used += max(0, _to_int(c_emem.get(f"7.{pid}"), 0))
+                        emp_free += max(0, _to_int(c_emem.get(f"8.{pid}"), 0))
+                emp_tot = emp_used + emp_free
+                if emp_tot > 0:
+                    mem_pct = round((emp_used / emp_tot) * 100.0, 1)
+                    memory_details = {
+                        "total_bytes": emp_tot,
+                        "used_bytes": emp_used,
+                        "avail_bytes": emp_free,
                         "usage_pct": mem_pct,
                     }
             if c_env:

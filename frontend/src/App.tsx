@@ -6877,17 +6877,6 @@ export const App: React.FC = () => {
                       {allDevices.length} Total Discovered
                     </div>
                   </div>
-                  <a
-                    href="/devices"
-                    onClick={(e) => {
-                      if (isModifiedClick(e)) return;
-                      e.preventDefault();
-                      navigateToTab("devices");
-                    }}
-                    className="rounded border border-slate-700 bg-slate-800/80 px-2.5 py-1 font-sans text-xs text-emerald-400 hover:bg-slate-700"
-                  >
-                    View Devices →
-                  </a>
                 </div>
               </div>
 
@@ -6904,17 +6893,6 @@ export const App: React.FC = () => {
                     </div>
                     <div className="text-xs text-slate-400">Reachable SNMP Targets</div>
                   </div>
-                  <a
-                    href="/targets"
-                    onClick={(e) => {
-                      if (isModifiedClick(e)) return;
-                      e.preventDefault();
-                      navigateToTab("targets");
-                    }}
-                    className="rounded border border-slate-700 bg-slate-800/80 px-2 py-1 font-sans text-xs text-emerald-400 hover:bg-slate-700"
-                  >
-                    + Add Host
-                  </a>
                 </div>
               </div>
 
@@ -6932,17 +6910,6 @@ export const App: React.FC = () => {
                       {overview?.scanner_summary?.online_hosts || 0} Active IPs
                     </div>
                   </div>
-                  <a
-                    href="/targets"
-                    onClick={(e) => {
-                      if (isModifiedClick(e)) return;
-                      e.preventDefault();
-                      navigateToTab("targets");
-                    }}
-                    className="rounded border border-slate-700 bg-slate-800/80 px-2 py-1 font-sans text-xs text-emerald-400 hover:bg-slate-700"
-                  >
-                    + Add Subnet
-                  </a>
                 </div>
               </div>
 
@@ -6977,7 +6944,7 @@ export const App: React.FC = () => {
                   <div className="flex flex-wrap items-center gap-2">
                     <h3 className="text-sm font-semibold text-white">
                       {overviewGraphMode === "live"
-                        ? "Network Traffic Overview (Live Stream)"
+                        ? "Network Traffic Overview"
                         : overviewGraphMode === "1h"
                           ? "Network Traffic Overview (Last 1 Hour)"
                           : overviewGraphMode === "12h"
@@ -7107,6 +7074,7 @@ export const App: React.FC = () => {
               </div>
               <DualAreaSparkChart
                 showYAxis={true}
+                linear={true}
                 fixedMaxBps={overviewFixedMaxBps}
                 liveMode={isLiveOverview}
                 liveWindowMs={120_000}
