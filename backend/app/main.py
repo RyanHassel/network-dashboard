@@ -5583,24 +5583,37 @@ async def trigger_device_poll(device_ref: str) -> Dict[str, Any]:
             pass
     await _notify_worker(f"poll_device:{device_ip}")
     if redis_client:
-        for _ in range(25):
+        for _ in range(75):
             await asyncio.sleep(0.2)
             try:
                 raw_done = await redis_client.get(done_key)
                 if raw_done:
                     parsed = json.loads(raw_done)
+                    ok_val = bool(parsed.get("ok"))
+                    msg = (
+                        (parsed.get("detail") or f"SNMP poll succeeded for {device_ip}.")
+                        if ok_val
+                        else (
+                            parsed.get("error")
+                            or f"SNMP poll failed for {device_ip}. Check SNMP credentials, version, and network reachability."
+                        )
+                    )
                     return {
                         "status": "completed",
                         "device_id": device_id,
-                        "ok": bool(parsed.get("ok")),
-                        "message": f"Completed targeted SNMP poll for {device_ip}.",
+                        "ok": ok_val,
+                        "message": msg,
+                        "poll_ms": parsed.get("poll_ms"),
+                        "interfaces": parsed.get("interfaces"),
+                        "vendor_name": parsed.get("vendor_name"),
                     }
             except Exception:
                 break
     return {
-        "status": "triggered",
+        "status": "timeout",
         "device_id": device_id,
-        "message": f"Immediate SNMP & MIB poll queued for {device_ip}.",
+        "ok": False,
+        "message": f"SNMP poll for {device_ip} did not complete within 15s — check worker status or SNMP reachability.",
     }
 
 

@@ -508,19 +508,40 @@ async def command_listener_loop(
     stop_event: asyncio.Event,
 ) -> None:
     async def _run_targeted_poll(target_ip: str) -> None:
-        ok = False
+        payload: Dict[str, Any] = {
+            "ok": False,
+            "error": f"No SNMP response from {target_ip}. Verify SNMP is enabled on the device, UDP port/firewall allows access, and the assigned SNMP credential profile matches.",
+        }
         try:
             res = await snmp_poller.poll_single_ip(target_ip, pool, redis_client)
             if res:
-                ok = True
+                sys_lbl = res.get("sys_name") or target_ip
+                vendor_lbl = res.get("vendor_name") or "SNMP"
+                iface_cnt = int(res.get("interfaces") or 0)
+                poll_ms = float(res.get("poll_ms") or 0.0)
+                detail = (
+                    f"Polled {sys_lbl} ({vendor_lbl}, {iface_cnt} interfaces) in {poll_ms:.0f} ms."
+                )
+                payload = {
+                    "ok": True,
+                    "detail": detail,
+                    "sys_name": res.get("sys_name"),
+                    "vendor_name": res.get("vendor_name"),
+                    "interfaces": iface_cnt,
+                    "poll_ms": res.get("poll_ms"),
+                }
                 await publish_event(redis_client, "snmp_update", [res])
         except Exception as exc:
             logger.warning("Targeted SNMP poll failed for %s: %s", target_ip, exc)
+            payload = {
+                "ok": False,
+                "error": f"SNMP poll error for {target_ip}: {exc}",
+            }
         try:
             await redis_client.set(
                 f"snmp:poll_done:{target_ip}",
-                json.dumps({"ok": ok}),
-                ex=20,
+                json.dumps(payload),
+                ex=30,
             )
         except Exception:
             pass

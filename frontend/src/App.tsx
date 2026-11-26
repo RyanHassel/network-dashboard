@@ -3433,6 +3433,12 @@ export const App: React.FC = () => {
   const [detailTrendRange, setDetailTrendRange] = useState<string>("24h");
   const [detailTrendSeries, setDetailTrendSeries] = useState<SNMPTrendPoint[]>([]);
   const [pollingDeviceNow, setPollingDeviceNow] = useState(false);
+  const [devicePollFeedback, setDevicePollFeedback] = useState<{
+    ip: string;
+    ok: boolean;
+    message: string;
+    checkedAt: string;
+  } | null>(null);
   const [rematchingMibs, setRematchingMibs] = useState(false);
 
   // Domain Telemetry State
@@ -3943,6 +3949,7 @@ export const App: React.FC = () => {
     setSelectedDeviceDetailIp(ip);
     setDeviceDetail(null);
     setDeviceDetailError(null);
+    setDevicePollFeedback(null);
     setDetailIfIndex(0);
     setDetailTrendRange("24h");
     setUpsHistoryRange("24h");
@@ -3983,22 +3990,57 @@ export const App: React.FC = () => {
       );
     };
     setPollingDeviceNow(true);
+    setDevicePollFeedback(null);
     try {
       const r = await fetch(`/api/devices/${encodeURIComponent(ip)}/poll`, { method: "POST" });
       let status = "triggered";
-      if (r.ok) {
-        try {
-          const body = await r.json();
-          status = body?.status || "triggered";
-        } catch {
-          status = "triggered";
-        }
+      let body: {
+        status?: string;
+        ok?: boolean;
+        message?: string;
+        detail?: string;
+      } | null = null;
+      try {
+        body = await r.json();
+        status = body?.status || "triggered";
+      } catch {
+        body = null;
       }
+
+      const checkedAt = new Date().toLocaleTimeString();
+      if (r.ok && status === "completed" && body?.ok === true) {
+        setDevicePollFeedback({
+          ip,
+          ok: true,
+          message: body.message || `SNMP poll succeeded for ${ip}.`,
+          checkedAt,
+        });
+      } else if (!r.ok) {
+        setDevicePollFeedback({
+          ip,
+          ok: false,
+          message:
+            body?.detail ||
+            body?.message ||
+            `SNMP poll request failed (HTTP ${r.status}).`,
+          checkedAt,
+        });
+      } else {
+        setDevicePollFeedback({
+          ip,
+          ok: false,
+          message:
+            body?.message ||
+            `SNMP poll failed for ${ip}. Check SNMP credentials, version, and device reachability.`,
+          checkedAt,
+        });
+      }
+
       await Promise.all([
         isViewingTargetIp() ? fetchDeviceDetail(ip) : Promise.resolve(),
         fetchAllDevices(),
       ]);
-      if (status !== "completed") {
+      if (status !== "completed" && status !== "timeout") {
         setTimeout(() => {
           if (isViewingTargetIp()) {
             fetchDeviceDetail(ip);
@@ -4006,6 +4048,16 @@ export const App: React.FC = () => {
           fetchAllDevices();
         }, 2000);
       }
+    } catch (err) {
+      setDevicePollFeedback({
+        ip,
+        ok: false,
+        message:
+          err instanceof Error
+            ? `SNMP poll request failed: ${err.message}`
+            : `SNMP poll request failed for ${ip}.`,
+        checkedAt: new Date().toLocaleTimeString(),
+      });
     } finally {
       setPollingDeviceNow(false);
     }
@@ -8172,7 +8224,7 @@ export const App: React.FC = () => {
                         </div>
                       )}
 
-                      <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3.5">
+                      <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3.5 space-y-3">
                         <div className="flex flex-wrap items-center justify-between gap-3">
                           <div>
                             <div className="text-xs font-medium text-white">On-Demand SNMP Poll</div>
@@ -8201,6 +8253,36 @@ export const App: React.FC = () => {
                             <span>{pollingDeviceNow ? "Polling SNMP..." : "Poll SNMP Now"}</span>
                           </button>
                         </div>
+                        {devicePollFeedback && devicePollFeedback.ip === activeDetailIp && (
+                          <div
+                            className={`flex items-start gap-2 rounded-md border px-3 py-2 text-xs ${
+                              devicePollFeedback.ok
+                                ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-300"
+                                : "border-rose-500/35 bg-rose-500/10 text-rose-300"
+                            }`}
+                          >
+                            {devicePollFeedback.ok ? (
+                              <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                            ) : (
+                              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                            )}
+                            <div className="min-w-0 flex-1">
+                              <div className="flex flex-wrap items-center justify-between gap-2 font-semibold">
+                                <span>
+                                  {devicePollFeedback.ok
+                                    ? "SNMP Poll Succeeded"
+                                    : "SNMP Poll Failed"}
+                                </span>
+                                <span className="font-mono-tabular text-[10px] opacity-75">
+                                  {devicePollFeedback.checkedAt}
+                                </span>
+                              </div>
+                              <p className="mt-0.5 text-[11px] leading-relaxed opacity-90">
+                                {devicePollFeedback.message}
+                              </p>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     </div>
 
