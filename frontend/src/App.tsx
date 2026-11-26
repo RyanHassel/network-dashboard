@@ -2471,6 +2471,10 @@ export const App: React.FC = () => {
   const [selectedDeviceDetailIp, setSelectedDeviceDetailIp] = useState<string | null>(
     initialRoute.deviceRef && !/^\d+$/.test(initialRoute.deviceRef) ? initialRoute.deviceRef : null,
   );
+  const selectedDeviceRefRef = useRef<string | null>(selectedDeviceRef);
+  selectedDeviceRefRef.current = selectedDeviceRef;
+  const selectedDeviceDetailIpRef = useRef<string | null>(selectedDeviceDetailIp);
+  selectedDeviceDetailIpRef.current = selectedDeviceDetailIp;
   const [deviceDetail, setDeviceDetail] = useState<DeviceDetailPayload | null>(null);
   const [loadingDeviceDetail, setLoadingDeviceDetail] = useState(false);
   const [deviceDetailError, setDeviceDetailError] = useState<string | null>(null);
@@ -2825,11 +2829,13 @@ export const App: React.FC = () => {
   };
 
   const fetchDeviceDetail = async (deviceRef: string, resetToOverview = false) => {
+    const isStillViewingDevice = () => Boolean(selectedDeviceRefRef.current);
+    if (!isStillViewingDevice()) return;
     const reqId = ++deviceDetailReqIdRef.current;
     setLoadingDeviceDetail(true);
     try {
       const r = await fetch(`/api/devices/${encodeURIComponent(deviceRef)}`);
-      if (reqId !== deviceDetailReqIdRef.current) return;
+      if (reqId !== deviceDetailReqIdRef.current || !isStillViewingDevice()) return;
       if (r.status === 404) {
         setDeviceDetail(null);
         setDeviceDetailError(`Device "${deviceRef}" was not found.`);
@@ -2837,7 +2843,7 @@ export const App: React.FC = () => {
       }
       if (r.ok) {
         const data: DeviceDetailPayload = await r.json();
-        if (reqId !== deviceDetailReqIdRef.current) return;
+        if (reqId !== deviceDetailReqIdRef.current || !isStillViewingDevice()) return;
         setDeviceDetailError(null);
         setDeviceDetail(data);
         setSelectedDeviceDetailIp(data.ip_address);
@@ -2845,11 +2851,17 @@ export const App: React.FC = () => {
         if (data.device_id != null) {
           const canonicalRef = String(data.device_id);
           const canonicalPath = `/devices/${canonicalRef}`;
-          lastLoadedDeviceRef.current = canonicalRef;
-          if (typeof window !== "undefined" && window.location.pathname !== canonicalPath) {
-            window.history.replaceState(null, "", canonicalPath);
+          const activeRef = selectedDeviceRefRef.current;
+          const activeIp = selectedDeviceDetailIpRef.current;
+          const matchesActiveDevice =
+            activeRef === deviceRef || activeRef === canonicalRef || activeIp === data.ip_address;
+          if (matchesActiveDevice) {
+            lastLoadedDeviceRef.current = canonicalRef;
+            if (typeof window !== "undefined" && window.location.pathname !== canonicalPath) {
+              window.history.replaceState(null, "", canonicalPath);
+            }
+            setSelectedDeviceRef(canonicalRef);
           }
-          setSelectedDeviceRef(canonicalRef);
         } else {
           lastLoadedDeviceRef.current = deviceRef;
         }
@@ -2930,10 +2942,13 @@ export const App: React.FC = () => {
       }
     }
     const nextRoute = parseAppRoute(targetPath);
+    selectedDeviceRefRef.current = nextRoute.deviceRef;
     setActiveTab(nextRoute.tab);
     setSelectedDeviceRef(nextRoute.deviceRef);
     setNavMenuOpen(false);
     if (!nextRoute.deviceRef) {
+      deviceDetailReqIdRef.current += 1;
+      selectedDeviceDetailIpRef.current = null;
       lastLoadedDeviceRef.current = null;
       setSelectedDeviceDetailIp(null);
       setDeviceDetail(null);
@@ -2980,8 +2995,9 @@ export const App: React.FC = () => {
         fetchConfig();
         fetchOverview();
         fetchInterfaces();
-        if (selectedDeviceRef) {
-          fetchDeviceDetail(selectedDeviceRef, false);
+        const curRef = selectedDeviceRefRef.current;
+        if (curRef) {
+          fetchDeviceDetail(curRef, false);
         }
         setRematchingMibs(false);
       }, 4500);
@@ -2991,6 +3007,16 @@ export const App: React.FC = () => {
   };
 
   const handlePollSingleDeviceNow = async (ip: string) => {
+    const isViewingTargetIp = () => {
+      const curRef = selectedDeviceRefRef.current;
+      if (!curRef) return false;
+      const mappedId = deviceIdByIp[ip];
+      return (
+        curRef === ip ||
+        selectedDeviceDetailIpRef.current === ip ||
+        (mappedId != null && curRef === String(mappedId))
+      );
+    };
     setPollingDeviceNow(true);
     try {
       const r = await fetch(`/api/devices/${encodeURIComponent(ip)}/poll`, { method: "POST" });
@@ -3003,10 +3029,15 @@ export const App: React.FC = () => {
           status = "triggered";
         }
       }
-      await Promise.all([fetchDeviceDetail(ip), fetchAllDevices()]);
+      await Promise.all([
+        isViewingTargetIp() ? fetchDeviceDetail(ip) : Promise.resolve(),
+        fetchAllDevices(),
+      ]);
       if (status !== "completed") {
         setTimeout(() => {
-          fetchDeviceDetail(ip);
+          if (isViewingTargetIp()) {
+            fetchDeviceDetail(ip);
+          }
           fetchAllDevices();
         }, 2000);
       }
@@ -3837,10 +3868,13 @@ export const App: React.FC = () => {
   useEffect(() => {
     const onPopState = () => {
       const nextRoute = parseAppRoute(window.location.pathname);
+      selectedDeviceRefRef.current = nextRoute.deviceRef;
       setActiveTab(nextRoute.tab);
       setNavMenuOpen(false);
       setSelectedDeviceRef(nextRoute.deviceRef);
       if (!nextRoute.deviceRef) {
+        deviceDetailReqIdRef.current += 1;
+        selectedDeviceDetailIpRef.current = null;
         lastLoadedDeviceRef.current = null;
         setSelectedDeviceDetailIp(null);
         setDeviceDetail(null);
