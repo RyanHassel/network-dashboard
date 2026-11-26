@@ -7074,7 +7074,6 @@ export const App: React.FC = () => {
               </div>
               <DualAreaSparkChart
                 showYAxis={true}
-                linear={true}
                 fixedMaxBps={overviewFixedMaxBps}
                 liveMode={isLiveOverview}
                 liveWindowMs={120_000}
