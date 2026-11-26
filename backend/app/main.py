@@ -3255,6 +3255,12 @@ def _classify_device_profile(
     ):
         return "wireless"
 
+    if re.search(
+        r"\b(cisco\s+ucs|ucs[-\s]?c?\d{3,4}|ucsc[-\s]?\w+|ucsb[-\s]?\w+|cimc)\b",
+        f"{combined} {identity_text}",
+    ):
+        return "server"
+
     if unifi_dev or re.search(
         r"\b(switch|gateway|router|firewall|ubiquiti|unifi|udm|mikrotik|cisco|fortinet|juniper|aruba|arista|netgear|access point)\b",
         combined,
@@ -3373,6 +3379,12 @@ def _classify_device_role(
     ):
         return "switch"
 
+    if re.search(
+        r"\b(cisco\s+ucs|ucs[-\s]?c?\d{3,4}|ucsc[-\s]?\w+|ucsb[-\s]?\w+|cimc)\b",
+        identity,
+    ):
+        return "server"
+
     if ptype == "network":
         return "network"
 
@@ -3381,7 +3393,7 @@ def _classify_device_role(
     )
     has_server_identity = bool(
         re.search(
-            r"\b(server|proxmox|pve|esxi|vmware|linux|ubuntu|debian|centos|rhel|rocky|alma|alpine|freebsd|windows\s*server|idrac|ilo|ipmi|bmc|supermicro|poweredge|proliant|raspberry|docker|kubernetes|hypervisor)\b",
+            r"\b(server|proxmox|pve|esxi|vmware|linux|ubuntu|debian|centos|rhel|rocky|alma|alpine|freebsd|windows\s*server|idrac|ilo|ipmi|bmc|cimc|cisco\s+ucs|ucs[-\s]?c?\d{3,4}|ucsc[-\s]?\w+|ucsb[-\s]?\w+|supermicro|poweredge|proliant|raspberry|docker|kubernetes|hypervisor)\b",
             identity,
         )
     )

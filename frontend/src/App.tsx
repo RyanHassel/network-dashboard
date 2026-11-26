@@ -462,7 +462,7 @@ function resolveVendorIconKey(d: UnifiedDeviceItem): { key: string; label: strin
   if (/\b(apple|iphone|ipad|macbook|mac mini|mac studio|imac|homepod|appletv|apple tv|airpods)\b/.test(hay)) {
     return { key: "apple", label: d.vendor || "Apple" };
   }
-  if (/\b(cisco|meraki|catalyst|nexus|aironet)\b/.test(hay)) {
+  if (/\b(cisco|meraki|catalyst|nexus|aironet|ucs|ucsc|ucsb|cimc)\b|ucs[-\s]?c?\d{3,4}/.test(hay)) {
     return { key: "cisco", label: d.vendor || "Cisco" };
   }
   if (/\b(proxmox|pve)\b/.test(hay)) {
