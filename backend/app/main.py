@@ -3149,8 +3149,12 @@ def _classify_device_role(
     unifi_dev: Optional[Dict[str, Any]],
     sources: Optional[List[str]] = None,
     interface_count: int = 0,
+    is_unifi_client: bool = False,
 ) -> Optional[str]:
-    """Classifies granular hardware role (router, switch, ap, firewall, server, nas, ups, printer, network)."""
+    """Classifies granular hardware role (router, switch, ap, firewall, server, nas, ups, printer, network, client)."""
+    if is_unifi_client and not unifi_dev and "SNMP" not in (sources or []):
+        return "client"
+
     ptype = (profile_type or "").strip().lower()
     if ptype == "ups":
         return "ups"
@@ -4002,6 +4006,7 @@ async def get_all_devices() -> Dict[str, Any]:
                 "interface_count": 0,
                 "uptime_sec": None,
                 "sources": [],
+                "is_unifi_client": False,
                 "log_count_24h": 0,
                 "last_seen": None,
             }
@@ -4107,8 +4112,9 @@ async def get_all_devices() -> Dict[str, Any]:
         item["mac_address"] = r["mac"] or item["mac_address"]
         item["vendor"] = r["oui_vendor"] or item["vendor"]
         item["vlan_id"] = r["vlan_id"] or item["vlan_id"]
-        if "UniFi" not in item["sources"]:
-            item["sources"].append("UniFi")
+        item["is_unifi_client"] = True
+        if "UniFi" not in item["sources"] and "UniFi Client" not in item["sources"]:
+            item["sources"].append("UniFi Client")
 
     for r in log_counts:
         ip_str = str(r["source_ip"])
@@ -4119,7 +4125,11 @@ async def get_all_devices() -> Dict[str, Any]:
 
     # Auto-match vendor MIB profile for any previously discovered device missing matched_mibs
     for item in by_ip.values():
-        if not item.get("matched_mibs"):
+        is_unifi_infra = bool(item.get("_unifi_device_type"))
+        has_snmp = "SNMP" in (item.get("sources") or [])
+        is_client_only = bool(item.get("is_unifi_client")) and not is_unifi_infra and not has_snmp
+
+        if not is_client_only and not item.get("matched_mibs"):
             matched = match_device_vendor_profile(
                 "",
                 f"{item.get('vendor') or ''} {item.get('sys_descr') or ''}",
@@ -4134,39 +4144,46 @@ async def get_all_devices() -> Dict[str, Any]:
                 "Generic / Standard RFC",
             ):
                 item["vendor"] = matched_vendor
+
         unifi_hint = (
             {"device_type": item.get("_unifi_device_type")}
-            if item.get("_unifi_device_type")
-            else ({"device_type": "unknown"} if "UniFi" in item.get("sources", []) else None)
+            if is_unifi_infra
+            else None
         )
-        item["device_profile_type"] = _classify_device_profile(
-            {
-                "device_category": item.get("device_category"),
-                "vendor_name": item.get("vendor"),
-                "hardware_model": item.get("hardware_model"),
-                "sys_descr": item.get("sys_descr"),
-                "sys_name": item.get("hostname"),
-                "matched_mibs": item.get("matched_mibs") or [],
-                "has_ups_telemetry": bool(item.get("has_ups_telemetry")),
-                "has_wireless_telemetry": bool(item.get("has_wireless_telemetry")),
-            },
-            unifi_hint,
-            None,
-        )
-        item["device_role"] = _classify_device_role(
-            item["device_profile_type"],
-            {
-                "device_category": item.get("device_category"),
-                "vendor_name": item.get("vendor"),
-                "hardware_model": item.get("hardware_model"),
-                "sys_descr": item.get("sys_descr"),
-                "sys_name": item.get("hostname"),
-                "matched_mibs": item.get("matched_mibs") or [],
-            },
-            unifi_hint,
-            sources=item.get("sources") or [],
-            interface_count=int(item.get("interface_count") or 0),
-        )
+        if is_client_only:
+            item["device_profile_type"] = "client"
+            item["device_role"] = "client"
+        else:
+            item["device_profile_type"] = _classify_device_profile(
+                {
+                    "device_category": item.get("device_category"),
+                    "vendor_name": item.get("vendor"),
+                    "hardware_model": item.get("hardware_model"),
+                    "sys_descr": item.get("sys_descr"),
+                    "sys_name": item.get("hostname"),
+                    "matched_mibs": item.get("matched_mibs") or [],
+                    "has_ups_telemetry": bool(item.get("has_ups_telemetry")),
+                    "has_wireless_telemetry": bool(item.get("has_wireless_telemetry")),
+                },
+                unifi_hint,
+                None,
+            )
+            item["device_role"] = _classify_device_role(
+                item["device_profile_type"],
+                {
+                    "device_category": item.get("device_category"),
+                    "vendor_name": item.get("vendor"),
+                    "hardware_model": item.get("hardware_model"),
+                    "sys_descr": item.get("sys_descr"),
+                    "sys_name": item.get("hostname"),
+                    "matched_mibs": item.get("matched_mibs") or [],
+                },
+                unifi_hint,
+                sources=item.get("sources") or [],
+                interface_count=int(item.get("interface_count") or 0),
+                is_unifi_client=bool(item.get("is_unifi_client")),
+            )
+        item["is_unifi_client"] = bool(item.get("is_unifi_client"))
         item.pop("has_ups_telemetry", None)
         item.pop("has_wireless_telemetry", None)
         item.pop("_unifi_device_type", None)
@@ -4448,14 +4465,36 @@ async def get_device_detail(device_ref: str) -> Dict[str, Any]:
         ),
     }
 
-    device_profile_type = _classify_device_profile(
-        snmp_sys_dict, unifi_dev_dict, fallback_mib_match
+    is_client_only = (
+        bool(unifi_cli_dict)
+        and not bool(unifi_dev_dict)
+        and not bool(snmp_cfg_dict)
+        and not bool(snmp_sys_dict)
     )
+    if is_client_only:
+        device_profile_type = "client"
+        device_role = "client"
+    else:
+        device_profile_type = _classify_device_profile(
+            snmp_sys_dict, unifi_dev_dict, fallback_mib_match
+        )
+        detail_sources: List[str] = []
+        if snmp_cfg_dict or snmp_sys_dict:
+            detail_sources.append("SNMP")
+        device_role = _classify_device_role(
+            device_profile_type,
+            snmp_sys_dict or resolved_identity,
+            unifi_dev_dict,
+            sources=detail_sources,
+            interface_count=len(snmp_if_rows),
+            is_unifi_client=bool(unifi_cli_dict),
+        )
 
     return {
         "device_id": device_id,
         "ip_address": device_ip,
         "device_profile_type": device_profile_type,
+        "device_role": device_role,
         "discovered_host": host_dict,
         "snmp_config": snmp_cfg_dict,
         "snmp_system": snmp_sys_dict,
@@ -4465,6 +4504,39 @@ async def get_device_detail(device_ref: str) -> Dict[str, Any]:
         "unifi_device": unifi_dev_dict,
         "unifi_client": unifi_cli_dict,
         "recent_logs": [_serialize(r) for r in log_rows],
+    }
+
+
+@app.delete("/api/devices/{device_ref}")
+async def remove_device(device_ref: str) -> Dict[str, Any]:
+    """Removes a device from discovered hosts, SNMP targets/inventory, UniFi caches, and device registry."""
+    pool = _get_pool()
+    removed_snmp_target = False
+    async with pool.acquire() as conn:
+        device_id, device_ip = await _resolve_device_ref(conn, device_ref)
+        res_tgt = await conn.execute(
+            "DELETE FROM snmp_targets_config WHERE device_ip = $1",
+            device_ip,
+        )
+        if res_tgt and not res_tgt.endswith(" 0"):
+            removed_snmp_target = True
+        await conn.execute("DELETE FROM snmp_devices WHERE device_ip = $1", device_ip)
+        await conn.execute("DELETE FROM discovered_hosts WHERE host(ip_address) = $1", device_ip)
+        await conn.execute(
+            "DELETE FROM unifi_devices WHERE ip_address = $1 OR lan_ip = $1",
+            device_ip,
+        )
+        await conn.execute("DELETE FROM unifi_clients WHERE ip_address = $1", device_ip)
+        await conn.execute("DELETE FROM device_registry WHERE ip_address = $1", device_ip)
+
+    if removed_snmp_target:
+        await _notify_worker("reload_config")
+
+    return {
+        "status": "deleted",
+        "device_id": device_id,
+        "ip_address": device_ip,
+        "removed_snmp_target": removed_snmp_target,
     }
 
 

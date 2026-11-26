@@ -391,6 +391,7 @@ interface UnifiedDeviceItem {
   interface_count: number;
   uptime_sec: number | null;
   sources: string[];
+  is_unifi_client?: boolean;
   log_count_24h: number;
   last_seen: string | null;
 }
@@ -491,6 +492,15 @@ function renderDeviceRoleBadge(d: UnifiedDeviceItem): React.ReactNode {
           className="inline-flex shrink-0 items-center gap-1 rounded border border-sky-500/25 bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-300"
         >
           <Network className="h-2.5 w-2.5" /> Network
+        </span>
+      );
+    case "client":
+      return (
+        <span
+          title="UniFi Client"
+          className="inline-flex shrink-0 items-center gap-1 rounded border border-slate-700 bg-slate-800/80 px-1.5 py-0.5 text-[10px] font-medium text-slate-300"
+        >
+          <Monitor className="h-2.5 w-2.5" /> Client
         </span>
       );
     default:
@@ -882,7 +892,8 @@ interface DeviceDetailPayload {
     last_poll_duration_ms: number;
     last_polled: string | null;
   } | null;
-  device_profile_type?: "ups" | "wireless" | "nas" | "printer" | "network" | "server" | string;
+  device_profile_type?: "ups" | "wireless" | "nas" | "printer" | "network" | "server" | "client" | string;
+  device_role?: string | null;
   matched_mib_profile?: {
     vendor_name?: string;
     vendor?: string;
@@ -2404,7 +2415,9 @@ export const App: React.FC = () => {
   // Devices Inventory & Per-Device Detail Page State
   const [allDevices, setAllDevices] = useState<UnifiedDeviceItem[]>([]);
   const [deviceSearch, setDeviceSearch] = useState("");
-  const [deviceFilter, setDeviceFilter] = useState<"all" | "online" | "snmp">("all");
+  const [deviceFilter, setDeviceFilter] = useState<"all" | "online" | "snmp" | "clients">("all");
+  const [confirmRemoveDeviceIp, setConfirmRemoveDeviceIp] = useState<string | null>(null);
+  const [removingDeviceIp, setRemovingDeviceIp] = useState<string | null>(null);
   const [deviceSortKey, setDeviceSortKey] = useState<DeviceSortKey>("ip_address");
   const [deviceSortDir, setDeviceSortDir] = useState<SortDirection>("asc");
   const [visibleDeviceColumns, setVisibleDeviceColumns] = useState<DeviceColumnKey[]>(() => {
@@ -3061,6 +3074,21 @@ export const App: React.FC = () => {
     if (r.ok) {
       syncConfigState(await r.json());
       handlePollSingleDeviceNow(ip);
+    }
+  };
+
+  const handleRemoveDevice = async (d: UnifiedDeviceItem) => {
+    const ref = d.device_id != null ? String(d.device_id) : d.ip_address;
+    setRemovingDeviceIp(d.ip_address);
+    try {
+      const r = await fetch(`/api/devices/${encodeURIComponent(ref)}`, { method: "DELETE" });
+      if (r.ok) {
+        setAllDevices((prev) => prev.filter((item) => item.ip_address !== d.ip_address));
+        setConfirmRemoveDeviceIp(null);
+        await Promise.all([fetchAllDevices(), fetchConfig()]);
+      }
+    } finally {
+      setRemovingDeviceIp(null);
     }
   };
 
@@ -4492,6 +4520,13 @@ export const App: React.FC = () => {
     .filter((d) => {
       if (deviceFilter === "online" && !d.is_online) return false;
       if (deviceFilter === "snmp" && !d.sources.includes("SNMP")) return false;
+      if (
+        deviceFilter === "clients" &&
+        d.device_role !== "client" &&
+        d.device_profile_type !== "client"
+      ) {
+        return false;
+      }
       if (deviceSearch.trim()) {
         const q = deviceSearch.trim().toLowerCase();
         const qNum = q.replace(/^#/, "");
@@ -6167,10 +6202,20 @@ export const App: React.FC = () => {
                         allDevices.filter((d) => d.sources.includes("SNMP")).length
                       })`,
                     },
+                    {
+                      id: "clients",
+                      label: `Clients (${
+                        allDevices.filter(
+                          (d) => d.device_role === "client" || d.device_profile_type === "client",
+                        ).length
+                      })`,
+                    },
                   ].map((f) => (
                     <button
                       key={f.id}
-                      onClick={() => setDeviceFilter(f.id as "all" | "online" | "snmp")}
+                      onClick={() =>
+                        setDeviceFilter(f.id as "all" | "online" | "snmp" | "clients")
+                      }
                       className={`rounded px-2.5 py-1 text-xs font-medium transition ${
                         deviceFilter === f.id
                           ? "bg-emerald-600 text-white"
@@ -6343,13 +6388,14 @@ export const App: React.FC = () => {
                           </th>
                         );
                       })}
+                      <th className="pb-2.5 pl-2 text-right font-medium">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800/60 font-mono-tabular">
                     {filteredDevices.length === 0 ? (
                       <tr>
                         <td
-                          colSpan={activeDeviceColumns.length}
+                          colSpan={activeDeviceColumns.length + 1}
                           className="py-10 text-center font-sans text-slate-500"
                         >
                           No devices match your current filter. Add a subnet or SNMP target in{" "}
@@ -6559,6 +6605,40 @@ export const App: React.FC = () => {
                                   );
                               }
                             })}
+                            <td
+                              onClick={(e) => e.stopPropagation()}
+                              className="py-3 pl-2 text-right font-sans"
+                            >
+                              {confirmRemoveDeviceIp === d.ip_address ? (
+                                <div className="inline-flex items-center gap-1">
+                                  <button
+                                    type="button"
+                                    disabled={removingDeviceIp === d.ip_address}
+                                    onClick={() => handleRemoveDevice(d)}
+                                    className="rounded border border-rose-500/40 bg-rose-500/20 px-2 py-0.5 text-[11px] font-medium text-rose-300 hover:bg-rose-500/30 disabled:opacity-50"
+                                  >
+                                    {removingDeviceIp === d.ip_address ? "Removing..." : "Remove"}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={removingDeviceIp === d.ip_address}
+                                    onClick={() => setConfirmRemoveDeviceIp(null)}
+                                    className="rounded border border-slate-700 bg-slate-800 px-2 py-0.5 text-[11px] text-slate-300 hover:bg-slate-700 disabled:opacity-50"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              ) : (
+                                <button
+                                  type="button"
+                                  title="Remove device"
+                                  onClick={() => setConfirmRemoveDeviceIp(d.ip_address)}
+                                  className="inline-flex items-center rounded p-1 text-slate-500 transition hover:bg-rose-500/15 hover:text-rose-400"
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </button>
+                              )}
+                            </td>
                           </tr>
                         );
                       })
@@ -6639,6 +6719,10 @@ export const App: React.FC = () => {
                       <span className="inline-flex items-center gap-1 rounded border border-sky-500/30 bg-sky-500/15 px-2 py-0.5 text-[11px] font-medium text-sky-300">
                         <Server className="h-3 w-3" /> Server / Host
                       </span>
+                    ) : detailProfileType === "client" ? (
+                      <span className="inline-flex items-center gap-1 rounded border border-slate-700 bg-slate-800/80 px-2 py-0.5 text-[11px] font-medium text-slate-300">
+                        <Monitor className="h-3 w-3" /> UniFi Client
+                      </span>
                     ) : (
                       <span className="inline-flex items-center gap-1 rounded border border-cyan-500/30 bg-cyan-500/15 px-2 py-0.5 text-[11px] font-medium text-cyan-300">
                         <Network className="h-3 w-3" /> Network Device
@@ -6652,12 +6736,24 @@ export const App: React.FC = () => {
                         ? "Wireless Radios, Broadcast SSIDs, Airtime Utilization, Clients & Interfaces (SNMP)"
                         : detailProfileType === "printer"
                           ? "Printer Toner & Supply Levels, SNMP Counters, and Syslogs"
-                          : "Complete Polled Telemetry — Discovery, SNMP System & Interfaces, and Syslogs"}
+                          : detailProfileType === "client"
+                            ? "UniFi Client Connection, IP/MAC Identity, Discovery & Syslog Events (SNMP Not Configured)"
+                            : "Complete Polled Telemetry — Discovery, SNMP System & Interfaces, and Syslogs"}
                   </p>
                 </div>
               </div>
 
               <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => selectedDeviceRef && fetchDeviceDetail(selectedDeviceRef, false)}
+                  disabled={loadingDeviceDetail || !selectedDeviceRef}
+                  className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800 disabled:opacity-50"
+                  title="Reload latest polled telemetry for this device without refreshing the browser"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${loadingDeviceDetail ? "animate-spin" : ""}`} />
+                  <span>{loadingDeviceDetail ? "Refreshing..." : "Refresh"}</span>
+                </button>
                 {!deviceDetail?.snmp_config ? (
                   <button
                     disabled={!activeDetailIp}
