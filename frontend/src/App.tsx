@@ -130,7 +130,7 @@ const DEVICE_TABLE_COLUMNS: Array<{
   { key: "ip_address", label: "IPv4 Address", alignRight: false, defaultVisible: true },
   { key: "hostname", label: "Hostname / sysName", alignRight: false, defaultVisible: true },
   { key: "mac_address", label: "MAC Address", alignRight: false, defaultVisible: true },
-  { key: "vendor_icon", label: "Vendor Icon", alignRight: false, defaultVisible: true },
+  { key: "vendor_icon", label: "Vendor", alignRight: false, defaultVisible: true },
   { key: "vendor", label: "Vendor / Hardware", alignRight: false, defaultVisible: true },
   { key: "subnet", label: "Subnet / VLAN", alignRight: false, defaultVisible: true },
   { key: "snmp", label: "SNMP / Interfaces", alignRight: false, defaultVisible: true },
@@ -473,7 +473,13 @@ function resolveVendorIconKey(d: UnifiedDeviceItem): { key: string; label: strin
   if (/\b(raspberry|raspbian)\b/.test(hay)) {
     return { key: "raspberry", label: d.vendor || "Raspberry Pi" };
   }
-  if (/\b(linux|ubuntu|debian|centos|rhel|red hat|rocky|alma|alpine|net-snmp)\b/.test(hay)) {
+  if (/\b(debian)\b/.test(hay)) {
+    return { key: "debian", label: d.vendor || "Debian" };
+  }
+  if (/\b(ubuntu)\b/.test(hay)) {
+    return { key: "ubuntu", label: d.vendor || "Ubuntu" };
+  }
+  if (/\b(linux|centos|rhel|red hat|rocky|alma|alpine|net-snmp)\b/.test(hay)) {
     return { key: "linux", label: d.vendor || "Linux" };
   }
   if (/\b(dell|poweredge|idrac)\b/.test(hay)) {
@@ -494,7 +500,10 @@ function resolveVendorIconKey(d: UnifiedDeviceItem): { key: string; label: strin
   if (/\b(vmware|esxi)\b/.test(hay)) {
     return { key: "vmware", label: d.vendor || "VMware" };
   }
-  if (/\b(apc|schneider|cyberpower|eaton|ups)\b/.test(hay)) {
+  if (/\b(apc|schneider)\b/.test(hay)) {
+    return { key: "apc", label: d.vendor || "APC" };
+  }
+  if (/\b(cyberpower|eaton|ups)\b/.test(hay)) {
     return { key: "ups", label: d.vendor || "UPS Power" };
   }
   if (/\b(google|nest|chromecast)\b/.test(hay)) {
@@ -518,6 +527,9 @@ function resolveVendorIconKey(d: UnifiedDeviceItem): { key: string; label: strin
   if (/\b(qnap|truenas|ixsystems)\b/.test(hay)) {
     return { key: "storage", label: d.vendor || "NAS Storage" };
   }
+  if (/\b(icmp|ping)\b/.test(hay)) {
+    return { key: "icmp", label: d.vendor || "ICMP Host" };
+  }
   return { key: "generic", label: d.vendor || "Unknown Vendor" };
 }
 
@@ -527,170 +539,321 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
   switch (key) {
     case "ubiquiti":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-sky-400">
-          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M5 4v9a7 7 0 0 0 14 0V4" />
-            <path d="M5 7h2M5 10h2M17 7h2M17 10h2" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+            {/* Pixelated top-left stem cubes */}
+            <rect x="4.5" y="2.5" width="2" height="2" rx="0.3" fill="#38BDF8" />
+            <rect x="7.2" y="3.2" width="1.6" height="1.6" rx="0.2" fill="#0EA5E9" />
+            <rect x="4.5" y="5.2" width="2.2" height="2.2" rx="0.3" fill="#0EA5E9" />
+            <rect x="7" y="5.6" width="2" height="2" rx="0.3" fill="#0284C7" />
+            {/* Blue left stem curving into bottom */}
+            <path
+              d="M4.6 8.2h4.2v5.4c0 2.6 1.5 4.2 3.7 4.4v3.4c-4.7-.2-7.9-3.2-7.9-7.9V8.2Z"
+              fill="#0EA5E9"
+            />
+            {/* Silver/slate bottom-right curve and right stem */}
+            <path
+              d="M12.5 18c2-.2 3.2-1.7 3.2-4.4V5.2l3.8-1.9v10.2c0 4.7-3 7.7-7 7.9V18Z"
+              fill="#CBD5E1"
+            />
+            <path
+              d="M15.7 5.2l3.8-1.9v9.2c0 2.9-.9 4.9-2.5 6.2l-1.3-2.1v-11.4Z"
+              fill="#E2E8F0"
+            />
+          </svg>
+        </span>
+      );
+    case "debian":
+      return (
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+            <path
+              d="M13.3 13.7c-.8 0-1.4-.5-1.3-1.2.1-.9 1-1.5 1.9-1.4 1.3.1 2.1 1.3 1.9 2.7-.3 1.9-2.2 3.1-4.2 2.8-2.7-.4-4.4-3-3.9-5.8.6-3.4 4-5.7 7.4-5 3.8.8 6.1 4.6 5.1 8.4-.7 2.8-2.8 5-5.5 6"
+              stroke="#D70A53"
+              strokeWidth="1.9"
+              strokeLinecap="round"
+            />
+            <path
+              d="M13.5 5.8c-4.1-.7-8 2-8.7 6.1-.6 3.5 1.3 6.9 4.4 8.3"
+              stroke="#E11D48"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeDasharray="1 1.6"
+            />
+          </svg>
+        </span>
+      );
+    case "ubuntu":
+      return (
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+            <circle cx="12" cy="12" r="5.8" stroke="#E95420" strokeWidth="2.4" />
+            <circle cx="17.2" cy="6.2" r="2.1" fill="#E95420" stroke="#0B1120" strokeWidth="0.9" />
+            <circle cx="17.2" cy="17.8" r="2.1" fill="#E95420" stroke="#0B1120" strokeWidth="0.9" />
+            <circle cx="5.4" cy="12" r="2.1" fill="#E95420" stroke="#0B1120" strokeWidth="0.9" />
+          </svg>
+        </span>
+      );
+    case "linux":
+      return (
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+            {/* Penguin body & flippers */}
+            <path
+              d="M12 2.5c-2.6 0-4.2 1.8-4.2 4.3 0 1.4.4 2.4-.5 3.6-1 1.3-2.3 3.2-2.3 5.2 0 1.5.7 2.6 1.8 3.2h10.4c1.1-.6 1.8-1.7 1.8-3.2 0-2-1.3-3.9-2.3-5.2-.9-1.2-.5-2.2-.5-3.6C16.2 4.3 14.6 2.5 12 2.5Z"
+              fill="#1E293B"
+              stroke="#64748B"
+              strokeWidth="1.1"
+              strokeLinejoin="round"
+            />
+            {/* White belly */}
+            <ellipse cx="12" cy="14.2" rx="3.7" ry="4.6" fill="#F8FAFC" />
+            {/* Eyes */}
+            <ellipse cx="10.4" cy="6.2" rx="1.15" ry="1.4" fill="#FFFFFF" />
+            <ellipse cx="13.6" cy="6.2" rx="1.15" ry="1.4" fill="#FFFFFF" />
+            <circle cx="10.7" cy="6.4" r="0.55" fill="#0F172A" />
+            <circle cx="13.3" cy="6.4" r="0.55" fill="#0F172A" />
+            {/* Amber beak */}
+            <path d="M10.1 7.9c1.2-.6 2.6-.6 3.8 0-.4 1.1-1.1 1.7-1.9 1.7-.8 0-1.5-.6-1.9-1.7Z" fill="#F59E0B" />
+            {/* Amber webbed feet */}
+            <path d="M6.2 19.6c0-.9 1.1-1.4 2.6-1.2 1 .1 1.7.7 1.7 1.4 0 .6-.7 1-1.9 1-1.3 0-2.4-.4-2.4-1.2Z" fill="#F59E0B" />
+            <path d="M17.8 19.6c0-.9-1.1-1.4-2.6-1.2-1 .1-1.7.7-1.7 1.4 0 .6.7 1 1.9 1 1.3 0 2.4-.4 2.4-1.2Z" fill="#F59E0B" />
+          </svg>
+        </span>
+      );
+    case "raspberry":
+      return (
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+            <path d="M12 6.2c-1.8-2.2-4.2-2.6-5.2-1.5 1.1 1.6 3.1 2.2 5.2 1.5Z" fill="#6CC04A" />
+            <path d="M12 6.2c1.8-2.2 4.2-2.6 5.2-1.5-1.1 1.6-3.1 2.2-5.2 1.5Z" fill="#4CA635" />
+            <circle cx="12" cy="13.8" r="5.8" fill="#C51A4A" />
+            <circle cx="10" cy="11.2" r="1.4" fill="#E11D48" />
+            <circle cx="14" cy="11.2" r="1.4" fill="#E11D48" />
+            <circle cx="12" cy="14" r="1.5" fill="#F43F5E" />
+            <circle cx="9.6" cy="15.8" r="1.3" fill="#E11D48" />
+            <circle cx="14.4" cy="15.8" r="1.3" fill="#E11D48" />
+          </svg>
+        </span>
+      );
+    case "apc":
+      return (
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 28 20" className="h-4.5 w-6" fill="none" aria-hidden="true">
+            <text
+              x="14"
+              y="12"
+              textAnchor="middle"
+              fill="#EF4444"
+              fontSize="10.5"
+              fontWeight="900"
+              fontStyle="italic"
+              fontFamily="system-ui, -apple-system, sans-serif"
+              letterSpacing="-0.4"
+            >
+              APC
+            </text>
+            <rect x="4" y="14.2" width="20" height="2" rx="1" fill="#10B981" />
           </svg>
         </span>
       );
     case "apple":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-slate-200">
-          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="currentColor">
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center text-slate-200">
+          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="currentColor" aria-hidden="true">
             <path d="M16.36 12.76c-.02-2.2 1.8-3.26 1.88-3.31-1.03-1.5-2.62-1.7-3.18-1.73-1.35-.14-2.64.8-3.32.8-.69 0-1.75-.78-2.88-.76-1.48.02-2.84.86-3.6 2.18-1.54 2.67-.39 6.62 1.1 8.78.73 1.05 1.6 2.24 2.74 2.2 1.1-.04 1.52-.71 2.85-.71 1.33 0 1.71.71 2.87.69 1.19-.02 1.94-1.07 2.66-2.13.84-1.22 1.18-2.41 1.2-2.47-.03-.01-2.3-.88-2.32-3.54ZM14.18 6.31c.6-.73 1.01-1.75.9-2.77-.87.04-1.93.58-2.55 1.31-.55.64-1.04 1.68-.91 2.67.97.08 1.96-.49 2.56-1.21Z" />
           </svg>
         </span>
       );
     case "cisco":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-cyan-400">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-            <path d="M3 13v-2M7 15V9M11 17V7M15 15V9M19 13v-2" />
-            <path d="M5 17c3.5-2.5 10.5-2.5 14 0" strokeWidth="1.5" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#00BCEB" strokeWidth="2.1" strokeLinecap="round" aria-hidden="true">
+            <path d="M3.5 13v-2M7.5 15V9M12 17V6M16.5 15V9M20.5 13v-2" />
+            <path d="M5 17.5c4-2.4 10-2.4 14 0" stroke="#38BDF8" strokeWidth="1.4" />
           </svg>
         </span>
       );
     case "proxmox":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-orange-400">
-          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M6 6l6 5 6-5" />
-            <path d="M6 18l6-5 6 5" />
-            <path d="M4 12h2M18 12h2" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#E57000" strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M6.5 5.5L12 10.2l5.5-4.7" />
+            <path d="M6.5 18.5L12 13.8l5.5 4.7" />
+            <path d="M4.2 9.2c1.4 1.6 1.4 4 0 5.6M19.8 9.2c-1.4 1.6-1.4 4 0 5.6" stroke="#CBD5E1" strokeWidth="1.9" />
           </svg>
         </span>
       );
     case "microsoft":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-sky-400">
-          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="currentColor">
-            <path d="M3 3h8.5v8.5H3V3Zm9.5 0H21v8.5h-8.5V3ZM3 12.5h8.5V21H3v-8.5Zm9.5 0H21V21h-8.5v-8.5Z" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" aria-hidden="true">
+            <rect x="3" y="3" width="8.2" height="8.2" fill="#F25022" />
+            <rect x="12.8" y="3" width="8.2" height="8.2" fill="#7FBA00" />
+            <rect x="3" y="12.8" width="8.2" height="8.2" fill="#00A4EF" />
+            <rect x="12.8" y="12.8" width="8.2" height="8.2" fill="#FFB900" />
           </svg>
         </span>
       );
     case "synology":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-amber-400">
-          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M16 7a5 5 0 0 0-8 0" />
-            <path d="M8 17a5 5 0 0 0 8 0" />
-            <path d="M8.5 10.5c0-1.2 1.6-2 3.5-2s3.5.8 3.5 2-1.6 1.7-3.5 1.7-3.5.7-3.5 1.8 1.6 2 3.5 2 3.5-.8 3.5-2" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#F59E0B" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M16.5 7.5a5.5 5.5 0 0 0-9 0" />
+            <path d="M7.5 16.5a5.5 5.5 0 0 0 9 0" />
+            <path d="M8.5 10.3c0-1.2 1.6-2 3.5-2s3.5.8 3.5 2-1.6 1.7-3.5 1.7-3.5.7-3.5 1.8 1.6 2 3.5 2 3.5-.8 3.5-2" />
           </svg>
-        </span>
-      );
-    case "linux":
-    case "raspberry":
-      return (
-        <span title={label} className="inline-flex items-center justify-center text-amber-300">
-          <Terminal className="h-4 w-4" />
         </span>
       );
     case "dell":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-sky-300">
-          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-            <circle cx="12" cy="12" r="9" />
-            <path d="M9 9.5v5h2a2.5 2.5 0 0 0 0-5H9Z" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" stroke="#007DB8" strokeWidth="2" />
+            <text
+              x="12"
+              y="14.5"
+              textAnchor="middle"
+              fill="#38BDF8"
+              fontSize="7"
+              fontWeight="800"
+              fontFamily="system-ui, sans-serif"
+            >
+              DELL
+            </text>
           </svg>
         </span>
       );
     case "aruba":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-orange-400">
-          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M4 18L12 5l8 13" />
-            <path d="M8 13.5h8" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#FF8300" strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M4.5 18.5L12 5l7.5 13.5" />
+            <path d="M8.2 13.5h7.6" />
           </svg>
         </span>
       );
     case "hp":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-cyan-300">
-          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-            <circle cx="12" cy="12" r="9" />
-            <path d="M9.5 7.5v9M9.5 12h3v4.5M15 12v6" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" stroke="#0096D6" strokeWidth="2" />
+            <path d="M9.5 7v10M9.5 12h3v5M14.8 12v6" stroke="#38BDF8" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
         </span>
       );
     case "fortinet":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-rose-400">
-          <ShieldCheck className="h-4 w-4" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="#EE3124" aria-hidden="true">
+            <rect x="3.5" y="5" width="4.5" height="3.2" rx="0.6" />
+            <rect x="9.75" y="5" width="4.5" height="3.2" rx="0.6" />
+            <rect x="16" y="5" width="4.5" height="3.2" rx="0.6" />
+            <rect x="3.5" y="10.4" width="4.5" height="3.2" rx="0.6" />
+            <rect x="16" y="10.4" width="4.5" height="3.2" rx="0.6" />
+            <rect x="3.5" y="15.8" width="4.5" height="3.2" rx="0.6" />
+            <rect x="9.75" y="15.8" width="4.5" height="3.2" rx="0.6" />
+            <rect x="16" y="15.8" width="4.5" height="3.2" rx="0.6" />
+          </svg>
         </span>
       );
     case "mikrotik":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-emerald-400">
-          <Router className="h-4 w-4" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#CBD5E1" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M4 16V8l4 4 4-4v8" />
+            <path d="M15 8v8M15 12l4.5-4M16.5 10.5L20 16" stroke="#38BDF8" />
+          </svg>
         </span>
       );
     case "vmware":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-indigo-400">
-          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <rect x="4" y="4" width="9" height="9" rx="1.5" />
-            <rect x="11" y="11" width="9" height="9" rx="1.5" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <rect x="4" y="4" width="9.5" height="9.5" rx="2" stroke="#0091DA" />
+            <rect x="10.5" y="10.5" width="9.5" height="9.5" rx="2" stroke="#00C1D5" />
           </svg>
         </span>
       );
     case "ups":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-amber-400">
-          <Zap className="h-4 w-4" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center text-amber-400">
+          <Zap className="h-4.5 w-4.5" />
         </span>
       );
     case "google":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-emerald-300">
-          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M19.5 12.5h-7.5" />
-            <path d="M17.5 16.5A7.5 7.5 0 1 1 18 7.8" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" aria-hidden="true">
+            <path d="M21 12.2c0-.7-.1-1.3-.2-2H12v3.8h5c-.2 1.2-.9 2.2-2 2.9v2.4h3.2c1.9-1.7 2.8-4.3 2.8-7.1Z" fill="#4285F4" />
+            <path d="M12 21.3c2.7 0 4.9-.9 6.5-2.4l-3.2-2.4c-.9.6-2 .9-3.3.9-2.5 0-4.7-1.7-5.5-4H3.2v2.5c1.6 3.2 5 5.4 8.8 5.4Z" fill="#34A853" />
+            <path d="M6.5 13.4c-.2-.6-.3-1.2-.3-1.9s.1-1.3.3-1.9V7.1H3.2C2.4 8.6 2 10.3 2 12s.4 3.4 1.2 4.9l3.3-2.5Z" fill="#FBBC05" />
+            <path d="M12 6.6c1.5 0 2.8.5 3.8 1.5l2.8-2.8C16.9 3.7 14.7 2.7 12 2.7c-3.8 0-7.2 2.2-8.8 5.4l3.3 2.5c.8-2.3 3-4 5.5-4Z" fill="#EA4335" />
           </svg>
         </span>
       );
     case "amazon":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-amber-400">
-          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M4 15c4.5 3.5 11.5 3.5 16 0" />
-            <path d="M18 13l2.5 1.8-.8 2.7" />
-            <path d="M9 11V7a3 3 0 0 1 6 0v4M9 9.5h6" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#FF9900" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M4 15.5c4.5 3.3 11.5 3.3 16 0" />
+            <path d="M17.5 13.5l2.8 1.7-.9 2.8" />
           </svg>
         </span>
       );
     case "samsung":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-indigo-300">
-          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-            <ellipse cx="12" cy="12" rx="9" ry="5" transform="rotate(-20 12 12)" />
-            <circle cx="12" cy="12" r="1.5" fill="currentColor" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+            <ellipse cx="12" cy="12" rx="9" ry="4.8" transform="rotate(-14 12 12)" stroke="#3B82F6" strokeWidth="2" />
+            <circle cx="12" cy="12" r="1.5" fill="#93C5FD" />
           </svg>
         </span>
       );
     case "intel":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-sky-400">
-          <Cpu className="h-4 w-4" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+            <ellipse cx="12" cy="12" rx="9.5" ry="6" transform="rotate(-12 12 12)" stroke="#0071C5" strokeWidth="1.9" />
+            <text x="12" y="14.2" textAnchor="middle" fill="#38BDF8" fontSize="6.8" fontWeight="700" fontFamily="system-ui, sans-serif">
+              intel
+            </text>
+          </svg>
         </span>
       );
     case "tplink":
+      return (
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#2DD4BF" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M12 4a8 8 0 0 1 8 8" />
+            <path d="M12 8v8M8 12h8" />
+            <circle cx="8" cy="16" r="2.2" />
+          </svg>
+        </span>
+      );
     case "netgear":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-teal-400">
-          <Network className="h-4 w-4" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center text-indigo-400">
+          <Network className="h-4.5 w-4.5" />
         </span>
       );
     case "storage":
       return (
-        <span title={label} className="inline-flex items-center justify-center text-violet-400">
-          <HardDrive className="h-4 w-4" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center text-sky-400">
+          <HardDrive className="h-4.5 w-4.5" />
         </span>
       );
+    case "icmp":
     default:
       return (
-        <span title={label} className="inline-flex items-center justify-center text-slate-500">
-          <Server className="h-4 w-4" />
+        <span title={label} className="inline-flex h-5 w-6 items-center justify-center text-slate-400">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="2" fill="currentColor" stroke="none" />
+            <path d="M8.5 8.5a5 5 0 0 0 0 7" />
+            <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+            <path d="M5.6 5.6a9 9 0 0 0 0 12.8" />
+            <path d="M18.4 5.6a9 9 0 0 1 0 12.8" />
+          </svg>
         </span>
       );
   }
