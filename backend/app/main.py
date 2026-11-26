@@ -451,6 +451,15 @@ class OverviewGraphSettingsPayload(BaseModel):
     selections: List[OverviewGraphDeviceSelection] = []
 
 
+class DeviceSettingsPayload(BaseModel):
+    custom_name: Optional[str] = None
+    custom_location: Optional[str] = None
+    custom_device_type: Optional[str] = None
+    notes: Optional[str] = None
+    snmp_enabled: Optional[bool] = None
+    snmp_profile_id: Optional[int] = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_pool, redis_client
@@ -3143,6 +3152,38 @@ def _classify_device_profile(
     return "server"
 
 
+_VALID_CUSTOM_DEVICE_TYPES = {
+    "router",
+    "switch",
+    "ap",
+    "firewall",
+    "server",
+    "nas",
+    "ups",
+    "printer",
+    "network",
+    "client",
+}
+
+
+def _role_to_profile_type(role: str) -> str:
+    """Maps a device_role override to its corresponding device_profile_type."""
+    r = (role or "").strip().lower()
+    if r == "ups":
+        return "ups"
+    if r in ("ap", "wireless"):
+        return "wireless"
+    if r == "nas":
+        return "nas"
+    if r == "printer":
+        return "printer"
+    if r == "server":
+        return "server"
+    if r == "client":
+        return "client"
+    return "network"
+
+
 def _classify_device_role(
     profile_type: str,
     snmp_sys: Optional[Dict[str, Any]],
@@ -3978,6 +4019,17 @@ async def get_all_devices() -> Dict[str, Any]:
             if r["source_ip"]:
                 all_dev_ips.append(str(r["source_ip"]).strip())
         dev_id_map = await ensure_device_ids(conn, all_dev_ips)
+        reg_rows = await conn.fetch(
+            """
+            SELECT ip_address, custom_name, custom_location, custom_device_type, notes
+            FROM device_registry
+            WHERE custom_name IS NOT NULL
+               OR custom_location IS NOT NULL
+               OR custom_device_type IS NOT NULL
+               OR notes IS NOT NULL
+            """
+        )
+        reg_overrides = {str(r["ip_address"]): dict(r) for r in reg_rows if r["ip_address"]}
 
     by_ip: Dict[str, Dict[str, Any]] = {}
 
@@ -4183,6 +4235,20 @@ async def get_all_devices() -> Dict[str, Any]:
                 interface_count=int(item.get("interface_count") or 0),
                 is_unifi_client=bool(item.get("is_unifi_client")),
             )
+
+        ovr = reg_overrides.get(item["ip_address"])
+        if ovr:
+            if ovr.get("custom_name"):
+                item["hostname"] = str(ovr["custom_name"]).strip()
+            if ovr.get("custom_location"):
+                item["sys_location"] = str(ovr["custom_location"]).strip()
+            ovr_type = str(ovr.get("custom_device_type") or "").strip().lower()
+            if ovr_type in _VALID_CUSTOM_DEVICE_TYPES:
+                item["device_role"] = ovr_type
+                item["device_profile_type"] = _role_to_profile_type(ovr_type)
+            if ovr.get("notes"):
+                item["notes"] = str(ovr["notes"])
+
         item["is_unifi_client"] = bool(item.get("is_unifi_client"))
         item.pop("has_ups_telemetry", None)
         item.pop("has_wireless_telemetry", None)
@@ -4296,6 +4362,15 @@ async def get_device_detail(device_ref: str) -> Dict[str, Any]:
             WHERE source_ip = $1
             ORDER BY time DESC
             LIMIT 100
+            """,
+            device_ip,
+        )
+
+        reg_row = await conn.fetchrow(
+            """
+            SELECT custom_name, custom_location, custom_device_type, notes
+            FROM device_registry
+            WHERE ip_address = $1
             """,
             device_ip,
         )
@@ -4490,11 +4565,39 @@ async def get_device_detail(device_ref: str) -> Dict[str, Any]:
             is_unifi_client=bool(unifi_cli_dict),
         )
 
+    reg_dict = dict(reg_row) if reg_row else {}
+    custom_name = str(reg_dict.get("custom_name") or "").strip() or None
+    custom_location = str(reg_dict.get("custom_location") or "").strip() or None
+    raw_custom_type = str(reg_dict.get("custom_device_type") or "").strip().lower()
+    custom_device_type = raw_custom_type if raw_custom_type in _VALID_CUSTOM_DEVICE_TYPES else None
+    notes_val = str(reg_dict.get("notes") or "") or None
+
+    if custom_name:
+        resolved_identity["hostname"] = custom_name
+    if custom_location:
+        resolved_identity["location"] = custom_location
+        if isinstance(snmp_sys_dict, dict):
+            snmp_sys_dict["sys_location"] = custom_location
+    if custom_device_type:
+        device_role = custom_device_type
+        device_profile_type = _role_to_profile_type(custom_device_type)
+
+    device_settings_out = {
+        "custom_name": custom_name,
+        "custom_location": custom_location,
+        "custom_device_type": custom_device_type,
+        "notes": notes_val,
+        "snmp_enabled": bool(snmp_cfg_dict.get("enabled")) if snmp_cfg_dict else False,
+        "snmp_configured": bool(snmp_cfg_dict),
+        "snmp_profile_id": snmp_cfg_dict.get("profile_id") if snmp_cfg_dict else None,
+    }
+
     return {
         "device_id": device_id,
         "ip_address": device_ip,
         "device_profile_type": device_profile_type,
         "device_role": device_role,
+        "device_settings": device_settings_out,
         "discovered_host": host_dict,
         "snmp_config": snmp_cfg_dict,
         "snmp_system": snmp_sys_dict,
@@ -4505,6 +4608,104 @@ async def get_device_detail(device_ref: str) -> Dict[str, Any]:
         "unifi_client": unifi_cli_dict,
         "recent_logs": [_serialize(r) for r in log_rows],
     }
+
+
+@app.put("/api/devices/{device_ref}/settings")
+async def update_device_settings(
+    device_ref: str,
+    payload: DeviceSettingsPayload,
+) -> Dict[str, Any]:
+    """Updates per-device name/location/type/notes overrides and SNMP polling enable/disable state."""
+    pool = _get_pool()
+    custom_name = (payload.custom_name or "").strip() or None
+    custom_location = (payload.custom_location or "").strip() or None
+    notes_val = (payload.notes or "").strip() or None
+    raw_type = (payload.custom_device_type or "").strip().lower()
+    if raw_type in ("", "auto"):
+        custom_device_type: Optional[str] = None
+    elif raw_type in _VALID_CUSTOM_DEVICE_TYPES:
+        custom_device_type = raw_type
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported device type override: {raw_type}",
+        )
+
+    snmp_changed = False
+    trigger_poll_now = False
+    async with pool.acquire() as conn:
+        device_id, device_ip = await _resolve_device_ref(conn, device_ref)
+        await ensure_device_ids(conn, [device_ip])
+        await conn.execute(
+            """
+            UPDATE device_registry
+            SET custom_name = $2,
+                custom_location = $3,
+                custom_device_type = $4,
+                notes = $5
+            WHERE ip_address = $1
+            """,
+            device_ip,
+            custom_name,
+            custom_location,
+            custom_device_type,
+            notes_val,
+        )
+
+        if payload.snmp_enabled is not None:
+            existing_target = await conn.fetchrow(
+                "SELECT id, profile_id, label, enabled FROM snmp_targets_config WHERE device_ip = $1",
+                device_ip,
+            )
+            if existing_target:
+                new_profile_id = (
+                    payload.snmp_profile_id
+                    if payload.snmp_profile_id is not None
+                    else existing_target["profile_id"]
+                )
+                new_label = custom_name if custom_name is not None else (existing_target["label"] or "")
+                await conn.execute(
+                    """
+                    UPDATE snmp_targets_config
+                    SET enabled = $2,
+                        profile_id = $3,
+                        label = $4
+                    WHERE id = $1
+                    """,
+                    existing_target["id"],
+                    bool(payload.snmp_enabled),
+                    new_profile_id,
+                    new_label,
+                )
+                snmp_changed = True
+                if payload.snmp_enabled and not existing_target["enabled"]:
+                    trigger_poll_now = True
+            elif payload.snmp_enabled:
+                chosen_profile_id = payload.snmp_profile_id
+                if chosen_profile_id is None:
+                    chosen_profile_id = await conn.fetchval(
+                        "SELECT id FROM snmp_profiles ORDER BY id ASC LIMIT 1"
+                    )
+                await conn.execute(
+                    """
+                    INSERT INTO snmp_targets_config (device_ip, label, profile_id, enabled)
+                    VALUES ($1, $2, $3, TRUE)
+                    """,
+                    device_ip,
+                    custom_name or device_ip,
+                    chosen_profile_id,
+                )
+                snmp_changed = True
+                trigger_poll_now = True
+
+        target_ref = str(device_id) if device_id is not None else device_ip
+
+    if snmp_changed:
+        await _notify_worker("reload_config")
+        if trigger_poll_now:
+            await _notify_worker("snmp_now")
+
+    return await get_device_detail(target_ref)
 
 
 @app.delete("/api/devices/{device_ref}")

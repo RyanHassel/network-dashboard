@@ -58,29 +58,39 @@ const TAB_PATHS: Record<TabKey, string> = {
   settings: "/settings",
 };
 
-function parseAppRoute(pathname: string): { tab: TabKey; deviceRef: string | null } {
+function parseAppRoute(pathname: string): {
+  tab: TabKey;
+  deviceRef: string | null;
+  deviceSettings: boolean;
+} {
   const clean = (pathname || "/").replace(/\/+$/, "") || "/";
   if (clean === "/" || clean === "/overview" || clean === "/pulse") {
-    return { tab: "pulse", deviceRef: null };
+    return { tab: "pulse", deviceRef: null, deviceSettings: false };
   }
   if (clean === "/devices") {
-    return { tab: "devices", deviceRef: null };
+    return { tab: "devices", deviceRef: null, deviceSettings: false };
   }
   if (clean.startsWith("/devices/")) {
-    const rawRef = clean.slice("/devices/".length).split("/")[0] || "";
+    const segs = clean
+      .slice("/devices/".length)
+      .split("/")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const rawRef = segs[0] || "";
+    const isSettings = segs[1] === "settings";
     try {
       const decoded = decodeURIComponent(rawRef).trim();
-      return { tab: "devices", deviceRef: decoded || null };
+      return { tab: "devices", deviceRef: decoded || null, deviceSettings: Boolean(decoded && isSettings) };
     } catch {
-      return { tab: "devices", deviceRef: rawRef.trim() || null };
+      return { tab: "devices", deviceRef: rawRef || null, deviceSettings: Boolean(rawRef && isSettings) };
     }
   }
-  if (clean === "/snmp") return { tab: "snmp", deviceRef: null };
-  if (clean === "/scanner") return { tab: "scanner", deviceRef: null };
-  if (clean === "/syslog") return { tab: "syslog", deviceRef: null };
-  if (clean === "/targets") return { tab: "targets", deviceRef: null };
-  if (clean === "/settings") return { tab: "settings", deviceRef: null };
-  return { tab: "pulse", deviceRef: null };
+  if (clean === "/snmp") return { tab: "snmp", deviceRef: null, deviceSettings: false };
+  if (clean === "/scanner") return { tab: "scanner", deviceRef: null, deviceSettings: false };
+  if (clean === "/syslog") return { tab: "syslog", deviceRef: null, deviceSettings: false };
+  if (clean === "/targets") return { tab: "targets", deviceRef: null, deviceSettings: false };
+  if (clean === "/settings") return { tab: "settings", deviceRef: null, deviceSettings: false };
+  return { tab: "pulse", deviceRef: null, deviceSettings: false };
 }
 
 function isModifiedClick(e: React.MouseEvent): boolean {
@@ -392,6 +402,7 @@ interface UnifiedDeviceItem {
   uptime_sec: number | null;
   sources: string[];
   is_unifi_client?: boolean;
+  notes?: string | null;
   log_count_24h: number;
   last_seen: string | null;
 }
@@ -894,6 +905,15 @@ interface DeviceDetailPayload {
   } | null;
   device_profile_type?: "ups" | "wireless" | "nas" | "printer" | "network" | "server" | "client" | string;
   device_role?: string | null;
+  device_settings?: {
+    custom_name: string | null;
+    custom_location: string | null;
+    custom_device_type: string | null;
+    notes: string | null;
+    snmp_enabled: boolean;
+    snmp_configured: boolean;
+    snmp_profile_id: number | null;
+  };
   matched_mib_profile?: {
     vendor_name?: string;
     vendor?: string;
@@ -2488,6 +2508,22 @@ export const App: React.FC = () => {
   selectedDeviceRefRef.current = selectedDeviceRef;
   const selectedDeviceDetailIpRef = useRef<string | null>(selectedDeviceDetailIp);
   selectedDeviceDetailIpRef.current = selectedDeviceDetailIp;
+  const [deviceSettingsOpen, setDeviceSettingsOpen] = useState<boolean>(
+    initialRoute.deviceSettings,
+  );
+  const deviceSettingsOpenRef = useRef<boolean>(deviceSettingsOpen);
+  deviceSettingsOpenRef.current = deviceSettingsOpen;
+  const [devSetName, setDevSetName] = useState("");
+  const [devSetLocation, setDevSetLocation] = useState("");
+  const [devSetType, setDevSetType] = useState("auto");
+  const [devSetNotes, setDevSetNotes] = useState("");
+  const [devSetSnmpEnabled, setDevSetSnmpEnabled] = useState(false);
+  const [devSetSnmpProfileId, setDevSetSnmpProfileId] = useState<number | null>(null);
+  const [savingDeviceSettings, setSavingDeviceSettings] = useState(false);
+  const [deviceSettingsFeedback, setDeviceSettingsFeedback] = useState<{
+    type: "ok" | "err";
+    text: string;
+  } | null>(null);
   const [deviceDetail, setDeviceDetail] = useState<DeviceDetailPayload | null>(null);
   const [loadingDeviceDetail, setLoadingDeviceDetail] = useState(false);
   const [deviceDetailError, setDeviceDetailError] = useState<string | null>(null);
@@ -2863,7 +2899,9 @@ export const App: React.FC = () => {
 
         if (data.device_id != null) {
           const canonicalRef = String(data.device_id);
-          const canonicalPath = `/devices/${canonicalRef}`;
+          const canonicalPath = deviceSettingsOpenRef.current
+            ? `/devices/${canonicalRef}/settings`
+            : `/devices/${canonicalRef}`;
           const activeRef = selectedDeviceRefRef.current;
           const activeIp = selectedDeviceDetailIpRef.current;
           const matchesActiveDevice =
@@ -2956,8 +2994,11 @@ export const App: React.FC = () => {
     }
     const nextRoute = parseAppRoute(targetPath);
     selectedDeviceRefRef.current = nextRoute.deviceRef;
+    deviceSettingsOpenRef.current = nextRoute.deviceSettings;
     setActiveTab(nextRoute.tab);
     setSelectedDeviceRef(nextRoute.deviceRef);
+    setDeviceSettingsOpen(nextRoute.deviceSettings);
+    setDeviceSettingsFeedback(null);
     setNavMenuOpen(false);
     if (!nextRoute.deviceRef) {
       deviceDetailReqIdRef.current += 1;
@@ -3089,6 +3130,47 @@ export const App: React.FC = () => {
       }
     } finally {
       setRemovingDeviceIp(null);
+    }
+  };
+
+  const handleSaveDeviceSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const targetRef = selectedDeviceRef || activeDetailIp;
+    if (!targetRef) return;
+    setSavingDeviceSettings(true);
+    setDeviceSettingsFeedback(null);
+    try {
+      const r = await fetch(`/api/devices/${encodeURIComponent(targetRef)}/settings`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          custom_name: devSetName.trim(),
+          custom_location: devSetLocation.trim(),
+          custom_device_type: devSetType,
+          notes: devSetNotes,
+          snmp_enabled: devSetSnmpEnabled,
+          snmp_profile_id: devSetSnmpProfileId,
+        }),
+      });
+      if (r.ok) {
+        const updated: DeviceDetailPayload = await r.json();
+        setDeviceDetail(updated);
+        setDeviceSettingsFeedback({ type: "ok", text: "Device settings saved." });
+        await Promise.all([fetchAllDevices(), fetchConfig()]);
+      } else {
+        let msg = `Failed to save device settings (HTTP ${r.status}).`;
+        try {
+          const err = await r.json();
+          if (err?.detail) msg = String(err.detail);
+        } catch {
+          // ignore
+        }
+        setDeviceSettingsFeedback({ type: "err", text: msg });
+      }
+    } catch {
+      setDeviceSettingsFeedback({ type: "err", text: "Unable to save device settings." });
+    } finally {
+      setSavingDeviceSettings(false);
     }
   };
 
@@ -3894,12 +3976,33 @@ export const App: React.FC = () => {
   ]);
 
   useEffect(() => {
+    const ds = deviceDetail?.device_settings;
+    if (!deviceDetail) return;
+    setDevSetName(ds?.custom_name || "");
+    setDevSetLocation(ds?.custom_location || "");
+    setDevSetType(ds?.custom_device_type || "auto");
+    setDevSetNotes(ds?.notes || "");
+    setDevSetSnmpEnabled(
+      ds?.snmp_configured ? Boolean(ds.snmp_enabled) : Boolean(deviceDetail.snmp_config?.enabled),
+    );
+    setDevSetSnmpProfileId(
+      ds?.snmp_profile_id ??
+        deviceDetail.snmp_config?.profile_id ??
+        config?.snmp_profiles?.[0]?.id ??
+        null,
+    );
+  }, [deviceDetail]);
+
+  useEffect(() => {
     const onPopState = () => {
       const nextRoute = parseAppRoute(window.location.pathname);
       selectedDeviceRefRef.current = nextRoute.deviceRef;
+      deviceSettingsOpenRef.current = nextRoute.deviceSettings;
       setActiveTab(nextRoute.tab);
       setNavMenuOpen(false);
       setSelectedDeviceRef(nextRoute.deviceRef);
+      setDeviceSettingsOpen(nextRoute.deviceSettings);
+      setDeviceSettingsFeedback(null);
       if (!nextRoute.deviceRef) {
         deviceDetailReqIdRef.current += 1;
         selectedDeviceDetailIpRef.current = null;
@@ -6723,6 +6826,18 @@ export const App: React.FC = () => {
                       <span className="inline-flex items-center gap-1 rounded border border-slate-700 bg-slate-800/80 px-2 py-0.5 text-[11px] font-medium text-slate-300">
                         <Monitor className="h-3 w-3" /> UniFi Client
                       </span>
+                    ) : deviceDetail?.device_role === "router" ? (
+                      <span className="inline-flex items-center gap-1 rounded border border-emerald-500/30 bg-emerald-500/15 px-2 py-0.5 text-[11px] font-medium text-emerald-300">
+                        <Router className="h-3 w-3" /> Router / Gateway
+                      </span>
+                    ) : deviceDetail?.device_role === "switch" ? (
+                      <span className="inline-flex items-center gap-1 rounded border border-sky-500/30 bg-sky-500/15 px-2 py-0.5 text-[11px] font-medium text-sky-300">
+                        <Network className="h-3 w-3" /> Network Switch
+                      </span>
+                    ) : deviceDetail?.device_role === "firewall" ? (
+                      <span className="inline-flex items-center gap-1 rounded border border-rose-500/30 bg-rose-500/15 px-2 py-0.5 text-[11px] font-medium text-rose-300">
+                        <ShieldCheck className="h-3 w-3" /> Firewall
+                      </span>
                     ) : (
                       <span className="inline-flex items-center gap-1 rounded border border-cyan-500/30 bg-cyan-500/15 px-2 py-0.5 text-[11px] font-medium text-cyan-300">
                         <Network className="h-3 w-3" /> Network Device
@@ -6743,7 +6858,7 @@ export const App: React.FC = () => {
                 </div>
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
                   onClick={() => selectedDeviceRef && fetchDeviceDetail(selectedDeviceRef, false)}
@@ -6754,7 +6869,7 @@ export const App: React.FC = () => {
                   <RefreshCw className={`h-3.5 w-3.5 ${loadingDeviceDetail ? "animate-spin" : ""}`} />
                   <span>{loadingDeviceDetail ? "Refreshing..." : "Refresh"}</span>
                 </button>
-                {!deviceDetail?.snmp_config ? (
+                {!deviceDetail?.snmp_config && (
                   <button
                     disabled={!activeDetailIp}
                     onClick={() =>
@@ -6768,14 +6883,30 @@ export const App: React.FC = () => {
                   >
                     <Plus className="h-3.5 w-3.5" /> Enable SNMP Polling on This Device
                   </button>
+                )}
+                {deviceSettingsOpen ? (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      selectedDeviceRef &&
+                      navigateToPath(`/devices/${encodeURIComponent(selectedDeviceRef)}`)
+                    }
+                    className="flex items-center gap-1.5 rounded-md border border-emerald-500/40 bg-emerald-500/15 px-3 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/25"
+                  >
+                    <ArrowLeft className="h-3.5 w-3.5" /> Back to Telemetry
+                  </button>
                 ) : (
                   <button
-                    onClick={() => activeDetailIp && handlePollSingleDeviceNow(activeDetailIp)}
-                    disabled={pollingDeviceNow || !activeDetailIp}
-                    className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
+                    type="button"
+                    disabled={!selectedDeviceRef}
+                    onClick={() =>
+                      selectedDeviceRef &&
+                      navigateToPath(`/devices/${encodeURIComponent(selectedDeviceRef)}/settings`)
+                    }
+                    className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800 disabled:opacity-50"
+                    title="Configure device name, location, type override, notes, and SNMP polling"
                   >
-                    <RefreshCw className={`h-3.5 w-3.5 ${pollingDeviceNow ? "animate-spin" : ""}`} />
-                    <span>{pollingDeviceNow ? "Polling SNMP..." : "Poll SNMP Now"}</span>
+                    <Settings className="h-3.5 w-3.5" /> Settings
                   </button>
                 )}
               </div>
@@ -6803,8 +6934,261 @@ export const App: React.FC = () => {
                   <ArrowLeft className="h-3.5 w-3.5" /> Return to Devices
                 </a>
               </div>
+            ) : deviceSettingsOpen ? (
+              <form onSubmit={handleSaveDeviceSettings} className="space-y-6">
+                {deviceSettingsFeedback && (
+                  <div
+                    className={`flex items-center justify-between rounded-lg border px-4 py-2.5 text-xs ${
+                      deviceSettingsFeedback.type === "ok"
+                        ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                        : "border-rose-500/40 bg-rose-500/10 text-rose-300"
+                    }`}
+                  >
+                    <span>{deviceSettingsFeedback.text}</span>
+                    <button
+                      type="button"
+                      onClick={() => setDeviceSettingsFeedback(null)}
+                      className="text-slate-400 hover:text-white"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+                  {/* Device Identity Overrides & Notes */}
+                  <div className="rounded-xl border border-slate-800 bg-[#111827] p-5 space-y-4">
+                    <div>
+                      <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
+                        <Edit3 className="h-4 w-4 text-emerald-400" />
+                        Device Identity, Type &amp; Notes
+                      </h3>
+                      <p className="mt-0.5 text-xs text-slate-400">
+                        Override auto-detected device metadata or record maintenance notes. Leave a
+                        field blank or choose Auto-Detect to use polled values.
+                      </p>
+                    </div>
+
+                    <div className="space-y-3">
+                      <div>
+                        <label className="mb-1 block text-[11px] font-medium text-slate-400">
+                          Device Name Override
+                        </label>
+                        <input
+                          type="text"
+                          value={devSetName}
+                          onChange={(e) => setDevSetName(e.target.value)}
+                          placeholder={
+                            deviceDetail?.snmp_system?.sys_name ||
+                            deviceDetail?.discovered_host?.hostname ||
+                            activeDetailIp ||
+                            "Auto-detected name"
+                          }
+                          className="w-full rounded-md border border-slate-700 bg-[#090D16] px-3 py-2 text-xs text-white placeholder:text-slate-500 focus:border-emerald-500 focus:outline-none"
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                        <div>
+                          <label className="mb-1 block text-[11px] font-medium text-slate-400">
+                            Location Override
+                          </label>
+                          <input
+                            type="text"
+                            value={devSetLocation}
+                            onChange={(e) => setDevSetLocation(e.target.value)}
+                            placeholder={
+                              deviceDetail?.snmp_system?.sys_location || "e.g. Server Rack / Closet"
+                            }
+                            className="w-full rounded-md border border-slate-700 bg-[#090D16] px-3 py-2 text-xs text-white placeholder:text-slate-500 focus:border-emerald-500 focus:outline-none"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="mb-1 block text-[11px] font-medium text-slate-400">
+                            Device Type
+                          </label>
+                          <select
+                            value={devSetType}
+                            onChange={(e) => setDevSetType(e.target.value)}
+                            className="w-full rounded-md border border-slate-700 bg-[#090D16] px-3 py-2 text-xs text-white focus:border-emerald-500 focus:outline-none"
+                          >
+                            <option value="auto">Auto-Detect (From Telemetry)</option>
+                            <option value="router">Router / Gateway</option>
+                            <option value="switch">Switch</option>
+                            <option value="ap">Wi-Fi AP / Wireless</option>
+                            <option value="firewall">Firewall / Security</option>
+                            <option value="server">Server / Host</option>
+                            <option value="nas">NAS / Storage</option>
+                            <option value="ups">UPS / Battery Backup</option>
+                            <option value="printer">Printer</option>
+                            <option value="network">Network Device</option>
+                            <option value="client">Client</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="mb-1 block text-[11px] font-medium text-slate-400">
+                          Notes
+                        </label>
+                        <textarea
+                          rows={4}
+                          value={devSetNotes}
+                          onChange={(e) => setDevSetNotes(e.target.value)}
+                          placeholder="Rack location, switch port patch notes, credentials reminder, maintenance log..."
+                          className="w-full rounded-md border border-slate-700 bg-[#090D16] px-3 py-2 text-xs text-white placeholder:text-slate-500 focus:border-emerald-500 focus:outline-none"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* SNMP Polling Controls */}
+                  <div className="rounded-xl border border-slate-800 bg-[#111827] p-5 flex flex-col justify-between space-y-5">
+                    <div className="space-y-4">
+                      <div>
+                        <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
+                          <Settings className="h-4 w-4 text-sky-400" />
+                          SNMP Polling &amp; Immediate Actions
+                        </h3>
+                        <p className="mt-0.5 text-xs text-slate-400">
+                          Enable or pause scheduled SNMP telemetry collection for{" "}
+                          <span className="font-mono-tabular text-slate-200">{activeDetailIp}</span>
+                          .
+                        </p>
+                      </div>
+
+                      <div className="flex items-center justify-between rounded-lg border border-slate-800 bg-[#090D16] px-4 py-3">
+                        <div>
+                          <div className="text-xs font-medium text-white">SNMP Polling Enabled</div>
+                          <div className="text-[11px] text-slate-400">
+                            {devSetSnmpEnabled
+                              ? "Worker actively polls this host on its SNMP profile interval."
+                              : "Scheduled SNMP polling is disabled for this device."}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={devSetSnmpEnabled}
+                          onClick={() => setDevSetSnmpEnabled((prev) => !prev)}
+                          className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full border transition-colors ${
+                            devSetSnmpEnabled
+                              ? "border-emerald-500/60 bg-emerald-600"
+                              : "border-slate-700 bg-slate-800"
+                          }`}
+                        >
+                          <span
+                            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                              devSetSnmpEnabled ? "translate-x-6" : "translate-x-1"
+                            }`}
+                          />
+                        </button>
+                      </div>
+
+                      {(config?.snmp_profiles || []).length > 0 && (
+                        <div>
+                          <label className="mb-1 block text-[11px] font-medium text-slate-400">
+                            SNMP Credential Profile
+                          </label>
+                          <select
+                            value={devSetSnmpProfileId ?? ""}
+                            onChange={(e) =>
+                              setDevSetSnmpProfileId(
+                                e.target.value ? Number(e.target.value) : null,
+                              )
+                            }
+                            className="w-full rounded-md border border-slate-700 bg-[#090D16] px-3 py-2 text-xs text-white focus:border-emerald-500 focus:outline-none"
+                          >
+                            {(config?.snmp_profiles || []).map((prof) => (
+                              <option key={prof.id} value={prof.id}>
+                                {prof.name} ({prof.version.toUpperCase()} • {prof.poll_interval}s)
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+
+                      <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3.5">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div>
+                            <div className="text-xs font-medium text-white">On-Demand SNMP Poll</div>
+                            <div className="text-[11px] text-slate-400">
+                              Run an immediate SNMP walk outside the normal schedule.
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => activeDetailIp && handlePollSingleDeviceNow(activeDetailIp)}
+                            disabled={
+                              pollingDeviceNow ||
+                              !activeDetailIp ||
+                              !deviceDetail?.snmp_config?.enabled
+                            }
+                            className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
+                            title={
+                              deviceDetail?.snmp_config?.enabled
+                                ? "Trigger immediate SNMP poll for this device"
+                                : "Save with SNMP Polling Enabled first"
+                            }
+                          >
+                            <RefreshCw
+                              className={`h-3.5 w-3.5 ${pollingDeviceNow ? "animate-spin" : ""}`}
+                            />
+                            <span>{pollingDeviceNow ? "Polling SNMP..." : "Poll SNMP Now"}</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-end gap-2 border-t border-slate-800 pt-4">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          selectedDeviceRef &&
+                          navigateToPath(`/devices/${encodeURIComponent(selectedDeviceRef)}`)
+                        }
+                        className="rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-800"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="submit"
+                        disabled={savingDeviceSettings}
+                        className="rounded-md bg-emerald-600 px-4 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
+                      >
+                        {savingDeviceSettings ? "Saving..." : "Save Device Settings"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </form>
             ) : (
               <>
+                {deviceDetail?.device_settings?.notes && (
+                  <div className="rounded-xl border border-slate-800 bg-[#111827] px-5 py-3.5">
+                    <div className="mb-1 flex items-center justify-between">
+                      <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                        Device Notes
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          selectedDeviceRef &&
+                          navigateToPath(
+                            `/devices/${encodeURIComponent(selectedDeviceRef)}/settings`,
+                          )
+                        }
+                        className="text-[11px] font-medium text-emerald-400 hover:text-emerald-300"
+                      >
+                        Edit Notes
+                      </button>
+                    </div>
+                    <p className="whitespace-pre-wrap text-xs text-slate-200">
+                      {deviceDetail.device_settings.notes}
+                    </p>
+                  </div>
+                )}
                 {/* Identity & SNMP System Summary Cards */}
                 <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
                   {/* Card 1: Network Discovery & L2/L3 Identity */}

@@ -17,6 +17,11 @@ CREATE TABLE IF NOT EXISTS device_registry (
 CREATE INDEX IF NOT EXISTS idx_device_registry_ip
     ON device_registry (ip_address);
 
+ALTER TABLE device_registry ADD COLUMN IF NOT EXISTS custom_name TEXT;
+ALTER TABLE device_registry ADD COLUMN IF NOT EXISTS custom_location TEXT;
+ALTER TABLE device_registry ADD COLUMN IF NOT EXISTS custom_device_type TEXT;
+ALTER TABLE device_registry ADD COLUMN IF NOT EXISTS notes TEXT;
+
 CREATE TABLE IF NOT EXISTS app_settings (
     key        TEXT PRIMARY KEY,
     value      JSONB NOT NULL DEFAULT '{}'::jsonb,
