@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Tuple
 
 import asyncpg
 
@@ -202,12 +202,26 @@ CREATE INDEX IF NOT EXISTS idx_icmp_metrics_raw_dev_time
 """
 
 
+_DEVICE_ID_LOCK_KEY = 7842101
+
+
+def _compute_compacted_id_updates(rows: List[Tuple[int, str]]) -> List[Tuple[int, int]]:
+    """Returns (old_id, new_id) pairs to compact jumped device_registry IDs without shifting earlier IDs."""
+    updates: List[Tuple[int, int]] = []
+    expected = 0
+    for row_id, _ip in rows:
+        expected += 1
+        if int(row_id) > expected:
+            updates.append((int(row_id), expected))
+    return updates
+
+
 async def ensure_device_ids(
     conn: asyncpg.Connection,
     ips: Iterable[str],
     touch_last_seen: bool = False,
 ) -> Dict[str, int]:
-    """Ensures every IP has a persistent integer ID in device_registry and returns {ip: id}."""
+    """Ensures every IP has a persistent, sequential (+1) ID in device_registry and returns {ip: id}."""
     cleaned: List[str] = []
     seen: set = set()
     for raw in ips:
@@ -220,75 +234,170 @@ async def ensure_device_ids(
     if not cleaned:
         return {}
 
-    if touch_last_seen:
-        await conn.execute(
-            """
-            INSERT INTO device_registry (ip_address, first_seen, last_seen)
-            SELECT ip, NOW(), NOW()
-            FROM UNNEST($1::text[]) AS t(ip)
-            ON CONFLICT (ip_address) DO UPDATE SET
-                last_seen = NOW()
-            """,
-            cleaned,
-        )
-    else:
-        await conn.execute(
-            """
-            INSERT INTO device_registry (ip_address, first_seen, last_seen)
-            SELECT ip, NOW(), NOW()
-            FROM UNNEST($1::text[]) AS t(ip)
-            ON CONFLICT (ip_address) DO NOTHING
-            """,
-            cleaned,
-        )
-
     rows = await conn.fetch(
         "SELECT id, ip_address FROM device_registry WHERE ip_address = ANY($1::text[])",
         cleaned,
     )
-    return {str(r["ip_address"]): int(r["id"]) for r in rows}
+    id_map: Dict[str, int] = {str(r["ip_address"]): int(r["id"]) for r in rows}
+
+    if touch_last_seen:
+        existing_ips = [ip for ip in cleaned if ip in id_map]
+        if existing_ips:
+            await conn.execute(
+                "UPDATE device_registry SET last_seen = NOW() WHERE ip_address = ANY($1::text[])",
+                existing_ips,
+            )
+
+    missing = [ip for ip in cleaned if ip not in id_map]
+    if missing:
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", _DEVICE_ID_LOCK_KEY)
+            recheck_rows = await conn.fetch(
+                "SELECT id, ip_address FROM device_registry WHERE ip_address = ANY($1::text[])",
+                missing,
+            )
+            for r in recheck_rows:
+                id_map[str(r["ip_address"])] = int(r["id"])
+
+            still_missing = [ip for ip in missing if ip not in id_map]
+            if still_missing:
+                next_id = int(
+                    await conn.fetchval(
+                        "SELECT COALESCE(MAX(id), 0) FROM device_registry"
+                    )
+                    or 0
+                )
+                for ip_str in still_missing:
+                    next_id += 1
+                    await conn.execute(
+                        """
+                        INSERT INTO device_registry (id, ip_address, first_seen, last_seen)
+                        VALUES ($1, $2, NOW(), NOW())
+                        ON CONFLICT (ip_address) DO NOTHING
+                        """,
+                        next_id,
+                        ip_str,
+                    )
+                    id_map[ip_str] = next_id
+
+                await conn.execute(
+                    """
+                    SELECT setval(
+                        pg_get_serial_sequence('device_registry', 'id'),
+                        COALESCE((SELECT MAX(id) FROM device_registry), 1),
+                        (SELECT COUNT(*) > 0 FROM device_registry)
+                    )
+                    """
+                )
+
+    return id_map
 
 
 async def backfill_device_registry(conn: asyncpg.Connection) -> None:
-    """Backfills device_registry with all previously discovered/managed devices in stable order."""
+    """Backfills device_registry with any unregistered devices in stable sequential order."""
     try:
-        await conn.execute(
+        missing_rows = await conn.fetch(
             """
             WITH all_ips AS (
-                SELECT host(ip_address) AS ip, COALESCE(first_seen, NOW()) AS fs, COALESCE(last_seen, NOW()) AS ls
+                SELECT host(ip_address) AS ip, COALESCE(first_seen, NOW()) AS fs
                 FROM discovered_hosts
                 UNION ALL
-                SELECT device_ip AS ip, COALESCE(created_at, NOW()) AS fs, NOW() AS ls
+                SELECT device_ip AS ip, COALESCE(created_at, NOW()) AS fs
                 FROM snmp_targets_config
                 WHERE device_ip IS NOT NULL AND device_ip != ''
                 UNION ALL
-                SELECT device_ip AS ip, COALESCE(first_polled, last_polled, NOW()) AS fs, COALESCE(last_polled, NOW()) AS ls
+                SELECT device_ip AS ip, COALESCE(created_at, NOW()) AS fs
+                FROM icmp_targets_config
+                WHERE device_ip IS NOT NULL AND device_ip != ''
+                UNION ALL
+                SELECT device_ip AS ip, COALESCE(first_polled, last_polled, NOW()) AS fs
                 FROM snmp_devices
                 WHERE device_ip IS NOT NULL AND device_ip != ''
                 UNION ALL
-                SELECT lan_ip AS ip, COALESCE(last_seen, NOW()) AS fs, COALESCE(last_seen, NOW()) AS ls
+                SELECT lan_ip AS ip, COALESCE(last_seen, NOW()) AS fs
                 FROM unifi_devices
                 WHERE lan_ip IS NOT NULL AND lan_ip != ''
                 UNION ALL
-                SELECT ip_address AS ip, COALESCE(last_seen, NOW()) AS fs, COALESCE(last_seen, NOW()) AS ls
+                SELECT ip_address AS ip, COALESCE(last_seen, NOW()) AS fs
                 FROM unifi_devices
                 WHERE ip_address IS NOT NULL AND ip_address != ''
                 UNION ALL
-                SELECT ip_address AS ip, COALESCE(last_seen, NOW()) AS fs, COALESCE(last_seen, NOW()) AS ls
+                SELECT ip_address AS ip, COALESCE(last_seen, NOW()) AS fs
                 FROM unifi_clients
                 WHERE ip_address IS NOT NULL AND ip_address != ''
             )
-            INSERT INTO device_registry (ip_address, first_seen, last_seen)
-            SELECT ip, MIN(fs), MAX(ls)
-            FROM all_ips
-            WHERE ip IS NOT NULL AND TRIM(ip) != ''
-            GROUP BY ip
-            ORDER BY MIN(fs) ASC, ip ASC
-            ON CONFLICT (ip_address) DO NOTHING
+            SELECT TRIM(a.ip) AS ip
+            FROM all_ips a
+            WHERE a.ip IS NOT NULL
+              AND TRIM(a.ip) != ''
+              AND NOT EXISTS (
+                  SELECT 1 FROM device_registry d WHERE d.ip_address = TRIM(a.ip)
+              )
+            GROUP BY TRIM(a.ip)
+            ORDER BY MIN(a.fs) ASC, TRIM(a.ip) ASC
             """
         )
+        if missing_rows:
+            await ensure_device_ids(
+                conn,
+                [str(r["ip"]) for r in missing_rows if r["ip"]],
+                touch_last_seen=False,
+            )
     except Exception as exc:
         logger.warning("device_registry backfill skipped: %s", exc)
+
+
+async def repair_jumped_device_ids(conn: asyncpg.Connection) -> None:
+    """Compacts any sequence-jumped gaps in device_registry once and resyncs sequence."""
+    try:
+        marker = await conn.fetchval(
+            "SELECT 1 FROM app_settings WHERE key = 'device_id_gap_repair_v1'"
+        )
+        if marker:
+            return
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", _DEVICE_ID_LOCK_KEY)
+            marker2 = await conn.fetchval(
+                "SELECT 1 FROM app_settings WHERE key = 'device_id_gap_repair_v1'"
+            )
+            if marker2:
+                return
+            rows = await conn.fetch(
+                "SELECT id, ip_address FROM device_registry ORDER BY id ASC"
+            )
+            updates = _compute_compacted_id_updates(
+                [(int(r["id"]), str(r["ip_address"])) for r in rows]
+            )
+            for old_id, new_id in updates:
+                await conn.execute(
+                    "UPDATE device_registry SET id = $1 WHERE id = $2",
+                    new_id,
+                    old_id,
+                )
+            await conn.execute(
+                """
+                SELECT setval(
+                    pg_get_serial_sequence('device_registry', 'id'),
+                    COALESCE((SELECT MAX(id) FROM device_registry), 1),
+                    (SELECT COUNT(*) > 0 FROM device_registry)
+                )
+                """
+            )
+            await conn.execute(
+                """
+                INSERT INTO app_settings (key, value)
+                VALUES ('device_id_gap_repair_v1', $1::jsonb)
+                ON CONFLICT (key) DO NOTHING
+                """,
+                json.dumps({"repaired_count": len(updates)}),
+            )
+            if updates:
+                logger.info(
+                    "Compacted %d jumped device_registry ID(s) sequentially.",
+                    len(updates),
+                )
+    except Exception as exc:
+        logger.warning("device_registry ID compaction skipped: %s", exc)
 
 
 async def ensure_dynamic_config_tables(pool: asyncpg.Pool) -> None:
@@ -296,6 +405,7 @@ async def ensure_dynamic_config_tables(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
         await conn.execute(DYNAMIC_CONFIG_DDL)
         await backfill_device_registry(conn)
+        await repair_jumped_device_ids(conn)
 
         for tbl, ret_days in (
             ("snmp_poll_metrics", 30),
