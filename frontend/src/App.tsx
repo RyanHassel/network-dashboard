@@ -672,9 +672,29 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
     case "cisco":
       return (
         <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="#00BCEB" strokeWidth="2.1" strokeLinecap="round" aria-hidden="true">
-            <path d="M3.5 13v-2M7.5 15V9M12 17V6M16.5 15V9M20.5 13v-2" />
-            <path d="M5 17.5c4-2.4 10-2.4 14 0" stroke="#38BDF8" strokeWidth="1.4" />
+          <svg viewBox="0 0 36 24" className="h-6 w-8" fill="none" aria-hidden="true">
+            {/* 9 rounded vertical bars forming the symmetric two-tower wave */}
+            <rect x="2.2" y="8.2" width="2" height="3.8" rx="1" fill="#049FD9" />
+            <rect x="6" y="6.2" width="2" height="5.8" rx="1" fill="#049FD9" />
+            <rect x="9.8" y="2.2" width="2" height="11.4" rx="1" fill="#049FD9" />
+            <rect x="13.6" y="6.2" width="2" height="5.8" rx="1" fill="#049FD9" />
+            <rect x="17.4" y="8.2" width="2" height="3.8" rx="1" fill="#049FD9" />
+            <rect x="21.2" y="6.2" width="2" height="5.8" rx="1" fill="#049FD9" />
+            <rect x="25" y="2.2" width="2" height="11.4" rx="1" fill="#049FD9" />
+            <rect x="28.8" y="6.2" width="2" height="5.8" rx="1" fill="#049FD9" />
+            <rect x="32.6" y="8.2" width="2" height="3.8" rx="1" fill="#049FD9" />
+            <text
+              x="18.4"
+              y="22"
+              textAnchor="middle"
+              fill="#049FD9"
+              fontSize="7.4"
+              fontWeight="800"
+              fontFamily="system-ui, -apple-system, sans-serif"
+              letterSpacing="1.2"
+            >
+              CISCO
+            </text>
           </svg>
         </span>
       );
@@ -3770,7 +3790,10 @@ export const App: React.FC = () => {
   };
 
   const handleQuickEnableSnmpOnDevice = async (ip: string, hostname: string) => {
-    const profileId = config?.snmp_profiles?.[0]?.id || null;
+    const profileId =
+      (deviceDetail?.ip_address === ip ? deviceDetail.snmp_config?.profile_id : null) ||
+      config?.snmp_profiles?.[0]?.id ||
+      null;
     const r = await fetch("/api/config/snmp-targets", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -7677,12 +7700,14 @@ export const App: React.FC = () => {
                   <RefreshCw className={`h-3.5 w-3.5 ${loadingDeviceDetail ? "animate-spin" : ""}`} />
                   <span>{loadingDeviceDetail ? "Refreshing..." : "Refresh"}</span>
                 </button>
-                {!deviceDetail?.snmp_config &&
+                {deviceDetail &&
+                  (!activeDetailIp || deviceDetail.ip_address === activeDetailIp) &&
+                  !deviceDetail.snmp_config?.enabled &&
                   !(
                     detailProfileType === "icmp" &&
-                    deviceDetail?.icmp_host &&
-                    !deviceDetail?.snmp_system &&
-                    !deviceDetail?.unifi_device
+                    Boolean(deviceDetail.icmp_host) &&
+                    !deviceDetail.snmp_system &&
+                    !deviceDetail.unifi_device
                   ) && (
                     <button
                       disabled={!activeDetailIp}
