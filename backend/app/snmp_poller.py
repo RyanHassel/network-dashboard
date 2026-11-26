@@ -177,6 +177,330 @@ def _normalize_mac(raw: Optional[str]) -> Optional[str]:
     return mac
 
 
+def _parse_cisco_ucs_telemetry(
+    ucs_rack: Dict[str, str],
+    ucs_proc: Dict[str, str],
+    ucs_proc_env: Dict[str, str],
+    ucs_mb_temp: Dict[str, str],
+    ucs_mb_power: Dict[str, str],
+    ucs_disks: Dict[str, str],
+    ucs_luns: Dict[str, str],
+    ucs_fans: Dict[str, str],
+    ucs_psus: Dict[str, str],
+) -> Dict[str, Any]:
+    """Parses CISCO-UNIFIED-COMPUTING-MIB (1.3.6.1.4.1.9.9.719.1.*) tables for Cisco UCS servers."""
+    hardware_model = ""
+    serial_number = ""
+    temp_celsius: Optional[float] = None
+    mem_pct: Optional[float] = None
+    memory_details: Dict[str, Any] = {}
+    cpu_details: Dict[str, Any] = {}
+    storage_volumes: List[Dict[str, Any]] = []
+    sensors: List[Dict[str, Any]] = []
+    vendor_scalars: Dict[str, Any] = {}
+    has_data = False
+
+    def _group_by_inst(tbl: Dict[str, str]) -> Dict[str, Dict[str, str]]:
+        grouped: Dict[str, Dict[str, str]] = {}
+        for k, v in (tbl or {}).items():
+            if "." not in k:
+                continue
+            col, inst = k.split(".", 1)
+            grouped.setdefault(inst, {})[col] = str(v).strip()
+        return grouped
+
+    def _sorted_insts(grouped: Dict[str, Dict[str, str]]) -> List[str]:
+        return sorted(grouped.keys(), key=lambda s: tuple(int(p) if p.isdigit() else 999999 for p in s.split(".")))
+
+    def _valid_temp(raw: Optional[str]) -> Optional[float]:
+        val = _to_float(raw, -1.0)
+        if 0.0 < val < 150.0:
+            return round(val, 1)
+        return None
+
+    # 1. Rack Unit Identity, CPU counts, Memory capacity (cucsComputeRackUnitTable)
+    if ucs_rack:
+        has_data = True
+        rack_rows = _group_by_inst(ucs_rack)
+        for inst in _sorted_insts(rack_rows):
+            row = rack_rows[inst]
+            if not hardware_model and row.get("32"):
+                hardware_model = row["32"]
+            if not serial_number and row.get("47"):
+                serial_number = row["47"]
+            num_cpus = _to_int(row.get("35"), 0)
+            num_cores = _to_int(row.get("34"), 0)
+            num_threads = _to_int(row.get("38"), 0)
+            if num_cores > 0:
+                cpu_details["core_count"] = num_cores
+                vendor_scalars["CPU Cores"] = num_cores
+            if num_cpus > 0:
+                cpu_details["socket_count"] = num_cpus
+                vendor_scalars["CPU Sockets"] = num_cpus
+            if num_threads > 0:
+                cpu_details["thread_count"] = num_threads
+                vendor_scalars["CPU Threads"] = num_threads
+            total_mem_mb = _to_int(row.get("51"), 0)
+            avail_mem_mb = _to_int(row.get("7"), 0)
+            if total_mem_mb > 0:
+                total_bytes = total_mem_mb * 1024 * 1024
+                avail_bytes = (
+                    min(total_bytes, avail_mem_mb * 1024 * 1024)
+                    if avail_mem_mb > 0
+                    else total_bytes
+                )
+                used_bytes = (
+                    max(0, total_bytes - avail_bytes)
+                    if 0 < avail_mem_mb < total_mem_mb
+                    else 0
+                )
+                usage_pct = round((used_bytes / total_bytes) * 100.0, 1) if total_bytes > 0 else 0.0
+                mem_pct = usage_pct
+                memory_details = {
+                    "total_bytes": total_bytes,
+                    "used_bytes": used_bytes,
+                    "avail_bytes": avail_bytes,
+                    "usage_pct": usage_pct,
+                }
+            if hardware_model or serial_number or total_mem_mb > 0:
+                break
+
+    # 2. Processor Inventory (cucsProcessorUnitTable)
+    if ucs_proc:
+        has_data = True
+        proc_rows = _group_by_inst(ucs_proc)
+        cpu_models: List[str] = []
+        total_proc_cores = 0
+        total_proc_threads = 0
+        for inst in _sorted_insts(proc_rows):
+            row = proc_rows[inst]
+            m_str = (row.get("10") or "").strip()
+            if m_str and m_str not in cpu_models:
+                cpu_models.append(m_str)
+            c_cnt = _to_int(row.get("5"), 0)
+            t_cnt = _to_int(row.get("19"), 0)
+            if c_cnt > 0:
+                total_proc_cores += c_cnt
+            if t_cnt > 0:
+                total_proc_threads += t_cnt
+            if "CPU Speed" not in vendor_scalars:
+                spd = _to_int(row.get("17"), 0)
+                if spd > 0:
+                    vendor_scalars["CPU Speed"] = f"{spd} MHz"
+        if cpu_models:
+            vendor_scalars["Processor"] = cpu_models[0]
+            cpu_details["model"] = cpu_models[0]
+        if total_proc_cores > 0 and "core_count" not in cpu_details:
+            cpu_details["core_count"] = total_proc_cores
+            vendor_scalars["CPU Cores"] = total_proc_cores
+        if total_proc_threads > 0 and "thread_count" not in cpu_details:
+            cpu_details["thread_count"] = total_proc_threads
+            vendor_scalars["CPU Threads"] = total_proc_threads
+
+    # 3. CPU Temperatures (cucsProcessorEnvStatsTable)
+    if ucs_proc_env:
+        has_data = True
+        penv_rows = _group_by_inst(ucs_proc_env)
+        for idx, inst in enumerate(_sorted_insts(penv_rows)):
+            t_val = _valid_temp(penv_rows[inst].get("10"))
+            if t_val is not None:
+                if temp_celsius is None:
+                    temp_celsius = t_val
+                sensors.append(
+                    {
+                        "name": f"CPU {idx + 1} Temp",
+                        "category": "Temperature",
+                        "value": f"{t_val:.1f} °C",
+                        "status": "warning" if t_val >= 85.0 else "ok",
+                    }
+                )
+
+    # 4. Motherboard Temperatures (cucsComputeRackUnitMbTempStatsTable)
+    if ucs_mb_temp:
+        has_data = True
+        mb_rows = _group_by_inst(ucs_mb_temp)
+        mb_cols = (
+            ("4", "Board Ambient"),
+            ("10", "Board Front"),
+            ("14", "IOH 1 Temp"),
+            ("18", "IOH 2 Temp"),
+            ("22", "Board Rear"),
+        )
+        for inst in _sorted_insts(mb_rows):
+            row = mb_rows[inst]
+            for col, label in mb_cols:
+                t_val = _valid_temp(row.get(col))
+                if t_val is not None:
+                    if temp_celsius is None:
+                        temp_celsius = t_val
+                    sensors.append(
+                        {
+                            "name": label,
+                            "category": "Temperature",
+                            "value": f"{t_val:.1f} °C",
+                            "status": "warning" if t_val >= 75.0 else "ok",
+                        }
+                    )
+
+    # 5. Motherboard Power Draw (cucsComputeMbPowerStatsTable)
+    if ucs_mb_power:
+        has_data = True
+        pwr_rows = _group_by_inst(ucs_mb_power)
+        for inst in _sorted_insts(pwr_rows):
+            row = pwr_rows[inst]
+            watts = _to_float(row.get("4"), -1.0)
+            amps = _to_float(row.get("12"), -1.0)
+            volts = _to_float(row.get("16"), -1.0)
+            if 0.0 < watts < 10000.0:
+                vendor_scalars["Power Draw"] = f"{watts:.0f} W"
+                sensors.append(
+                    {
+                        "name": "System Power Consumed",
+                        "category": "Power",
+                        "value": f"{watts:.0f} W",
+                        "status": "ok",
+                    }
+                )
+            if 0.0 < volts < 1000.0:
+                sensors.append(
+                    {
+                        "name": "Input Voltage",
+                        "category": "Power",
+                        "value": f"{volts:.1f} V",
+                        "status": "ok",
+                    }
+                )
+            if 0.0 < amps < 100.0:
+                sensors.append(
+                    {
+                        "name": "Input Current",
+                        "category": "Power",
+                        "value": f"{amps:.2f} A",
+                        "status": "ok",
+                    }
+                )
+            break
+
+    # 6. Storage Local LUNs & Physical Disks
+    lun_volumes: List[Dict[str, Any]] = []
+    if ucs_luns:
+        has_data = True
+        lun_rows = _group_by_inst(ucs_luns)
+        for idx, inst in enumerate(_sorted_insts(lun_rows)):
+            row = lun_rows[inst]
+            size_mb = _to_int(row.get("20"), 0)
+            if size_mb <= 0:
+                continue
+            lun_id = (row.get("10") or str(idx)).strip()
+            lun_name = (row.get("13") or "").strip()
+            mount = lun_name or f"Virtual Drive {lun_id}"
+            lun_volumes.append(
+                {
+                    "mount": mount,
+                    "total_bytes": size_mb * 1024 * 1024,
+                    "used_bytes": 0,
+                    "usage_pct": 0.0,
+                }
+            )
+
+    disk_volumes: List[Dict[str, Any]] = []
+    if ucs_disks:
+        has_data = True
+        disk_rows = _group_by_inst(ucs_disks)
+        for idx, inst in enumerate(_sorted_insts(disk_rows)):
+            row = disk_rows[inst]
+            presence = (row.get("27") or "").strip().lower()
+            if presence in ("11", "missing", "unequipped"):
+                continue
+            size_mb = _to_int(row.get("31"), 0)
+            if size_mb <= 0:
+                continue
+            disk_id = (row.get("16") or str(idx + 1)).strip()
+            disk_model = (row.get("22") or "").strip()
+            mount = f"Disk {disk_id}" + (f" ({disk_model})" if disk_model else "")
+            disk_volumes.append(
+                {
+                    "mount": mount,
+                    "total_bytes": size_mb * 1024 * 1024,
+                    "used_bytes": 0,
+                    "usage_pct": 0.0,
+                }
+            )
+            cap_str = (
+                f"{size_mb / 1024 / 1024:.2f} TB"
+                if size_mb >= 1024 * 1024
+                else f"{size_mb / 1024:.0f} GB"
+            )
+            sensors.append(
+                {
+                    "name": f"Drive Bay {disk_id}",
+                    "category": "Storage",
+                    "value": f"{cap_str}" + (f" ({disk_model})" if disk_model else ""),
+                    "status": "ok",
+                }
+            )
+
+    storage_volumes = lun_volumes if lun_volumes else disk_volumes
+
+    # 7. Chassis Fans (cucsEquipmentFanStatsTable)
+    if ucs_fans:
+        has_data = True
+        fan_rows = _group_by_inst(ucs_fans)
+        for idx, inst in enumerate(_sorted_insts(fan_rows)):
+            rpm = _to_float(fan_rows[inst].get("6"), -1.0)
+            if 0.0 < rpm < 50000.0:
+                sensors.append(
+                    {
+                        "name": f"Chassis Fan {idx + 1}",
+                        "category": "Fan",
+                        "value": f"{rpm:.0f} RPM",
+                        "status": "ok",
+                    }
+                )
+
+    # 8. Power Supply Units (cucsEquipmentPsuStatsTable)
+    if ucs_psus:
+        has_data = True
+        psu_rows = _group_by_inst(ucs_psus)
+        for idx, inst in enumerate(_sorted_insts(psu_rows)):
+            row = psu_rows[inst]
+            psu_out = _to_float(row.get("16"), -1.0)
+            psu_temp = _valid_temp(row.get("4"))
+            if 0.0 < psu_out < 10000.0:
+                sensors.append(
+                    {
+                        "name": f"PSU {idx + 1} Output",
+                        "category": "Power",
+                        "value": f"{psu_out:.0f} W",
+                        "status": "ok",
+                    }
+                )
+            if psu_temp is not None:
+                if temp_celsius is None:
+                    temp_celsius = psu_temp
+                sensors.append(
+                    {
+                        "name": f"PSU {idx + 1} Temp",
+                        "category": "Temperature",
+                        "value": f"{psu_temp:.1f} °C",
+                        "status": "warning" if psu_temp >= 75.0 else "ok",
+                    }
+                )
+
+    return {
+        "has_data": has_data,
+        "hardware_model": hardware_model,
+        "serial_number": serial_number,
+        "temp_celsius": temp_celsius,
+        "mem_pct": mem_pct,
+        "memory_details": memory_details,
+        "cpu_details": cpu_details,
+        "storage_volumes": storage_volumes,
+        "sensors": sensors,
+        "vendor_scalars": vendor_scalars,
+    }
+
+
 def _parse_sys_descr_metadata(sys_descr: str, vendor_key: str) -> Dict[str, str]:
     """Extracts hardware model, firmware version, serial, and OS/kernel fallback info from sysDescr."""
     descr = (sys_descr or "").strip()
@@ -212,7 +536,7 @@ def _parse_sys_descr_metadata(sys_descr: str, vendor_key: str) -> Dict[str, str]
         if m_mt:
             out["hardware_model"] = m_mt.group(1)
 
-    elif vendor_key == "cisco":
+    elif vendor_key in ("cisco", "cisco_ucs"):
         m_cs = re.search(r"\bVersion\s+([0-9A-Za-z()._-]+)", descr, re.I)
         if m_cs:
             out["firmware_version"] = m_cs.group(1).rstrip(",")
@@ -2241,7 +2565,12 @@ class SNMPPoller:
                 total_b = unit_bytes * size_units
                 used_b = unit_bytes * used_units
                 pct = round((used_b / total_b) * 100.0, 1) if total_b > 0 else 0.0
-                if hr_type.endswith(".25.2.1.2") or descr_l in ("physical memory", "ram", "main memory"):
+                if hr_type.endswith(".25.2.1.2") or descr_l in (
+                    "physical memory",
+                    "real memory",
+                    "ram",
+                    "main memory",
+                ):
                     if mem_pct is None:
                         mem_pct = pct
                         memory_details = {
@@ -2496,17 +2825,79 @@ class SNMPPoller:
                         }
                     )
 
-        elif vendor_key == "cisco":
-            c_cpu, c_env = await asyncio.gather(
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.109.1.1.1.1", timeout=3.0, sem=sem, stats=poll_stats),
-                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.13.1.3.1", timeout=3.0, sem=sem, stats=poll_stats),
+        elif vendor_key in ("cisco", "cisco_ucs"):
+            (
+                c_cpu,
+                c_mem,
+                c_env,
+                ucs_rack,
+                ucs_proc,
+                ucs_proc_env,
+                ucs_mb_temp,
+                ucs_mb_power,
+                ucs_disks,
+                ucs_luns,
+                ucs_fans,
+                ucs_psus,
+            ) = await asyncio.gather(
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.109.1.1.1.1", timeout=3.5, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.48.1.1.1", timeout=3.5, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.13.1.3.1", timeout=3.5, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.9.35.1", timeout=3.5, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.41.9.1", timeout=3.5, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.41.2.1", timeout=3.5, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.9.44.1", timeout=3.5, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.9.25.1", timeout=3.5, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.45.4.1", timeout=3.5, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.45.5.1", timeout=3.5, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.15.14.1", timeout=3.5, sem=sem, stats=poll_stats),
+                self._snmp_walk_oid(target, port, auth_args, "1.3.6.1.4.1.9.9.719.1.15.58.1", timeout=3.5, sem=sem, stats=poll_stats),
             )
             if c_cpu:
                 _mark_mib("CISCO-PROCESS-MIB")
-                for k, v in c_cpu.items():
-                    if k.startswith("7.") or k.startswith("8."):
-                        cpu_pct = _to_float(v)
+                c_cpu_by_idx: Dict[str, float] = {}
+                for col_pfx in ("10.", "7.", "8.", "4."):
+                    for k, v in sorted(c_cpu.items()):
+                        if not k.startswith(col_pfx) or "." not in k:
+                            continue
+                        c_idx = k.split(".", 1)[1]
+                        if c_idx in c_cpu_by_idx:
+                            continue
+                        val = _to_float(v, -1.0)
+                        if val >= 0.0:
+                            c_cpu_by_idx[c_idx] = round(min(100.0, val), 1)
+                    if c_cpu_by_idx:
                         break
+                if c_cpu_by_idx:
+                    ordered_cpus = sorted(
+                        c_cpu_by_idx.items(),
+                        key=lambda kv: (int(kv[0]) if kv[0].isdigit() else 999999, kv[0]),
+                    )
+                    if cpu_pct is None:
+                        cpu_pct = round(sum(v for _, v in ordered_cpus) / len(ordered_cpus), 1)
+                    if "cores" not in cpu_details:
+                        cpu_details["cores"] = [
+                            {"core": idx, "label": f"CPU {idx}", "usage_pct": val}
+                            for idx, (_, val) in enumerate(ordered_cpus)
+                        ]
+                        cpu_details.setdefault("core_count", len(ordered_cpus))
+            if c_mem and mem_pct is None:
+                _mark_mib("CISCO-MEMORY-POOL-MIB")
+                pool_ids = {k.split(".", 1)[1] for k in c_mem.keys() if k.startswith("5.") and "." in k}
+                tot_used = 0
+                tot_free = 0
+                for pid in pool_ids:
+                    tot_used += max(0, _to_int(c_mem.get(f"5.{pid}"), 0))
+                    tot_free += max(0, _to_int(c_mem.get(f"6.{pid}"), 0))
+                tot_pool = tot_used + tot_free
+                if tot_pool > 0:
+                    mem_pct = round((tot_used / tot_pool) * 100.0, 1)
+                    memory_details = {
+                        "total_bytes": tot_pool,
+                        "used_bytes": tot_used,
+                        "avail_bytes": tot_free,
+                        "usage_pct": mem_pct,
+                    }
             if c_env:
                 _mark_mib("CISCO-ENVMON-MIB")
                 e_ids = {k.split(".", 1)[1] for k in c_env.keys() if k.startswith("2.") and "." in k}
@@ -2519,6 +2910,36 @@ class SNMPPoller:
                         sensors.append(
                             {"name": s_name, "category": "Temperature", "value": f"{s_val:.0f} °C", "status": "ok"}
                         )
+            ucs_parsed = _parse_cisco_ucs_telemetry(
+                ucs_rack=ucs_rack,
+                ucs_proc=ucs_proc,
+                ucs_proc_env=ucs_proc_env,
+                ucs_mb_temp=ucs_mb_temp,
+                ucs_mb_power=ucs_mb_power,
+                ucs_disks=ucs_disks,
+                ucs_luns=ucs_luns,
+                ucs_fans=ucs_fans,
+                ucs_psus=ucs_psus,
+            )
+            if ucs_parsed["has_data"]:
+                _mark_mib("CISCO-UNIFIED-COMPUTING-MIB")
+                if not hardware_model and ucs_parsed["hardware_model"]:
+                    hardware_model = ucs_parsed["hardware_model"]
+                if not serial_number and ucs_parsed["serial_number"]:
+                    serial_number = ucs_parsed["serial_number"]
+                if ucs_parsed["cpu_details"]:
+                    for ck, cv in ucs_parsed["cpu_details"].items():
+                        cpu_details.setdefault(ck, cv)
+                if mem_pct is None and ucs_parsed["mem_pct"] is not None:
+                    mem_pct = ucs_parsed["mem_pct"]
+                if not memory_details and ucs_parsed["memory_details"]:
+                    memory_details = ucs_parsed["memory_details"]
+                if not storage_volumes and ucs_parsed["storage_volumes"]:
+                    storage_volumes.extend(ucs_parsed["storage_volumes"])
+                if temp_celsius is None and ucs_parsed["temp_celsius"] is not None:
+                    temp_celsius = ucs_parsed["temp_celsius"]
+                sensors.extend(ucs_parsed["sensors"])
+                vendor_scalars.update(ucs_parsed["vendor_scalars"])
 
         elif vendor_key == "fortinet":
             fg_sys = await self._snmp_walk_oid(
@@ -2872,6 +3293,10 @@ class SNMPPoller:
             enrichment["extended_metrics"]["cpu_details"]["cores"] = cpu_core_metrics
         elif enrichment["cpu_pct"] is not None:
             avg_cpu = float(enrichment["cpu_pct"])
+            if not cpu_core_metrics:
+                ext_cores = enrichment["extended_metrics"].get("cpu_details", {}).get("cores")
+                if isinstance(ext_cores, list) and ext_cores:
+                    cpu_core_metrics = ext_cores
         else:
             avg_cpu = 0.0
 
