@@ -7677,21 +7677,27 @@ export const App: React.FC = () => {
                   <RefreshCw className={`h-3.5 w-3.5 ${loadingDeviceDetail ? "animate-spin" : ""}`} />
                   <span>{loadingDeviceDetail ? "Refreshing..." : "Refresh"}</span>
                 </button>
-                {!deviceDetail?.snmp_config && (
-                  <button
-                    disabled={!activeDetailIp}
-                    onClick={() =>
-                      activeDetailIp &&
-                      handleQuickEnableSnmpOnDevice(
-                        activeDetailIp,
-                        deviceDetail?.discovered_host?.hostname || activeDetailIp,
-                      )
-                    }
-                    className="flex items-center gap-1.5 rounded-md bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-sky-500 disabled:opacity-50"
-                  >
-                    <Plus className="h-3.5 w-3.5" /> Enable SNMP Polling on This Device
-                  </button>
-                )}
+                {!deviceDetail?.snmp_config &&
+                  !(
+                    detailProfileType === "icmp" &&
+                    deviceDetail?.icmp_host &&
+                    !deviceDetail?.snmp_system &&
+                    !deviceDetail?.unifi_device
+                  ) && (
+                    <button
+                      disabled={!activeDetailIp}
+                      onClick={() =>
+                        activeDetailIp &&
+                        handleQuickEnableSnmpOnDevice(
+                          activeDetailIp,
+                          deviceDetail?.discovered_host?.hostname || activeDetailIp,
+                        )
+                      }
+                      className="flex items-center gap-1.5 rounded-md bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-sky-500 disabled:opacity-50"
+                    >
+                      <Plus className="h-3.5 w-3.5" /> Enable SNMP Polling on This Device
+                    </button>
+                  )}
                 {deviceSettingsOpen ? (
                   <button
                     type="button"
