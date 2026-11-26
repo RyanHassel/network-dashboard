@@ -103,6 +103,7 @@ type DeviceSortKey =
   | "ip_address"
   | "hostname"
   | "mac_address"
+  | "vendor_icon"
   | "vendor"
   | "subnet"
   | "snmp"
@@ -116,7 +117,7 @@ type DeviceSortKey =
 type DeviceColumnKey = DeviceSortKey;
 type SortDirection = "asc" | "desc";
 
-const DEVICE_COLUMNS_STORAGE_KEY = "netdash_device_table_columns_v1";
+const DEVICE_COLUMNS_STORAGE_KEY = "netdash_device_table_columns_v2";
 
 const DEVICE_TABLE_COLUMNS: Array<{
   key: DeviceColumnKey;
@@ -129,6 +130,7 @@ const DEVICE_TABLE_COLUMNS: Array<{
   { key: "ip_address", label: "IPv4 Address", alignRight: false, defaultVisible: true },
   { key: "hostname", label: "Hostname / sysName", alignRight: false, defaultVisible: true },
   { key: "mac_address", label: "MAC Address", alignRight: false, defaultVisible: true },
+  { key: "vendor_icon", label: "Vendor Icon", alignRight: false, defaultVisible: true },
   { key: "vendor", label: "Vendor / Hardware", alignRight: false, defaultVisible: true },
   { key: "subnet", label: "Subnet / VLAN", alignRight: false, defaultVisible: true },
   { key: "snmp", label: "SNMP / Interfaces", alignRight: false, defaultVisible: true },
@@ -442,6 +444,256 @@ function formatDeviceVendorHardware(d: UnifiedDeviceItem): string {
     return vendor.toLowerCase().includes(model.toLowerCase()) ? vendor : `${vendor} / ${model}`;
   }
   return vendor || model || "—";
+}
+
+function resolveVendorIconKey(d: UnifiedDeviceItem): { key: string; label: string } {
+  const hay = [d.vendor, d.hardware_model, d.hostname, d.sys_descr, ...(d.matched_mibs || [])]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  if (/\b(ubiquiti|unifi|ubnt|udm|usw|uap|ucg|uxg|usg|edgeswitch|edgerouter|airmax|nanobeam|litebeam|airfiber)\b/.test(hay)) {
+    return { key: "ubiquiti", label: d.vendor || "Ubiquiti" };
+  }
+  if (/\b(apple|iphone|ipad|macbook|mac mini|mac studio|imac|homepod|appletv|apple tv|airpods)\b/.test(hay)) {
+    return { key: "apple", label: d.vendor || "Apple" };
+  }
+  if (/\b(cisco|meraki|catalyst|nexus|aironet)\b/.test(hay)) {
+    return { key: "cisco", label: d.vendor || "Cisco" };
+  }
+  if (/\b(proxmox|pve)\b/.test(hay)) {
+    return { key: "proxmox", label: d.vendor || "Proxmox" };
+  }
+  if (/\b(microsoft|windows|xbox|surface)\b/.test(hay)) {
+    return { key: "microsoft", label: d.vendor || "Microsoft" };
+  }
+  if (/\b(synology)\b/.test(hay)) {
+    return { key: "synology", label: d.vendor || "Synology" };
+  }
+  if (/\b(raspberry|raspbian)\b/.test(hay)) {
+    return { key: "raspberry", label: d.vendor || "Raspberry Pi" };
+  }
+  if (/\b(linux|ubuntu|debian|centos|rhel|red hat|rocky|alma|alpine|net-snmp)\b/.test(hay)) {
+    return { key: "linux", label: d.vendor || "Linux" };
+  }
+  if (/\b(dell|poweredge|idrac)\b/.test(hay)) {
+    return { key: "dell", label: d.vendor || "Dell" };
+  }
+  if (/\b(aruba)\b/.test(hay)) {
+    return { key: "aruba", label: d.vendor || "Aruba" };
+  }
+  if (/\b(hewlett|hpe|hp\b|proliant|laserjet|officejet|ilo)\b/.test(hay)) {
+    return { key: "hp", label: d.vendor || "HP / HPE" };
+  }
+  if (/\b(fortinet|fortigate)\b/.test(hay)) {
+    return { key: "fortinet", label: d.vendor || "Fortinet" };
+  }
+  if (/\b(mikrotik|routeros)\b/.test(hay)) {
+    return { key: "mikrotik", label: d.vendor || "MikroTik" };
+  }
+  if (/\b(vmware|esxi)\b/.test(hay)) {
+    return { key: "vmware", label: d.vendor || "VMware" };
+  }
+  if (/\b(apc|schneider|cyberpower|eaton|ups)\b/.test(hay)) {
+    return { key: "ups", label: d.vendor || "UPS Power" };
+  }
+  if (/\b(google|nest|chromecast)\b/.test(hay)) {
+    return { key: "google", label: d.vendor || "Google" };
+  }
+  if (/\b(amazon|echo|alexa|ring|firetv|kindle)\b/.test(hay)) {
+    return { key: "amazon", label: d.vendor || "Amazon" };
+  }
+  if (/\b(samsung|galaxy)\b/.test(hay)) {
+    return { key: "samsung", label: d.vendor || "Samsung" };
+  }
+  if (/\b(intel)\b/.test(hay)) {
+    return { key: "intel", label: d.vendor || "Intel" };
+  }
+  if (/\b(tp-link|tplink|omada)\b/.test(hay)) {
+    return { key: "tplink", label: d.vendor || "TP-Link" };
+  }
+  if (/\b(netgear)\b/.test(hay)) {
+    return { key: "netgear", label: d.vendor || "NETGEAR" };
+  }
+  if (/\b(qnap|truenas|ixsystems)\b/.test(hay)) {
+    return { key: "storage", label: d.vendor || "NAS Storage" };
+  }
+  return { key: "generic", label: d.vendor || "Unknown Vendor" };
+}
+
+function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
+  const { key, label } = resolveVendorIconKey(d);
+
+  switch (key) {
+    case "ubiquiti":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-sky-400">
+          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M5 4v9a7 7 0 0 0 14 0V4" />
+            <path d="M5 7h2M5 10h2M17 7h2M17 10h2" />
+          </svg>
+        </span>
+      );
+    case "apple":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-slate-200">
+          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="currentColor">
+            <path d="M16.36 12.76c-.02-2.2 1.8-3.26 1.88-3.31-1.03-1.5-2.62-1.7-3.18-1.73-1.35-.14-2.64.8-3.32.8-.69 0-1.75-.78-2.88-.76-1.48.02-2.84.86-3.6 2.18-1.54 2.67-.39 6.62 1.1 8.78.73 1.05 1.6 2.24 2.74 2.2 1.1-.04 1.52-.71 2.85-.71 1.33 0 1.71.71 2.87.69 1.19-.02 1.94-1.07 2.66-2.13.84-1.22 1.18-2.41 1.2-2.47-.03-.01-2.3-.88-2.32-3.54ZM14.18 6.31c.6-.73 1.01-1.75.9-2.77-.87.04-1.93.58-2.55 1.31-.55.64-1.04 1.68-.91 2.67.97.08 1.96-.49 2.56-1.21Z" />
+          </svg>
+        </span>
+      );
+    case "cisco":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-cyan-400">
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+            <path d="M3 13v-2M7 15V9M11 17V7M15 15V9M19 13v-2" />
+            <path d="M5 17c3.5-2.5 10.5-2.5 14 0" strokeWidth="1.5" />
+          </svg>
+        </span>
+      );
+    case "proxmox":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-orange-400">
+          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M6 6l6 5 6-5" />
+            <path d="M6 18l6-5 6 5" />
+            <path d="M4 12h2M18 12h2" />
+          </svg>
+        </span>
+      );
+    case "microsoft":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-sky-400">
+          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="currentColor">
+            <path d="M3 3h8.5v8.5H3V3Zm9.5 0H21v8.5h-8.5V3ZM3 12.5h8.5V21H3v-8.5Zm9.5 0H21V21h-8.5v-8.5Z" />
+          </svg>
+        </span>
+      );
+    case "synology":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-amber-400">
+          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M16 7a5 5 0 0 0-8 0" />
+            <path d="M8 17a5 5 0 0 0 8 0" />
+            <path d="M8.5 10.5c0-1.2 1.6-2 3.5-2s3.5.8 3.5 2-1.6 1.7-3.5 1.7-3.5.7-3.5 1.8 1.6 2 3.5 2 3.5-.8 3.5-2" />
+          </svg>
+        </span>
+      );
+    case "linux":
+    case "raspberry":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-amber-300">
+          <Terminal className="h-4 w-4" />
+        </span>
+      );
+    case "dell":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-sky-300">
+          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M9 9.5v5h2a2.5 2.5 0 0 0 0-5H9Z" />
+          </svg>
+        </span>
+      );
+    case "aruba":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-orange-400">
+          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M4 18L12 5l8 13" />
+            <path d="M8 13.5h8" />
+          </svg>
+        </span>
+      );
+    case "hp":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-cyan-300">
+          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M9.5 7.5v9M9.5 12h3v4.5M15 12v6" />
+          </svg>
+        </span>
+      );
+    case "fortinet":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-rose-400">
+          <ShieldCheck className="h-4 w-4" />
+        </span>
+      );
+    case "mikrotik":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-emerald-400">
+          <Router className="h-4 w-4" />
+        </span>
+      );
+    case "vmware":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-indigo-400">
+          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <rect x="4" y="4" width="9" height="9" rx="1.5" />
+            <rect x="11" y="11" width="9" height="9" rx="1.5" />
+          </svg>
+        </span>
+      );
+    case "ups":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-amber-400">
+          <Zap className="h-4 w-4" />
+        </span>
+      );
+    case "google":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-emerald-300">
+          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M19.5 12.5h-7.5" />
+            <path d="M17.5 16.5A7.5 7.5 0 1 1 18 7.8" />
+          </svg>
+        </span>
+      );
+    case "amazon":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-amber-400">
+          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M4 15c4.5 3.5 11.5 3.5 16 0" />
+            <path d="M18 13l2.5 1.8-.8 2.7" />
+            <path d="M9 11V7a3 3 0 0 1 6 0v4M9 9.5h6" />
+          </svg>
+        </span>
+      );
+    case "samsung":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-indigo-300">
+          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+            <ellipse cx="12" cy="12" rx="9" ry="5" transform="rotate(-20 12 12)" />
+            <circle cx="12" cy="12" r="1.5" fill="currentColor" />
+          </svg>
+        </span>
+      );
+    case "intel":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-sky-400">
+          <Cpu className="h-4 w-4" />
+        </span>
+      );
+    case "tplink":
+    case "netgear":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-teal-400">
+          <Network className="h-4 w-4" />
+        </span>
+      );
+    case "storage":
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-violet-400">
+          <HardDrive className="h-4 w-4" />
+        </span>
+      );
+    default:
+      return (
+        <span title={label} className="inline-flex items-center justify-center text-slate-500">
+          <Server className="h-4 w-4" />
+        </span>
+      );
+  }
 }
 
 function renderDeviceRoleBadge(d: UnifiedDeviceItem): React.ReactNode {
@@ -2503,15 +2755,35 @@ export const App: React.FC = () => {
   const [deviceSortDir, setDeviceSortDir] = useState<SortDirection>("asc");
   const [visibleDeviceColumns, setVisibleDeviceColumns] = useState<DeviceColumnKey[]>(() => {
     try {
-      const raw = localStorage.getItem(DEVICE_COLUMNS_STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
+      const validKeys = new Set(DEVICE_TABLE_COLUMNS.map((c) => c.key));
+      const rawV2 = localStorage.getItem(DEVICE_COLUMNS_STORAGE_KEY);
+      if (rawV2) {
+        const parsed = JSON.parse(rawV2);
         if (Array.isArray(parsed)) {
-          const validKeys = new Set(DEVICE_TABLE_COLUMNS.map((c) => c.key));
           const filtered = parsed.filter(
             (k): k is DeviceColumnKey => typeof k === "string" && validKeys.has(k as DeviceColumnKey),
           );
           if (filtered.length > 0) return filtered;
+        }
+      }
+      const rawV1 = localStorage.getItem("netdash_device_table_columns_v1");
+      if (rawV1) {
+        const parsed = JSON.parse(rawV1);
+        if (Array.isArray(parsed)) {
+          const filtered = parsed.filter(
+            (k): k is DeviceColumnKey => typeof k === "string" && validKeys.has(k as DeviceColumnKey),
+          );
+          if (filtered.length > 0) {
+            if (!filtered.includes("vendor_icon")) {
+              const vIdx = filtered.indexOf("vendor");
+              if (vIdx >= 0) {
+                filtered.splice(vIdx, 0, "vendor_icon");
+              } else {
+                filtered.unshift("vendor_icon");
+              }
+            }
+            return filtered;
+          }
         }
       }
     } catch {
@@ -4855,6 +5127,12 @@ export const App: React.FC = () => {
         case "mac_address":
           cmp = compareOptionalText((a.mac_address || "").trim(), (b.mac_address || "").trim());
           break;
+        case "vendor_icon":
+          cmp = compareOptionalText(
+            resolveVendorIconKey(a).label,
+            resolveVendorIconKey(b).label,
+          );
+          break;
         case "vendor": {
           const va = formatDeviceVendorHardware(a);
           const vb = formatDeviceVendorHardware(b);
@@ -6756,6 +7034,12 @@ export const App: React.FC = () => {
                                   return (
                                     <td key={col.key} className="py-3 text-slate-300">
                                       {d.mac_address || "—"}
+                                    </td>
+                                  );
+                                case "vendor_icon":
+                                  return (
+                                    <td key={col.key} className="py-3">
+                                      {renderVendorIcon(d)}
                                     </td>
                                   );
                                 case "vendor":
