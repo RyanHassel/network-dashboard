@@ -3143,6 +3143,95 @@ def _classify_device_profile(
     return "server"
 
 
+def _classify_device_role(
+    profile_type: str,
+    snmp_sys: Optional[Dict[str, Any]],
+    unifi_dev: Optional[Dict[str, Any]],
+    sources: Optional[List[str]] = None,
+    interface_count: int = 0,
+) -> Optional[str]:
+    """Classifies granular hardware role (router, switch, ap, firewall, server, nas, ups, printer, network)."""
+    ptype = (profile_type or "").strip().lower()
+    if ptype == "ups":
+        return "ups"
+
+    unifi_dtype = (
+        str(unifi_dev.get("device_type") or "").strip().lower()
+        if isinstance(unifi_dev, dict)
+        else ""
+    )
+    if ptype == "wireless" or unifi_dtype == "uap":
+        return "ap"
+    if ptype == "printer":
+        return "printer"
+    if ptype == "nas":
+        return "nas"
+
+    id_parts: List[str] = []
+    mibs: List[str] = []
+    for src in (snmp_sys, unifi_dev):
+        if not isinstance(src, dict):
+            continue
+        for key in (
+            "device_category",
+            "vendor_name",
+            "sys_descr",
+            "sys_name",
+            "hardware_model",
+            "model",
+            "name",
+            "hostname",
+        ):
+            val = src.get(key)
+            if val:
+                id_parts.append(str(val))
+        for mcol in ("matched_mibs", "mibs"):
+            raw_m = src.get(mcol)
+            if isinstance(raw_m, list):
+                mibs.extend(str(x) for x in raw_m)
+
+    identity = " ".join(id_parts).lower()
+
+    if re.search(
+        r"\b(fortigate|palo\s*alto|pfsense|opnsense|sophos|sonicwall|firewall|cisco\s+asa|watchguard|firepower)\b",
+        identity,
+    ):
+        return "firewall"
+
+    if unifi_dtype in ("udm", "ugw", "uxg") or re.search(
+        r"\b(udm[-\s]?pro|udm[-\s]?se|udm[-\s]?max|ucg|uxg|usg|dream\s*machine|edgerouter|router|gateway|vyos|mikrotik.*\b(?:rb|ccr|hex|router))\b",
+        identity,
+    ):
+        return "router"
+
+    if (
+        unifi_dtype == "usw"
+        or re.search(
+            r"\b(usw|edgeswitch|switch|catalyst|procurve|arista|nexus|crs\d+|css\d+|netgear.*\bgs\d+)\b",
+            identity,
+        )
+        or (ptype == "network" and int(interface_count or 0) >= 8)
+    ):
+        return "switch"
+
+    if ptype == "network":
+        return "network"
+
+    has_server_mib = any(
+        m in ("HOST-RESOURCES-MIB", "UCD-SNMP-MIB", "LM-SENSORS-MIB") for m in mibs
+    )
+    has_server_identity = bool(
+        re.search(
+            r"\b(server|proxmox|pve|esxi|vmware|linux|ubuntu|debian|centos|rhel|rocky|alma|alpine|freebsd|windows\s*server|idrac|ilo|ipmi|bmc|supermicro|poweredge|proliant|raspberry|docker|kubernetes|hypervisor)\b",
+            identity,
+        )
+    )
+    if has_server_mib or has_server_identity or ("SNMP" in (sources or []) and ptype == "server"):
+        return "server"
+
+    return None
+
+
 @app.post("/api/snmp/poll-all")
 async def trigger_snmp_poll_all() -> Dict[str, str]:
     await _notify_worker("snmp_now")
@@ -4054,6 +4143,7 @@ async def get_all_devices() -> Dict[str, Any]:
             {
                 "device_category": item.get("device_category"),
                 "vendor_name": item.get("vendor"),
+                "hardware_model": item.get("hardware_model"),
                 "sys_descr": item.get("sys_descr"),
                 "sys_name": item.get("hostname"),
                 "matched_mibs": item.get("matched_mibs") or [],
@@ -4062,6 +4152,20 @@ async def get_all_devices() -> Dict[str, Any]:
             },
             unifi_hint,
             None,
+        )
+        item["device_role"] = _classify_device_role(
+            item["device_profile_type"],
+            {
+                "device_category": item.get("device_category"),
+                "vendor_name": item.get("vendor"),
+                "hardware_model": item.get("hardware_model"),
+                "sys_descr": item.get("sys_descr"),
+                "sys_name": item.get("hostname"),
+                "matched_mibs": item.get("matched_mibs") or [],
+            },
+            unifi_hint,
+            sources=item.get("sources") or [],
+            interface_count=int(item.get("interface_count") or 0),
         )
         item.pop("has_ups_telemetry", None)
         item.pop("has_wireless_telemetry", None)

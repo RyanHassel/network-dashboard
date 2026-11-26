@@ -141,6 +141,7 @@ interface UpdateProgressComponent {
   status: "pending" | "running" | "completed" | "error" | string;
   pct: number;
   detail: string;
+  logs?: string[];
 }
 
 interface UpdateProgressState {
@@ -374,6 +375,7 @@ interface UnifiedDeviceItem {
   hardware_model?: string | null;
   device_category?: string | null;
   device_profile_type?: string;
+  device_role?: string | null;
   matched_mibs?: string[];
   subnet_cidr: string | null;
   vlan_id: number | null;
@@ -400,6 +402,100 @@ function formatDeviceVendorHardware(d: UnifiedDeviceItem): string {
     return vendor.toLowerCase().includes(model.toLowerCase()) ? vendor : `${vendor} / ${model}`;
   }
   return vendor || model || "—";
+}
+
+function renderDeviceRoleBadge(d: UnifiedDeviceItem): React.ReactNode {
+  const rawRole = (d.device_role || "").trim().toLowerCase();
+  const ptype = (d.device_profile_type || "").trim().toLowerCase();
+  const role = rawRole || (ptype === "wireless" ? "ap" : ptype && ptype !== "server" ? ptype : "");
+  if (!role) return null;
+
+  switch (role) {
+    case "router":
+      return (
+        <span
+          title="Router / Gateway"
+          className="inline-flex shrink-0 items-center gap-1 rounded border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300"
+        >
+          <Router className="h-2.5 w-2.5" /> Router
+        </span>
+      );
+    case "switch":
+      return (
+        <span
+          title="Network Switch"
+          className="inline-flex shrink-0 items-center gap-1 rounded border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-300"
+        >
+          <Network className="h-2.5 w-2.5" /> Switch
+        </span>
+      );
+    case "ap":
+    case "wireless":
+      return (
+        <span
+          title="Wireless AP / Device (SNMP)"
+          className="inline-flex shrink-0 items-center gap-1 rounded border border-teal-500/30 bg-teal-500/15 px-1.5 py-0.5 text-[10px] font-medium text-teal-300"
+        >
+          <Wifi className="h-2.5 w-2.5" /> Wi-Fi
+        </span>
+      );
+    case "firewall":
+      return (
+        <span
+          title="Firewall / Security Appliance"
+          className="inline-flex shrink-0 items-center gap-1 rounded border border-rose-500/30 bg-rose-500/10 px-1.5 py-0.5 text-[10px] font-medium text-rose-300"
+        >
+          <ShieldCheck className="h-2.5 w-2.5" /> Firewall
+        </span>
+      );
+    case "server":
+      return (
+        <span
+          title="Server / Host"
+          className="inline-flex shrink-0 items-center gap-1 rounded border border-indigo-500/30 bg-indigo-500/10 px-1.5 py-0.5 text-[10px] font-medium text-indigo-300"
+        >
+          <Server className="h-2.5 w-2.5" /> Server
+        </span>
+      );
+    case "nas":
+      return (
+        <span
+          title="NAS / Storage"
+          className="inline-flex shrink-0 items-center gap-1 rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-300"
+        >
+          <HardDrive className="h-2.5 w-2.5" /> NAS
+        </span>
+      );
+    case "ups":
+      return (
+        <span
+          title="UPS Battery Backup"
+          className="inline-flex shrink-0 items-center gap-1 rounded border border-amber-500/30 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300"
+        >
+          <Battery className="h-2.5 w-2.5" /> UPS
+        </span>
+      );
+    case "printer":
+      return (
+        <span
+          title="Network Printer"
+          className="inline-flex shrink-0 items-center gap-1 rounded border border-slate-600 bg-slate-800/80 px-1.5 py-0.5 text-[10px] font-medium text-slate-300"
+        >
+          <Printer className="h-2.5 w-2.5" /> Printer
+        </span>
+      );
+    case "network":
+      return (
+        <span
+          title="Network Infrastructure Device"
+          className="inline-flex shrink-0 items-center gap-1 rounded border border-sky-500/25 bg-sky-500/10 px-1.5 py-0.5 text-[10px] font-medium text-sky-300"
+        >
+          <Network className="h-2.5 w-2.5" /> Network
+        </span>
+      );
+    default:
+      return null;
+  }
 }
 
 interface UPSTelemetry {
@@ -2171,6 +2267,7 @@ export const App: React.FC = () => {
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const [updateProgress, setUpdateProgress] = useState<UpdateProgressState | null>(null);
   const [updateMinimized, setUpdateMinimized] = useState(false);
+  const [expandedUpdateCompId, setExpandedUpdateCompId] = useState<string | null>(null);
   const DISMISSED_UPDATE_SHA_KEY = "netdash_dismissed_update_sha";
   const [promptDismissedSha, setPromptDismissedSha] = useState<string | null>(() => {
     try {
@@ -4372,6 +4469,7 @@ export const App: React.FC = () => {
           (d.mac_address || "").toLowerCase().includes(q) ||
           (d.vendor || "").toLowerCase().includes(q) ||
           (d.hardware_model || "").toLowerCase().includes(q) ||
+          (d.device_role || "").toLowerCase().includes(q) ||
           (d.sys_descr || "").toLowerCase().includes(q)
         );
       }
@@ -5315,43 +5413,47 @@ export const App: React.FC = () => {
       )}
 
       {/* Main Content Container */}
-      <main className="mx-auto max-w-7xl space-y-6 px-4 py-6 sm:px-6">
+      <main
+        className={
+          showFullUpdatePage
+            ? "mx-auto flex h-[calc(100dvh-4.25rem)] max-w-5xl items-center justify-center overflow-hidden px-4 py-3 sm:px-6"
+            : "mx-auto max-w-7xl space-y-6 px-4 py-6 sm:px-6"
+        }
+      >
         {showFullUpdatePage ? (
-          <div className="mx-auto max-w-3xl space-y-6 py-6">
-            <div className="rounded-xl border border-slate-800 bg-[#111827] p-6 shadow-2xl">
-              <div className="flex flex-wrap items-start justify-between gap-4">
-                <div className="flex items-center gap-3.5">
+          <div className="w-full max-w-3xl">
+            <div className="rounded-xl border border-slate-800 bg-[#111827] p-4 shadow-2xl sm:p-5">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
                   <div
-                    className={`flex h-11 w-11 items-center justify-center rounded-xl border ${
+                    className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border ${
                       updateProgress?.status === "error"
                         ? "border-rose-500/40 bg-rose-500/10 text-rose-400"
-                        : updateProgress?.status === "completed"
-                          ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
-                          : "border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
+                        : "border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
                     }`}
                   >
                     {updateProgress?.status === "completed" ? (
-                      <Check className="h-5 w-5" />
+                      <Check className="h-4 w-4" />
                     ) : updateProgress?.status === "error" ? (
-                      <X className="h-5 w-5" />
+                      <X className="h-4 w-4" />
                     ) : (
-                      <RefreshCw className="h-5 w-5 animate-spin" />
+                      <RefreshCw className="h-4 w-4 animate-spin" />
                     )}
                   </div>
                   <div>
-                    <h2 className="text-base font-semibold text-white">
+                    <h2 className="text-sm font-semibold text-white">
                       {updateProgress?.status === "completed"
                         ? "Update Complete"
                         : updateProgress?.status === "error"
                           ? "Update Encountered an Error"
                           : "Application is Updating"}
                     </h2>
-                    <p className="mt-0.5 text-xs text-slate-400">
+                    <p className="text-[11px] text-slate-400">
                       {(updateProgress?.from_version || updateProgress?.from_sha) &&
                       (updateProgress?.target_version || updateProgress?.target_sha)
-                        ? `Installing update ${updateProgress?.from_version || updateProgress?.from_sha} → ${
+                        ? `Installing ${updateProgress?.from_version || updateProgress?.from_sha} → ${
                             updateProgress?.target_version || updateProgress?.target_sha
-                          }. You can continue browsing the frontend while backend services reload.`
+                          } • Browse dashboard anytime while services reload`
                         : "Installing NetDash update and verifying container health."}
                     </p>
                   </div>
@@ -5361,7 +5463,7 @@ export const App: React.FC = () => {
                   {updateProgress?.status !== "error" && (
                     <button
                       onClick={() => setMinimizedPreference(true)}
-                      className="rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800"
+                      className="rounded-md border border-slate-700 bg-[#090D16] px-2.5 py-1 text-xs font-medium text-slate-200 hover:bg-slate-800"
                     >
                       Show Dashboard While Updating
                     </button>
@@ -5370,7 +5472,7 @@ export const App: React.FC = () => {
                     updateProgress?.status === "error") && (
                     <button
                       onClick={handleDismissUpdateProgress}
-                      className="rounded-md bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
+                      className="rounded-md bg-emerald-600 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-500"
                     >
                       Return to Dashboard
                     </button>
@@ -5379,16 +5481,16 @@ export const App: React.FC = () => {
               </div>
 
               {/* Overall Install Progress Bar */}
-              <div className="mt-6 rounded-lg border border-slate-800 bg-[#090D16] p-4">
-                <div className="mb-2 flex items-center justify-between text-xs">
-                  <span className="font-medium text-slate-200">
+              <div className="mt-3.5 rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                <div className="mb-1.5 flex items-center justify-between gap-3 text-xs">
+                  <span className="truncate font-medium text-slate-200">
                     {updateProgress?.message || "Preparing update..."}
                   </span>
-                  <span className="font-mono-tabular text-sm font-semibold text-emerald-400">
+                  <span className="shrink-0 font-mono-tabular text-sm font-semibold text-emerald-400">
                     {updateProgress?.overall_pct ?? 1}%
                   </span>
                 </div>
-                <div className="h-2.5 w-full overflow-hidden rounded-full bg-slate-800">
+                <div className="h-2 w-full overflow-hidden rounded-full bg-slate-800">
                   <div
                     style={{
                       width: `${Math.max(0, Math.min(100, updateProgress?.overall_pct ?? 1))}%`,
@@ -5402,12 +5504,16 @@ export const App: React.FC = () => {
                 </div>
               </div>
 
-              {/* Per-Component Progress Breakdown */}
-              <div className="mt-5 space-y-2.5">
-                <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
-                  System Component Progress
-                </p>
+              {/* Per-Component Compact Accordion Progress Breakdown */}
+              <div className="mt-3.5 space-y-1.5">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="font-semibold uppercase tracking-wider text-slate-400">
+                    Service Update Progress
+                  </span>
+                  <span className="text-slate-500">Click any service to expand details</span>
+                </div>
                 {(updateProgress?.components || []).map((comp) => {
+                  const isExpanded = expandedUpdateCompId === comp.id;
                   const badgeCls =
                     comp.status === "completed"
                       ? "bg-emerald-500/15 text-emerald-400"
@@ -5422,31 +5528,91 @@ export const App: React.FC = () => {
                       : comp.status === "error"
                         ? "bg-rose-500"
                         : "bg-sky-400";
+                  const compLogs = comp.logs || [];
                   return (
                     <div
                       key={comp.id}
-                      className="rounded-lg border border-slate-800 bg-[#090D16] p-3 text-xs"
+                      className="overflow-hidden rounded-lg border border-slate-800 bg-[#090D16] text-xs"
                     >
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="flex items-center gap-2">
-                          <span className="font-semibold text-white">{comp.name}</span>
+                      <button
+                        type="button"
+                        aria-expanded={isExpanded}
+                        onClick={() =>
+                          setExpandedUpdateCompId((prev) => (prev === comp.id ? null : comp.id))
+                        }
+                        className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left transition hover:bg-slate-800/40"
+                      >
+                        <div className="flex min-w-0 flex-1 items-center gap-2">
+                          <ChevronDown
+                            className={`h-3.5 w-3.5 shrink-0 text-slate-400 transition-transform ${
+                              isExpanded ? "" : "-rotate-90"
+                            }`}
+                          />
+                          <span className="shrink-0 font-semibold text-white">{comp.name}</span>
                           <span
-                            className={`rounded px-1.5 py-0.5 font-mono-tabular text-[10px] uppercase ${badgeCls}`}
+                            className={`shrink-0 rounded px-1.5 py-0.5 font-mono-tabular text-[10px] uppercase ${badgeCls}`}
                           >
                             {comp.status === "running" ? "updating" : comp.status}
                           </span>
+                          <span className="hidden truncate text-[11px] text-slate-400 sm:inline">
+                            {comp.detail || "—"}
+                          </span>
                         </div>
-                        <span className="font-mono-tabular font-semibold text-slate-200">
-                          {comp.pct}%
-                        </span>
-                      </div>
-                      <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
-                        <div
-                          style={{ width: `${Math.max(0, Math.min(100, comp.pct))}%` }}
-                          className={`h-full rounded-full transition-[width] duration-400 ease-out ${barCls}`}
-                        />
-                      </div>
-                      <div className="mt-1.5 text-[11px] text-slate-400">{comp.detail || "—"}</div>
+                        <div className="flex shrink-0 items-center gap-2.5">
+                          <div className="h-1.5 w-20 overflow-hidden rounded-full bg-slate-800 sm:w-28">
+                            <div
+                              style={{ width: `${Math.max(0, Math.min(100, comp.pct))}%` }}
+                              className={`h-full rounded-full transition-[width] duration-400 ease-out ${barCls}`}
+                            />
+                          </div>
+                          <span className="w-9 text-right font-mono-tabular text-[11px] font-semibold text-slate-200">
+                            {comp.pct}%
+                          </span>
+                        </div>
+                      </button>
+
+                      {isExpanded && (
+                        <div className="space-y-2 border-t border-slate-800/80 bg-[#060911] px-3 py-2.5 text-[11px]">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="font-medium text-slate-200">
+                              {comp.detail || "Waiting for this update stage..."}
+                            </span>
+                            <span className="font-mono-tabular text-[10px] text-slate-500">
+                              {updateProgress?.updated_at
+                                ? `Updated ${new Date(updateProgress.updated_at).toLocaleTimeString()}`
+                                : ""}
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2 text-[10px] text-slate-400">
+                            <span className="rounded border border-slate-800 bg-[#090D16] px-1.5 py-0.5 font-mono-tabular">
+                              Stage: {comp.id}
+                            </span>
+                            <span className="rounded border border-slate-800 bg-[#090D16] px-1.5 py-0.5 font-mono-tabular">
+                              Progress: {comp.pct}%
+                            </span>
+                            {(updateProgress?.target_version || updateProgress?.target_sha) && (
+                              <span className="rounded border border-slate-800 bg-[#090D16] px-1.5 py-0.5 font-mono-tabular">
+                                Target:{" "}
+                                {updateProgress?.target_version || updateProgress?.target_sha}
+                              </span>
+                            )}
+                          </div>
+                          {compLogs.length > 0 ? (
+                            <div className="max-h-24 space-y-0.5 overflow-y-auto rounded border border-slate-800/80 bg-[#04070E] p-2 font-mono-tabular text-[10px] text-slate-300">
+                              {compLogs.map((ln, lIdx) => (
+                                <div key={lIdx} className="truncate" title={ln}>
+                                  {ln}
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <div className="text-[10px] text-slate-500">
+                              Live build &amp; deploy log lines appear here when this service stage
+                              runs.
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -6231,14 +6397,7 @@ export const App: React.FC = () => {
                                     >
                                       <div className="flex items-center gap-1.5">
                                         <span>{d.hostname || d.ip_address}</span>
-                                        {d.device_profile_type === "wireless" && (
-                                          <span
-                                            title="Wireless AP / Device (SNMP)"
-                                            className="inline-flex items-center gap-1 rounded border border-teal-500/30 bg-teal-500/15 px-1.5 py-0.5 text-[10px] font-medium text-teal-300"
-                                          >
-                                            <Wifi className="h-2.5 w-2.5" /> Wi-Fi
-                                          </span>
-                                        )}
+                                        {renderDeviceRoleBadge(d)}
                                       </div>
                                     </td>
                                   );
