@@ -292,6 +292,28 @@ interface SNMPTargetConfig {
   enabled: boolean;
 }
 
+interface ICMPTargetConfig {
+  id: number;
+  device_id?: number | null;
+  device_ip: string;
+  label: string;
+  poll_interval: number;
+  enabled: boolean;
+  resolved_hostname?: string | null;
+  is_reachable?: boolean | null;
+  last_rtt_ms?: number | null;
+  packet_loss_pct?: number | null;
+  status_since?: string | null;
+  last_polled?: string | null;
+}
+
+interface ICMPHistoryPoint {
+  time: string;
+  rtt_ms: number | null;
+  packet_loss_pct: number;
+  uptime_pct: number;
+}
+
 interface SubnetConfig {
   id: number;
   subnet_cidr: string;
@@ -372,6 +394,7 @@ interface AllConfigPayload {
   overview_graph_settings?: OverviewGraphSettings;
   snmp_profiles: SNMPProfile[];
   snmp_targets: SNMPTargetConfig[];
+  icmp_targets?: ICMPTargetConfig[];
   subnets: SubnetConfig[];
   unifi_controllers: UniFiControllerConfig[];
 }
@@ -380,6 +403,7 @@ interface UnifiedDeviceItem {
   device_id?: number | null;
   ip_address: string;
   hostname: string;
+  dns_hostname?: string | null;
   mac_address: string | null;
   vendor: string | null;
   hardware_model?: string | null;
@@ -395,6 +419,10 @@ interface UnifiedDeviceItem {
   snmp_profile_name: string | null;
   snmp_profile_id: number | null;
   snmp_target_id: number | null;
+  icmp_enabled?: boolean;
+  icmp_reachable?: boolean | null;
+  icmp_rtt_ms?: number | null;
+  icmp_uptime_pct_24h?: number | null;
   sys_descr: string | null;
   sys_location: string | null;
   cpu_usage_pct: number | null;
@@ -512,6 +540,15 @@ function renderDeviceRoleBadge(d: UnifiedDeviceItem): React.ReactNode {
           className="inline-flex shrink-0 items-center gap-1 rounded border border-slate-700 bg-slate-800/80 px-1.5 py-0.5 text-[10px] font-medium text-slate-300"
         >
           <Monitor className="h-2.5 w-2.5" /> Client
+        </span>
+      );
+    case "icmp":
+      return (
+        <span
+          title="ICMP-Only Ping Host"
+          className="inline-flex shrink-0 items-center gap-1 rounded border border-cyan-500/30 bg-cyan-500/10 px-1.5 py-0.5 text-[10px] font-medium text-cyan-300"
+        >
+          <Activity className="h-2.5 w-2.5" /> ICMP
         </span>
       );
     default:
@@ -903,8 +940,25 @@ interface DeviceDetailPayload {
     last_poll_duration_ms: number;
     last_polled: string | null;
   } | null;
-  device_profile_type?: "ups" | "wireless" | "nas" | "printer" | "network" | "server" | "client" | string;
+  device_profile_type?: "ups" | "wireless" | "nas" | "printer" | "network" | "server" | "client" | "icmp" | string;
   device_role?: string | null;
+  icmp_host?: {
+    id: number;
+    device_ip: string;
+    label: string;
+    poll_interval: number;
+    enabled: boolean;
+    resolved_hostname: string | null;
+    is_reachable: boolean | null;
+    last_rtt_ms: number | null;
+    packet_loss_pct: number;
+    status_since: string | null;
+    uptime_sec: number | null;
+    uptime_pct_24h: number | null;
+    uptime_pct_7d: number | null;
+    samples_24h: number;
+    last_polled: string | null;
+  } | null;
   device_settings?: {
     custom_name: string | null;
     custom_location: string | null;
@@ -922,6 +976,7 @@ interface DeviceDetailPayload {
   };
   resolved_identity?: {
     hostname: string;
+    dns_hostname?: string | null;
     mac_address: string | null;
     vendor: string | null;
     subnet_cidr: string | null;
@@ -2397,6 +2452,11 @@ export const App: React.FC = () => {
   const [newHostLabel, setNewHostLabel] = useState("");
   const [newHostProfileId, setNewHostProfileId] = useState<number>(0);
 
+  // ICMP-Only Ping Host Form State
+  const [newIcmpIp, setNewIcmpIp] = useState("");
+  const [newIcmpLabel, setNewIcmpLabel] = useState("");
+  const [newIcmpInterval, setNewIcmpInterval] = useState(30);
+
   // Subnet Form State
   const [newSubnetCidr, setNewSubnetCidr] = useState("");
   const [newSubnetLabel, setNewSubnetLabel] = useState("");
@@ -2583,6 +2643,10 @@ export const App: React.FC = () => {
   >("24h");
   const [systemScaleMode, setSystemScaleMode] = useState<"auto" | "full">("auto");
   const [selectedStorageMount, setSelectedStorageMount] = useState<string>("__all__");
+  const [icmpHistory, setIcmpHistory] = useState<ICMPHistoryPoint[]>([]);
+  const [icmpHistoryRange, setIcmpHistoryRange] = useState<
+    "1h" | "6h" | "24h" | "7d" | "30d"
+  >("24h");
 
   const [subnets, setSubnets] = useState<string[]>([]);
   const [selectedSubnet, setSelectedSubnet] = useState<string>("");
@@ -2951,6 +3015,11 @@ export const App: React.FC = () => {
         } else {
           setSystemHistory([]);
           setSystemHistoryVolumes([]);
+        }
+        if (data.icmp_host) {
+          fetchIcmpHistory(data.ip_address, icmpHistoryRange);
+        } else {
+          setIcmpHistory([]);
         }
       } else {
         setDeviceDetail(null);
@@ -3359,6 +3428,69 @@ export const App: React.FC = () => {
       fetchOverview();
       fetchAllDevices();
       flashFeedback("ok", "Removed monitored SNMP host.");
+    }
+  };
+
+  const handleAddIcmpHost = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newIcmpIp.trim()) return;
+    const r = await fetch("/api/config/icmp-targets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        device_ip: newIcmpIp.trim(),
+        label: newIcmpLabel.trim(),
+        poll_interval: Math.max(10, Number(newIcmpInterval) || 30),
+        enabled: true,
+      }),
+    });
+    if (r.ok) {
+      syncConfigState(await r.json());
+      flashFeedback(
+        "ok",
+        `Added ICMP-only host ${newIcmpIp.trim()} and queued ping + DNS lookup.`,
+      );
+      setNewIcmpIp("");
+      setNewIcmpLabel("");
+      setNewIcmpInterval(30);
+      fetchAllDevices();
+      setTimeout(() => {
+        fetchConfig();
+        fetchAllDevices();
+      }, 2500);
+    } else {
+      const errData = await r.json().catch(() => ({}));
+      flashFeedback("err", errData.detail || "Unable to add ICMP-only host.");
+    }
+  };
+
+  const handleToggleIcmpHost = async (t: ICMPTargetConfig) => {
+    const r = await fetch(`/api/config/icmp-targets/${t.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        device_ip: t.device_ip,
+        label: t.label || "",
+        poll_interval: t.poll_interval || 30,
+        enabled: !t.enabled,
+      }),
+    });
+    if (r.ok) {
+      syncConfigState(await r.json());
+      fetchAllDevices();
+      flashFeedback(
+        "ok",
+        `${!t.enabled ? "Enabled" : "Paused"} ICMP monitoring for ${t.device_ip}.`,
+      );
+    }
+  };
+
+  const handleDeleteIcmpHost = async (id: number) => {
+    const r = await fetch(`/api/config/icmp-targets/${id}`, { method: "DELETE" });
+    if (r.ok) {
+      syncConfigState(await r.json());
+      fetchAllDevices();
+      flashFeedback("ok", "Removed ICMP-only host.");
     }
   };
 
@@ -3875,6 +4007,21 @@ export const App: React.FC = () => {
     }
   };
 
+  const fetchIcmpHistory = async (ip: string, rk = icmpHistoryRange) => {
+    if (!ip) return;
+    try {
+      const r = await fetch(
+        `/api/devices/${encodeURIComponent(ip)}/icmp-history?range=${encodeURIComponent(rk)}`,
+      );
+      if (r.ok) {
+        const data = await r.json();
+        setIcmpHistory(data.series || []);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
   const fetchScanner = async () => {
     try {
       const r = await fetch("/api/scanner/hosts");
@@ -4110,6 +4257,18 @@ export const App: React.FC = () => {
     systemHistoryRange,
     Boolean(deviceDetail?.snmp_system),
     Boolean(deviceDetail?.unifi_device),
+  ]);
+
+  useEffect(() => {
+    const devIp = deviceDetail?.ip_address || selectedDeviceDetailIp;
+    if (devIp && deviceDetail?.icmp_host) {
+      fetchIcmpHistory(devIp, icmpHistoryRange);
+    }
+  }, [
+    deviceDetail?.ip_address,
+    selectedDeviceDetailIp,
+    icmpHistoryRange,
+    Boolean(deviceDetail?.icmp_host),
   ]);
 
   useEffect(() => {
@@ -6556,7 +6715,7 @@ export const App: React.FC = () => {
                                   return (
                                     <td
                                       key={col.key}
-                                      className="py-3 font-semibold text-emerald-400 underline"
+                                      className="py-3 font-semibold text-emerald-400"
                                     >
                                       <a
                                         href={getDeviceHref(d.ip_address, d.device_id)}
@@ -6566,10 +6725,18 @@ export const App: React.FC = () => {
                                           e.preventDefault();
                                           openDevicePage(d.ip_address, d.device_id);
                                         }}
-                                        className="hover:text-emerald-300"
+                                        className="underline hover:text-emerald-300"
                                       >
                                         {d.ip_address}
                                       </a>
+                                      {d.dns_hostname && d.dns_hostname !== d.ip_address && (
+                                        <div
+                                          className="mt-0.5 max-w-[180px] truncate font-sans text-[11px] font-normal text-slate-400"
+                                          title={d.dns_hostname}
+                                        >
+                                          {d.dns_hostname}
+                                        </div>
+                                      )}
                                     </td>
                                   );
                                 case "hostname":
@@ -6777,9 +6944,22 @@ export const App: React.FC = () => {
                         ID #{resolvedDetailDeviceId}
                       </span>
                     )}
-                    <h2 className="font-mono-tabular text-base font-bold text-white">
-                      {activeDetailIp || `Device #${selectedDeviceRef}`}
-                    </h2>
+                    <div>
+                      <h2 className="font-mono-tabular text-base font-bold leading-tight text-white">
+                        {activeDetailIp || `Device #${selectedDeviceRef}`}
+                      </h2>
+                      {(() => {
+                        const dnsName =
+                          deviceDetail?.icmp_host?.resolved_hostname ||
+                          deviceDetail?.resolved_identity?.dns_hostname;
+                        if (!dnsName || dnsName === activeDetailIp) return null;
+                        return (
+                          <div className="font-mono-tabular text-[11px] font-normal text-sky-300/90">
+                            {dnsName}
+                          </div>
+                        );
+                      })()}
+                    </div>
                     <span className="text-sm font-medium text-slate-300">
                       {deviceDetail?.resolved_identity?.hostname ||
                         deviceDetail?.snmp_system?.sys_name ||
@@ -6791,14 +6971,16 @@ export const App: React.FC = () => {
                       className={`rounded px-2 py-0.5 font-mono-tabular text-[11px] ${
                         deviceDetail?.discovered_host?.is_online ||
                         deviceDetail?.snmp_system?.is_reachable ||
-                        deviceDetail?.unifi_device?.status === "online"
+                        deviceDetail?.unifi_device?.status === "online" ||
+                        deviceDetail?.icmp_host?.is_reachable
                           ? "bg-emerald-500/15 text-emerald-400"
                           : "bg-slate-800 text-slate-400"
                       }`}
                     >
                       {deviceDetail?.discovered_host?.is_online ||
                       deviceDetail?.snmp_system?.is_reachable ||
-                      deviceDetail?.unifi_device?.status === "online"
+                      deviceDetail?.unifi_device?.status === "online" ||
+                      deviceDetail?.icmp_host?.is_reachable
                         ? "ONLINE"
                         : "OFFLINE"}
                     </span>
@@ -6825,6 +7007,10 @@ export const App: React.FC = () => {
                     ) : detailProfileType === "client" ? (
                       <span className="inline-flex items-center gap-1 rounded border border-slate-700 bg-slate-800/80 px-2 py-0.5 text-[11px] font-medium text-slate-300">
                         <Monitor className="h-3 w-3" /> UniFi Client
+                      </span>
+                    ) : detailProfileType === "icmp" ? (
+                      <span className="inline-flex items-center gap-1 rounded border border-cyan-500/30 bg-cyan-500/15 px-2 py-0.5 text-[11px] font-medium text-cyan-300">
+                        <Activity className="h-3 w-3" /> ICMP Host
                       </span>
                     ) : deviceDetail?.device_role === "router" ? (
                       <span className="inline-flex items-center gap-1 rounded border border-emerald-500/30 bg-emerald-500/15 px-2 py-0.5 text-[11px] font-medium text-emerald-300">
@@ -6853,7 +7039,9 @@ export const App: React.FC = () => {
                           ? "Printer Toner & Supply Levels, SNMP Counters, and Syslogs"
                           : detailProfileType === "client"
                             ? "UniFi Client Connection, IP/MAC Identity, Discovery & Syslog Events (SNMP Not Configured)"
-                            : "Complete Polled Telemetry — Discovery, SNMP System & Interfaces, and Syslogs"}
+                            : detailProfileType === "icmp"
+                              ? "ICMP Ping Response Time, Continuous & Historical Uptime & Reverse-DNS Identity"
+                              : "Complete Polled Telemetry — Discovery, SNMP System & Interfaces, and Syslogs"}
                   </p>
                 </div>
               </div>
@@ -7023,6 +7211,7 @@ export const App: React.FC = () => {
                             <option value="ups">UPS / Battery Backup</option>
                             <option value="printer">Printer</option>
                             <option value="network">Network Device</option>
+                            <option value="icmp">ICMP-Only Host</option>
                             <option value="client">Client</option>
                           </select>
                         </div>
@@ -8988,6 +9177,108 @@ export const App: React.FC = () => {
                     )}
                   </div>
                 )}
+
+                {/* ICMP Ping Latency & Uptime Panel */}
+                {deviceDetail?.icmp_host && (() => {
+                  const ih = deviceDetail.icmp_host;
+                  const rttChartPts = icmpHistory
+                    .filter((pt) => pt.rtt_ms != null)
+                    .map((pt) => ({
+                      label: pt.time,
+                      inVal: pt.rtt_ms ?? 0,
+                      outVal: 0,
+                    }));
+                  return (
+                    <div className="rounded-xl border border-cyan-500/30 bg-[#111827] p-5 space-y-4">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
+                            <Activity className="h-4 w-4 text-cyan-400" />
+                            ICMP Ping Response &amp; Uptime
+                          </h3>
+                          <p className="mt-0.5 text-xs text-slate-400">
+                            Echo probes every {ih.poll_interval}s
+                            {ih.resolved_hostname
+                              ? ` • Reverse DNS: ${ih.resolved_hostname}`
+                              : ""}
+                            {ih.last_polled
+                              ? ` • Last probe: ${new Date(ih.last_polled).toLocaleTimeString()}`
+                              : ""}
+                          </p>
+                        </div>
+                        <div className="inline-flex items-center rounded-md border border-slate-800 bg-[#090D16] p-0.5 text-[11px] font-medium">
+                          {(["1h", "6h", "24h", "7d", "30d"] as const).map((rk) => (
+                            <button
+                              key={rk}
+                              type="button"
+                              onClick={() => setIcmpHistoryRange(rk)}
+                              className={`rounded px-2 py-0.5 uppercase transition ${
+                                icmpHistoryRange === rk
+                                  ? "bg-cyan-500/20 text-cyan-300"
+                                  : "text-slate-400 hover:text-slate-200"
+                              }`}
+                            >
+                              {rk}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                        <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                          <div className="text-[11px] text-slate-400">Response Time</div>
+                          <div className="mt-1 font-mono-tabular text-lg font-semibold text-cyan-300">
+                            {ih.last_rtt_ms != null ? `${ih.last_rtt_ms.toFixed(2)} ms` : "—"}
+                          </div>
+                        </div>
+                        <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                          <div className="text-[11px] text-slate-400">Continuous Uptime</div>
+                          <div className="mt-1 font-mono-tabular text-lg font-semibold text-emerald-400">
+                            {ih.uptime_sec != null && ih.uptime_sec > 0
+                              ? formatDurationCompact(ih.uptime_sec)
+                              : ih.is_reachable
+                                ? "<1m"
+                                : "Down"}
+                          </div>
+                        </div>
+                        <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                          <div className="text-[11px] text-slate-400">24h Uptime</div>
+                          <div className="mt-1 font-mono-tabular text-lg font-semibold text-white">
+                            {ih.uptime_pct_24h != null ? `${ih.uptime_pct_24h.toFixed(1)}%` : "—"}
+                          </div>
+                        </div>
+                        <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                          <div className="text-[11px] text-slate-400">7d Uptime / Loss</div>
+                          <div className="mt-1 font-mono-tabular text-lg font-semibold text-slate-200">
+                            {ih.uptime_pct_7d != null ? `${ih.uptime_pct_7d.toFixed(1)}%` : "—"}{" "}
+                            <span className="text-xs font-normal text-slate-400">
+                              ({ih.packet_loss_pct.toFixed(0)}% loss)
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                        <div className="mb-2 text-xs font-medium text-slate-300">
+                          ICMP Round-Trip Latency ({icmpHistoryRange.toUpperCase()})
+                        </div>
+                        <DualAreaSparkChart
+                          points={rttChartPts}
+                          height={180}
+                          showYAxis={true}
+                          hideSecondary={true}
+                          primaryLabel="Ping Latency (ms)"
+                          primaryShortLabel="Latency"
+                          primaryColor="#22D3EE"
+                          yAxisLabel="ms"
+                          formatValue={(v) => `${v.toFixed(2)} ms`}
+                          formatAxisTick={(v) => (v >= 100 ? `${Math.round(v)}` : v.toFixed(1))}
+                          emptyMessage="Waiting for ICMP ping samples..."
+                        />
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 {/* System Resource Telemetry: CPU, Memory & Storage Historical Graphs */}
                 {showSystemResourceCard && (() => {
@@ -11053,6 +11344,143 @@ export const App: React.FC = () => {
                         </td>
                       </tr>
                     ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* 3b. ICMP-Only Ping Hosts (Latency, Uptime & Reverse DNS) */}
+            <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+              <h2 className="text-sm font-semibold text-white">
+                ICMP-Only Ping Hosts (Latency, Uptime &amp; DNS Resolution)
+              </h2>
+              <p className="mt-0.5 text-xs text-slate-400">
+                Add IP addresses for devices or external endpoints that only support ICMP ping.
+                NetDash continuously records latency/uptime and resolves reverse-DNS hostnames below
+                each IP.
+              </p>
+
+              <form onSubmit={handleAddIcmpHost} className="mt-4 flex flex-wrap gap-2.5">
+                <input
+                  type="text"
+                  placeholder="IPv4 / IPv6 Address (e.g. 10.1.3.50 or 1.1.1.1)"
+                  value={newIcmpIp}
+                  onChange={(e) => setNewIcmpIp(e.target.value)}
+                  className="w-64 rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 font-mono-tabular text-xs text-white"
+                  required
+                />
+                <input
+                  type="text"
+                  placeholder="Friendly Name (optional)"
+                  value={newIcmpLabel}
+                  onChange={(e) => setNewIcmpLabel(e.target.value)}
+                  className="rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 text-xs text-white"
+                />
+                <input
+                  type="number"
+                  min={10}
+                  max={3600}
+                  value={newIcmpInterval}
+                  onChange={(e) => setNewIcmpInterval(Number(e.target.value))}
+                  title="Ping interval in seconds"
+                  className="w-28 rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 font-mono-tabular text-xs text-white"
+                />
+                <button
+                  type="submit"
+                  className="flex items-center gap-1.5 rounded-md bg-cyan-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-cyan-500"
+                >
+                  <Plus className="h-3.5 w-3.5" /> Add ICMP Host
+                </button>
+              </form>
+
+              <div className="mt-4 overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-800 text-slate-400">
+                      <th className="pb-2 font-medium">Host IP / DNS</th>
+                      <th className="pb-2 font-medium">Label</th>
+                      <th className="pb-2 font-medium">Status</th>
+                      <th className="pb-2 font-medium">Latency</th>
+                      <th className="pb-2 font-medium">Interval</th>
+                      <th className="pb-2 text-right font-medium">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60 font-mono-tabular">
+                    {(config?.icmp_targets || []).length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="py-5 text-center font-sans text-slate-500">
+                          No ICMP-only hosts added yet. Add an IP above to track ping latency and
+                          uptime.
+                        </td>
+                      </tr>
+                    ) : (
+                      (config?.icmp_targets || []).map((t) => (
+                        <tr key={t.id}>
+                          <td
+                            onClick={() => openDevicePage(t.device_ip, t.device_id)}
+                            className="cursor-pointer py-2.5 font-semibold text-emerald-400"
+                          >
+                            <a
+                              href={getDeviceHref(t.device_ip, t.device_id)}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (isModifiedClick(e)) return;
+                                e.preventDefault();
+                                openDevicePage(t.device_ip, t.device_id);
+                              }}
+                              className="underline hover:text-emerald-300"
+                            >
+                              {t.device_ip}
+                            </a>
+                            {t.resolved_hostname && t.resolved_hostname !== t.device_ip && (
+                              <div className="mt-0.5 font-sans text-[11px] font-normal text-slate-400">
+                                {t.resolved_hostname}
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-2.5 font-sans text-slate-300">{t.label || "—"}</td>
+                          <td className="py-2.5">
+                            {!t.enabled ? (
+                              <span className="rounded bg-slate-800 px-2 py-0.5 text-[10px] text-slate-400">
+                                PAUSED
+                              </span>
+                            ) : t.is_reachable === true ? (
+                              <span className="rounded bg-emerald-500/15 px-2 py-0.5 text-[10px] text-emerald-400">
+                                UP
+                              </span>
+                            ) : t.last_polled ? (
+                              <span className="rounded bg-rose-500/15 px-2 py-0.5 text-[10px] text-rose-400">
+                                DOWN
+                              </span>
+                            ) : (
+                              <span className="rounded bg-slate-800 px-2 py-0.5 text-[10px] text-slate-400">
+                                PENDING
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2.5 text-cyan-300">
+                            {t.last_rtt_ms != null ? `${t.last_rtt_ms.toFixed(2)} ms` : "—"}
+                          </td>
+                          <td className="py-2.5 text-slate-400">{t.poll_interval}s</td>
+                          <td className="py-2.5 text-right">
+                            <div className="flex justify-end gap-1.5">
+                              <button
+                                onClick={() => handleToggleIcmpHost(t)}
+                                className="inline-flex items-center gap-1 rounded px-2 py-1 font-sans text-sky-400 hover:bg-sky-500/15"
+                              >
+                                {t.enabled ? "Pause" : "Resume"}
+                              </button>
+                              <button
+                                onClick={() => handleDeleteIcmpHost(t.id)}
+                                className="inline-flex items-center gap-1 rounded px-2 py-1 text-rose-400 hover:bg-rose-500/15"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" /> Remove
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))
+                    )}
                   </tbody>
                 </table>
               </div>

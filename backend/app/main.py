@@ -28,6 +28,7 @@ from app.db_schema import (
     ensure_dynamic_config_tables,
     repair_implausible_snmp_spikes,
 )
+from app.icmp_poller import resolve_reverse_dns
 from app.mib_catalog import (
     MIBS_DIR,
     VENDOR_CATALOG,
@@ -458,6 +459,13 @@ class DeviceSettingsPayload(BaseModel):
     notes: Optional[str] = None
     snmp_enabled: Optional[bool] = None
     snmp_profile_id: Optional[int] = None
+
+
+class ICMPTargetPayload(BaseModel):
+    device_ip: str
+    label: str = ""
+    poll_interval: int = 30
+    enabled: bool = True
 
 
 @asynccontextmanager
@@ -1226,6 +1234,7 @@ async def get_system_info() -> Dict[str, Any]:
             loop_labels = [
                 ("live_traffic_streamer", "Live Traffic Streamer"),
                 ("snmp_poller", "SNMP Poller Loop"),
+                ("icmp_poller", "ICMP Ping Poller"),
                 ("subnet_scanner", "Nmap Subnet Scanner Loop"),
                 ("unifi_collector", "UniFi Collector Loop"),
             ]
@@ -1817,8 +1826,18 @@ async def get_all_config() -> Dict[str, Any]:
             ORDER BY id ASC
             """
         )
+        icmp_targets = await conn.fetch(
+            """
+            SELECT id, device_ip, label, poll_interval, enabled, resolved_hostname,
+                   is_reachable, last_rtt_ms, packet_loss_pct, status_since, last_polled
+            FROM icmp_targets_config
+            ORDER BY id ASC
+            """
+        )
         target_id_map = await ensure_device_ids(
-            conn, [str(r["device_ip"]) for r in targets if r["device_ip"]]
+            conn,
+            [str(r["device_ip"]) for r in targets if r["device_ip"]]
+            + [str(r["device_ip"]) for r in icmp_targets if r["device_ip"]],
         )
 
     targets_out = []
@@ -1827,12 +1846,23 @@ async def get_all_config() -> Dict[str, Any]:
         d["device_id"] = target_id_map.get(str(r["device_ip"]))
         targets_out.append(d)
 
+    icmp_targets_out = []
+    for r in icmp_targets:
+        d = dict(r)
+        d["device_id"] = target_id_map.get(str(r["device_ip"]))
+        if d.get("status_since"):
+            d["status_since"] = d["status_since"].isoformat()
+        if d.get("last_polled"):
+            d["last_polled"] = d["last_polled"].isoformat()
+        icmp_targets_out.append(d)
+
     return {
         "onboarding": onboarding,
         "isp_settings": isp_settings,
         "overview_graph_settings": overview_graph_settings,
         "snmp_profiles": [dict(r) for r in profiles],
         "snmp_targets": targets_out,
+        "icmp_targets": icmp_targets_out,
         "subnets": [dict(r) for r in subnets],
         "unifi_controllers": [dict(r) for r in unifi_ctrls],
     }
@@ -2372,6 +2402,87 @@ async def delete_snmp_target(target_id: int) -> Dict[str, Any]:
         )
         if dev_ip:
             await conn.execute("DELETE FROM snmp_devices WHERE device_ip = $1", dev_ip)
+    return await get_all_config()
+
+
+@app.post("/api/config/icmp-targets")
+async def create_icmp_target(payload: ICMPTargetPayload) -> Dict[str, Any]:
+    raw_ip = payload.device_ip.strip()
+    if not raw_ip:
+        raise HTTPException(status_code=400, detail="Host IPv4 address is required.")
+    try:
+        ip_str = str(ipaddress.ip_address(raw_ip))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid IP address: {raw_ip}") from exc
+
+    label_str = payload.label.strip()
+    poll_int = max(10, min(3600, int(payload.poll_interval or 30)))
+    dns_host = await resolve_reverse_dns(ip_str, timeout=0.6)
+
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO icmp_targets_config (device_ip, label, poll_interval, enabled, resolved_hostname)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (device_ip) DO UPDATE SET
+                label = EXCLUDED.label,
+                poll_interval = EXCLUDED.poll_interval,
+                enabled = EXCLUDED.enabled,
+                resolved_hostname = COALESCE(EXCLUDED.resolved_hostname, icmp_targets_config.resolved_hostname)
+            """,
+            ip_str,
+            label_str,
+            poll_int,
+            bool(payload.enabled),
+            dns_host,
+        )
+        await ensure_device_ids(conn, [ip_str])
+    await _notify_worker("icmp_now")
+    return await get_all_config()
+
+
+@app.put("/api/config/icmp-targets/{target_id}")
+async def update_icmp_target(target_id: int, payload: ICMPTargetPayload) -> Dict[str, Any]:
+    raw_ip = payload.device_ip.strip()
+    if not raw_ip:
+        raise HTTPException(status_code=400, detail="Host IPv4 address is required.")
+    try:
+        ip_str = str(ipaddress.ip_address(raw_ip))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid IP address: {raw_ip}") from exc
+
+    label_str = payload.label.strip()
+    poll_int = max(10, min(3600, int(payload.poll_interval or 30)))
+
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE icmp_targets_config
+            SET device_ip = $1, label = $2, poll_interval = $3, enabled = $4
+            WHERE id = $5
+            """,
+            ip_str,
+            label_str,
+            poll_int,
+            bool(payload.enabled),
+            target_id,
+        )
+        await ensure_device_ids(conn, [ip_str])
+    await _notify_worker("icmp_now")
+    return await get_all_config()
+
+
+@app.delete("/api/config/icmp-targets/{target_id}")
+async def delete_icmp_target(target_id: int) -> Dict[str, Any]:
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM icmp_targets_config WHERE id = $1",
+            target_id,
+        )
+    await _notify_worker("icmp_now")
     return await get_all_config()
 
 
@@ -3163,6 +3274,7 @@ _VALID_CUSTOM_DEVICE_TYPES = {
     "printer",
     "network",
     "client",
+    "icmp",
 }
 
 
@@ -3181,6 +3293,8 @@ def _role_to_profile_type(role: str) -> str:
         return "server"
     if r == "client":
         return "client"
+    if r == "icmp":
+        return "icmp"
     return "network"
 
 
@@ -3917,6 +4031,7 @@ async def _resolve_device_ref(
             EXISTS (SELECT 1 FROM discovered_hosts WHERE host(ip_address) = $1)
             OR EXISTS (SELECT 1 FROM snmp_targets_config WHERE device_ip = $1)
             OR EXISTS (SELECT 1 FROM snmp_devices WHERE device_ip = $1)
+            OR EXISTS (SELECT 1 FROM icmp_targets_config WHERE device_ip = $1)
             OR EXISTS (SELECT 1 FROM unifi_devices WHERE ip_address = $1 OR lan_ip = $1)
             OR EXISTS (SELECT 1 FROM unifi_clients WHERE ip_address = $1)
             OR EXISTS (SELECT 1 FROM device_logs WHERE source_ip = $1 AND time > NOW() - INTERVAL '30 days')
@@ -3997,6 +4112,32 @@ async def get_all_devices() -> Dict[str, Any]:
             """
         )
 
+        icmp_rows = await conn.fetch(
+            """
+            SELECT id, device_ip, label, poll_interval, enabled, resolved_hostname,
+                   is_reachable, last_rtt_ms, packet_loss_pct, status_since, last_polled
+            FROM icmp_targets_config
+            """
+        )
+
+        icmp_uptime_rows = await conn.fetch(
+            """
+            SELECT device_ip,
+                   ROUND(
+                       (COUNT(*) FILTER (WHERE is_reachable) * 100.0 / NULLIF(COUNT(*), 0))::numeric,
+                       1
+                   )::double precision AS uptime_pct_24h
+            FROM icmp_metrics_raw
+            WHERE time > NOW() - INTERVAL '24 hours'
+            GROUP BY device_ip
+            """
+        )
+        icmp_uptime_map = {
+            str(r["device_ip"]): float(r["uptime_pct_24h"])
+            for r in icmp_uptime_rows
+            if r["uptime_pct_24h"] is not None
+        }
+
         all_dev_ips: List[str] = []
         for r in disc_rows:
             if r["ip_address"]:
@@ -4005,6 +4146,9 @@ async def get_all_devices() -> Dict[str, Any]:
             if r["device_ip"]:
                 all_dev_ips.append(str(r["device_ip"]).strip())
         for r in snmp_dev_rows:
+            if r["device_ip"]:
+                all_dev_ips.append(str(r["device_ip"]).strip())
+        for r in icmp_rows:
             if r["device_ip"]:
                 all_dev_ips.append(str(r["device_ip"]).strip())
         for r in unifi_dev_rows:
@@ -4059,6 +4203,11 @@ async def get_all_devices() -> Dict[str, Any]:
                 "uptime_sec": None,
                 "sources": [],
                 "is_unifi_client": False,
+                "dns_hostname": None,
+                "icmp_enabled": False,
+                "icmp_reachable": None,
+                "icmp_rtt_ms": None,
+                "icmp_uptime_pct_24h": None,
                 "log_count_24h": 0,
                 "last_seen": None,
             }
@@ -4175,13 +4324,43 @@ async def get_all_devices() -> Dict[str, Any]:
         if "Syslog" not in item["sources"]:
             item["sources"].append("Syslog")
 
+    now_utc = datetime.now(timezone.utc)
+    for r in icmp_rows:
+        ip_str = str(r["device_ip"])
+        item = _ensure_ip(ip_str)
+        dns_name = str(r["resolved_hostname"] or "").strip() or None
+        label_name = str(r["label"] or "").strip() or None
+        if dns_name:
+            item["dns_hostname"] = dns_name
+        if label_name and (item["hostname"] == ip_str or not item["hostname"]):
+            item["hostname"] = label_name
+        elif dns_name and (item["hostname"] == ip_str or not item["hostname"]):
+            item["hostname"] = dns_name
+        item["icmp_enabled"] = bool(r["enabled"])
+        item["icmp_reachable"] = bool(r["is_reachable"]) if r["last_polled"] else None
+        if r["last_rtt_ms"] is not None:
+            item["icmp_rtt_ms"] = round(float(r["last_rtt_ms"]), 2)
+        item["icmp_uptime_pct_24h"] = icmp_uptime_map.get(ip_str)
+        if r["is_reachable"]:
+            item["is_online"] = True
+            if item["uptime_sec"] is None and r["status_since"]:
+                delta_sec = int((now_utc - r["status_since"]).total_seconds())
+                if delta_sec >= 0:
+                    item["uptime_sec"] = delta_sec
+        if "ICMP" not in item["sources"]:
+            item["sources"].append("ICMP")
+        if r["last_polled"] and not item["last_seen"]:
+            item["last_seen"] = r["last_polled"].isoformat()
+
     # Auto-match vendor MIB profile for any previously discovered device missing matched_mibs
     for item in by_ip.values():
         is_unifi_infra = bool(item.get("_unifi_device_type"))
         has_snmp = "SNMP" in (item.get("sources") or [])
+        has_icmp = "ICMP" in (item.get("sources") or [])
         is_client_only = bool(item.get("is_unifi_client")) and not is_unifi_infra and not has_snmp
+        is_icmp_only = has_icmp and not has_snmp and not is_unifi_infra and not bool(item.get("is_unifi_client"))
 
-        if not is_client_only and not item.get("matched_mibs"):
+        if not is_client_only and not is_icmp_only and not item.get("matched_mibs"):
             matched = match_device_vendor_profile(
                 "",
                 f"{item.get('vendor') or ''} {item.get('sys_descr') or ''}",
@@ -4205,6 +4384,9 @@ async def get_all_devices() -> Dict[str, Any]:
         if is_client_only:
             item["device_profile_type"] = "client"
             item["device_role"] = "client"
+        elif is_icmp_only:
+            item["device_profile_type"] = "icmp"
+            item["device_role"] = "icmp"
         else:
             item["device_profile_type"] = _classify_device_profile(
                 {
@@ -4375,6 +4557,36 @@ async def get_device_detail(device_ref: str) -> Dict[str, Any]:
             device_ip,
         )
 
+        icmp_row = await conn.fetchrow(
+            """
+            SELECT id, device_ip, label, poll_interval, enabled, resolved_hostname,
+                   is_reachable, last_rtt_ms, packet_loss_pct, status_since, last_polled
+            FROM icmp_targets_config
+            WHERE device_ip = $1
+            """,
+            device_ip,
+        )
+        icmp_uptime_row = await conn.fetchrow(
+            """
+            SELECT
+                ROUND(
+                    (COUNT(*) FILTER (WHERE time > NOW() - INTERVAL '24 hours' AND is_reachable) * 100.0
+                     / NULLIF(COUNT(*) FILTER (WHERE time > NOW() - INTERVAL '24 hours'), 0))::numeric,
+                    1
+                )::double precision AS uptime_pct_24h,
+                ROUND(
+                    (COUNT(*) FILTER (WHERE is_reachable) * 100.0
+                     / NULLIF(COUNT(*), 0))::numeric,
+                    1
+                )::double precision AS uptime_pct_7d,
+                COUNT(*) FILTER (WHERE time > NOW() - INTERVAL '24 hours') AS samples_24h
+            FROM icmp_metrics_raw
+            WHERE device_ip = $1
+              AND time > NOW() - INTERVAL '7 days'
+            """,
+            device_ip,
+        )
+
     def _serialize(row: Optional[asyncpg.Record]) -> Optional[Dict[str, Any]]:
         if not row:
             return None
@@ -4540,15 +4752,57 @@ async def get_device_detail(device_ref: str) -> Dict[str, Any]:
         ),
     }
 
+    icmp_host_dict: Optional[Dict[str, Any]] = None
+    if icmp_row:
+        ih = dict(icmp_row)
+        uptime_sec_val: Optional[int] = None
+        if ih.get("is_reachable") and ih.get("status_since"):
+            delta_s = int((datetime.now(timezone.utc) - ih["status_since"]).total_seconds())
+            if delta_s >= 0:
+                uptime_sec_val = delta_s
+        icmp_host_dict = {
+            "id": ih.get("id"),
+            "device_ip": ih.get("device_ip"),
+            "label": ih.get("label") or "",
+            "poll_interval": int(ih.get("poll_interval") or 30),
+            "enabled": bool(ih.get("enabled")),
+            "resolved_hostname": str(ih.get("resolved_hostname") or "").strip() or None,
+            "is_reachable": bool(ih.get("is_reachable")) if ih.get("last_polled") else None,
+            "last_rtt_ms": round(float(ih["last_rtt_ms"]), 2) if ih.get("last_rtt_ms") is not None else None,
+            "packet_loss_pct": round(float(ih["packet_loss_pct"]), 1) if ih.get("packet_loss_pct") is not None else 0.0,
+            "status_since": ih["status_since"].isoformat() if ih.get("status_since") else None,
+            "uptime_sec": uptime_sec_val,
+            "uptime_pct_24h": float(icmp_uptime_row["uptime_pct_24h"]) if icmp_uptime_row and icmp_uptime_row["uptime_pct_24h"] is not None else None,
+            "uptime_pct_7d": float(icmp_uptime_row["uptime_pct_7d"]) if icmp_uptime_row and icmp_uptime_row["uptime_pct_7d"] is not None else None,
+            "samples_24h": int(icmp_uptime_row["samples_24h"] or 0) if icmp_uptime_row else 0,
+            "last_polled": ih["last_polled"].isoformat() if ih.get("last_polled") else None,
+        }
+        if icmp_host_dict["resolved_hostname"]:
+            resolved_identity["dns_hostname"] = icmp_host_dict["resolved_hostname"]
+            if resolved_identity["hostname"] == device_ip:
+                resolved_identity["hostname"] = icmp_host_dict["resolved_hostname"]
+        elif icmp_host_dict["label"] and resolved_identity["hostname"] == device_ip:
+            resolved_identity["hostname"] = icmp_host_dict["label"]
+
     is_client_only = (
         bool(unifi_cli_dict)
         and not bool(unifi_dev_dict)
         and not bool(snmp_cfg_dict)
         and not bool(snmp_sys_dict)
     )
+    is_icmp_only = (
+        bool(icmp_host_dict)
+        and not bool(snmp_cfg_dict)
+        and not bool(snmp_sys_dict)
+        and not bool(unifi_dev_dict)
+        and not bool(unifi_cli_dict)
+    )
     if is_client_only:
         device_profile_type = "client"
         device_role = "client"
+    elif is_icmp_only:
+        device_profile_type = "icmp"
+        device_role = "icmp"
     else:
         device_profile_type = _classify_device_profile(
             snmp_sys_dict, unifi_dev_dict, fallback_mib_match
@@ -4601,6 +4855,7 @@ async def get_device_detail(device_ref: str) -> Dict[str, Any]:
         "discovered_host": host_dict,
         "snmp_config": snmp_cfg_dict,
         "snmp_system": snmp_sys_dict,
+        "icmp_host": icmp_host_dict,
         "matched_mib_profile": fallback_mib_match,
         "resolved_identity": resolved_identity,
         "snmp_interfaces": [_serialize(r) for r in snmp_if_rows],
@@ -4722,6 +4977,7 @@ async def remove_device(device_ref: str) -> Dict[str, Any]:
         if res_tgt and not res_tgt.endswith(" 0"):
             removed_snmp_target = True
         await conn.execute("DELETE FROM snmp_devices WHERE device_ip = $1", device_ip)
+        await conn.execute("DELETE FROM icmp_targets_config WHERE device_ip = $1", device_ip)
         await conn.execute("DELETE FROM discovered_hosts WHERE host(ip_address) = $1", device_ip)
         await conn.execute(
             "DELETE FROM unifi_devices WHERE ip_address = $1 OR lan_ip = $1",
@@ -5170,6 +5426,82 @@ async def get_device_system_history(
         "device_ip": device_ip,
         "range": rk,
         "volumes": available_volumes,
+        "series": series,
+    }
+
+
+@app.get("/api/devices/{device_ref}/icmp-history")
+async def get_device_icmp_history(
+    device_ref: str,
+    range_key: str = Query(default="24h", alias="range"),
+) -> Dict[str, Any]:
+    """Returns time-bucketed ICMP latency (ms), uptime %, and packet loss history for a device."""
+    rk = (range_key or "24h").strip().lower()
+    if rk == "1d":
+        rk = "24h"
+    if rk not in ("1h", "6h", "24h", "7d", "30d"):
+        rk = "24h"
+
+    range_specs = {
+        "1h": ("1 hour", None),
+        "6h": ("6 hours", "5 minutes"),
+        "24h": ("24 hours", "15 minutes"),
+        "7d": ("7 days", "1 hour"),
+        "30d": ("30 days", "4 hours"),
+    }
+    sql_interval, bucket_size = range_specs[rk]
+
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        device_id, device_ip = await _resolve_device_ref(conn, device_ref)
+        if bucket_size is None:
+            rows = await conn.fetch(
+                f"""
+                SELECT time AS bucket,
+                       rtt_ms,
+                       packet_loss_pct,
+                       CASE WHEN is_reachable THEN 100.0 ELSE 0.0 END AS uptime_pct
+                FROM icmp_metrics_raw
+                WHERE device_ip = $1
+                  AND time > NOW() - INTERVAL '{sql_interval}'
+                ORDER BY time ASC
+                """,
+                device_ip,
+            )
+        else:
+            rows = await conn.fetch(
+                f"""
+                SELECT time_bucket('{bucket_size}', time) AS bucket,
+                       AVG(rtt_ms) AS rtt_ms,
+                       AVG(packet_loss_pct) AS packet_loss_pct,
+                       (COUNT(*) FILTER (WHERE is_reachable) * 100.0 / NULLIF(COUNT(*), 0))::double precision AS uptime_pct
+                FROM icmp_metrics_raw
+                WHERE device_ip = $1
+                  AND time > NOW() - INTERVAL '{sql_interval}'
+                GROUP BY bucket
+                ORDER BY bucket ASC
+                """,
+                device_ip,
+            )
+
+    series = [
+        {
+            "time": r["bucket"].isoformat(),
+            "rtt_ms": round(float(r["rtt_ms"]), 2) if r["rtt_ms"] is not None else None,
+            "packet_loss_pct": round(float(r["packet_loss_pct"]), 1)
+            if r["packet_loss_pct"] is not None
+            else 0.0,
+            "uptime_pct": round(float(r["uptime_pct"]), 1)
+            if r["uptime_pct"] is not None
+            else 0.0,
+        }
+        for r in rows
+    ]
+
+    return {
+        "device_id": device_id,
+        "device_ip": device_ip,
+        "range": rk,
         "series": series,
     }
 

@@ -15,6 +15,7 @@ import httpx
 import redis.asyncio as aioredis
 
 from app.db_schema import ensure_dynamic_config_tables
+from app.icmp_poller import ICMPPoller
 from app.scanner import SubnetScanner
 from app.snmp_poller import SNMPPoller
 from app.unifi import UniFiCollector
@@ -33,6 +34,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 
 UNIFI_POLL_INTERVAL = max(10, int(os.getenv("UNIFI_POLL_INTERVAL", "30") or 30))
 SNMP_POLL_INTERVAL = max(15, int(os.getenv("SNMP_POLL_INTERVAL", "60") or 60))
+ICMP_POLL_INTERVAL = max(10, int(os.getenv("ICMP_POLL_INTERVAL", "30") or 30))
 SUBNET_SCAN_MINUTES = max(1, int(os.getenv("SUBNET_SCAN_MINUTES", "15") or 15))
 LIVE_TRAFFIC_INTERVAL = max(1.0, min(10.0, float(os.getenv("LIVE_TRAFFIC_INTERVAL", "2") or 2)))
 
@@ -170,6 +172,49 @@ async def snmp_loop(
                 asyncio.create_task(snmp_trigger.wait()),
             ],
             timeout=SNMP_POLL_INTERVAL,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+
+
+async def icmp_loop(
+    poller: ICMPPoller,
+    pool: asyncpg.Pool,
+    redis_client: aioredis.Redis,
+    worker_state: Dict[str, Any],
+    stop_event: asyncio.Event,
+    icmp_trigger: asyncio.Event,
+) -> None:
+    logger.info("Starting ICMP ping poller loop (interval=%ds)", ICMP_POLL_INTERVAL)
+    loop_info = worker_state["loops"]["icmp_poller"]
+    first_run = True
+    while not stop_event.is_set():
+        force_now = first_run or icmp_trigger.is_set()
+        first_run = False
+        icmp_trigger.clear()
+        try:
+            results = await poller.poll_all(pool, force=force_now)
+            loop_info["status"] = "running"
+            loop_info["last_run"] = datetime.now(timezone.utc).isoformat()
+            if results:
+                up_cnt = sum(1 for r in results if r.get("is_reachable"))
+                loop_info["detail"] = f"{up_cnt}/{len(results)} ICMP host(s) reachable"
+                await publish_event(redis_client, "icmp_update", results)
+            elif not loop_info.get("detail") or loop_info.get("detail") == "Initializing":
+                loop_info["detail"] = "Idle (no active ICMP hosts)"
+        except Exception as exc:
+            logger.error("Error in ICMP loop: %s", exc)
+            loop_info["status"] = "error"
+            loop_info["last_run"] = datetime.now(timezone.utc).isoformat()
+            loop_info["detail"] = str(exc)[:160]
+
+        done, pending = await asyncio.wait(
+            [
+                asyncio.create_task(stop_event.wait()),
+                asyncio.create_task(icmp_trigger.wait()),
+            ],
+            timeout=ICMP_POLL_INTERVAL,
             return_when=asyncio.FIRST_COMPLETED,
         )
         for task in pending:
@@ -457,6 +502,7 @@ async def command_listener_loop(
     pool: asyncpg.Pool,
     scan_trigger: asyncio.Event,
     snmp_trigger: asyncio.Event,
+    icmp_trigger: asyncio.Event,
     unifi_trigger: asyncio.Event,
     live_reload_trigger: asyncio.Event,
     stop_event: asyncio.Event,
@@ -498,6 +544,8 @@ async def command_listener_loop(
                     if raw == "rematch_mibs":
                         await redis_client.set("snmp:force_rematch", "1", ex=60)
                     snmp_trigger.set()
+                if raw in ("icmp_now", "reload_config", "reload_all"):
+                    icmp_trigger.set()
                 if raw in ("unifi_now", "reload_all"):
                     unifi_trigger.set()
                 if raw in ("snmp_now", "unifi_now", "reload_all", "live_reload"):
@@ -511,6 +559,7 @@ async def main() -> None:
     stop_event = asyncio.Event()
     scan_trigger = asyncio.Event()
     snmp_trigger = asyncio.Event()
+    icmp_trigger = asyncio.Event()
     unifi_trigger = asyncio.Event()
     live_reload_trigger = asyncio.Event()
 
@@ -539,6 +588,7 @@ async def main() -> None:
 
     unifi_collector = UniFiCollector()
     snmp_poller = SNMPPoller()
+    icmp_poller = ICMPPoller()
     subnet_scanner = SubnetScanner()
 
     worker_state: Dict[str, Any] = {
@@ -553,6 +603,12 @@ async def main() -> None:
             "snmp_poller": {
                 "status": "starting",
                 "interval_sec": SNMP_POLL_INTERVAL,
+                "last_run": None,
+                "detail": "Initializing",
+            },
+            "icmp_poller": {
+                "status": "starting",
+                "interval_sec": ICMP_POLL_INTERVAL,
                 "last_run": None,
                 "detail": "Initializing",
             },
@@ -581,6 +637,7 @@ async def main() -> None:
         heartbeat_loop(redis_client, worker_state, stop_event),
         unifi_loop(unifi_collector, pool, redis_client, worker_state, stop_event, unifi_trigger),
         snmp_loop(snmp_poller, pool, redis_client, worker_state, stop_event, snmp_trigger),
+        icmp_loop(icmp_poller, pool, redis_client, worker_state, stop_event, icmp_trigger),
         scanner_loop(subnet_scanner, pool, redis_client, worker_state, stop_event, scan_trigger),
         live_traffic_loop(
             unifi_collector,
@@ -597,6 +654,7 @@ async def main() -> None:
             pool,
             scan_trigger,
             snmp_trigger,
+            icmp_trigger,
             unifi_trigger,
             live_reload_trigger,
             stop_event,

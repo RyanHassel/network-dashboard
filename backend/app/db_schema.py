@@ -52,6 +52,21 @@ CREATE TABLE IF NOT EXISTS snmp_targets_config (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS icmp_targets_config (
+    id                SERIAL PRIMARY KEY,
+    device_ip         TEXT NOT NULL UNIQUE,
+    label             TEXT DEFAULT '',
+    poll_interval     INT NOT NULL DEFAULT 30,
+    enabled           BOOLEAN NOT NULL DEFAULT TRUE,
+    resolved_hostname TEXT,
+    is_reachable      BOOLEAN DEFAULT FALSE,
+    last_rtt_ms       DOUBLE PRECISION,
+    packet_loss_pct   DOUBLE PRECISION DEFAULT 0,
+    status_since      TIMESTAMPTZ,
+    last_polled       TIMESTAMPTZ,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS scan_subnets_config (
     id          SERIAL PRIMARY KEY,
     subnet_cidr TEXT NOT NULL UNIQUE,
@@ -173,6 +188,17 @@ CREATE TABLE IF NOT EXISTS device_system_metrics_raw (
 
 CREATE INDEX IF NOT EXISTS idx_device_system_metrics_dev_time
     ON device_system_metrics_raw (device_ip, time DESC);
+
+CREATE TABLE IF NOT EXISTS icmp_metrics_raw (
+    time            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    device_ip       TEXT NOT NULL,
+    is_reachable    BOOLEAN NOT NULL DEFAULT FALSE,
+    rtt_ms          DOUBLE PRECISION,
+    packet_loss_pct DOUBLE PRECISION NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_icmp_metrics_raw_dev_time
+    ON icmp_metrics_raw (device_ip, time DESC);
 """
 
 
@@ -276,6 +302,7 @@ async def ensure_dynamic_config_tables(pool: asyncpg.Pool) -> None:
             ("ups_metrics_raw", 180),
             ("wireless_metrics_raw", 180),
             ("device_system_metrics_raw", 180),
+            ("icmp_metrics_raw", 90),
         ):
             try:
                 await conn.execute(
