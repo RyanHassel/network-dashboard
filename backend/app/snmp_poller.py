@@ -2848,11 +2848,28 @@ class SNMPPoller:
         enrichment["extended_metrics"]["responding_mibs"] = responding_mibs
         enrichment["extended_metrics"]["ip_addresses"] = ip_addresses[:32]
 
-        cpu_vals = [_to_float(v, -1.0) for v in cpu_loads.values()]
-        cpu_vals = [v for v in cpu_vals if v >= 0.0]
+        cpu_core_metrics: List[Dict[str, Any]] = []
+        cpu_vals: List[float] = []
+        sorted_cpu_items = sorted(
+            cpu_loads.items(),
+            key=lambda kv: (int(kv[0]) if str(kv[0]).isdigit() else 0, str(kv[0])),
+        )
+        for core_idx, (_, raw_val) in enumerate(sorted_cpu_items):
+            val = _to_float(raw_val, -1.0)
+            if val >= 0.0:
+                clamped = round(min(100.0, val), 1)
+                cpu_vals.append(clamped)
+                cpu_core_metrics.append(
+                    {
+                        "core": core_idx,
+                        "label": f"CPU {core_idx}",
+                        "usage_pct": clamped,
+                    }
+                )
         if cpu_vals:
             avg_cpu = round(sum(cpu_vals) / len(cpu_vals), 2)
             enrichment["extended_metrics"]["cpu_details"]["core_count"] = len(cpu_vals)
+            enrichment["extended_metrics"]["cpu_details"]["cores"] = cpu_core_metrics
         elif enrichment["cpu_pct"] is not None:
             avg_cpu = float(enrichment["cpu_pct"])
         else:
@@ -3315,8 +3332,8 @@ class SNMPPoller:
                             time, device_ip, cpu_usage_pct, mem_usage_pct,
                             mem_used_bytes, mem_total_bytes, storage_usage_pct,
                             storage_used_bytes, storage_total_bytes, temp_celsius,
-                            load_1m, volume_metrics
-                        ) VALUES (NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+                            load_1m, volume_metrics, cpu_core_metrics
+                        ) VALUES (NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb)
                         """,
                         target,
                         avg_cpu if has_cpu_metric else None,
@@ -3329,6 +3346,7 @@ class SNMPPoller:
                         temp_celsius,
                         cpu_det.get("load_1m"),
                         json.dumps(stor_sum["volume_metrics"]),
+                        json.dumps(cpu_core_metrics),
                     )
                 except Exception as exc:
                     logger.debug("device_system_metrics_raw insert skipped: %s", exc)

@@ -1209,7 +1209,27 @@ interface DeviceSystemHistoryPoint {
   temp_celsius: number | null;
   load_1m: number | null;
   volumes?: Record<string, DeviceSystemVolumePoint>;
+  cores?: Record<string, number>;
 }
+
+const CPU_CORE_COLORS = [
+  "#10B981",
+  "#38BDF8",
+  "#F59E0B",
+  "#A78BFA",
+  "#F43F5E",
+  "#2DD4BF",
+  "#FB923C",
+  "#E879F9",
+  "#84CC16",
+  "#60A5FA",
+  "#FBBF24",
+  "#C084FC",
+  "#FB7185",
+  "#34D399",
+  "#F97316",
+  "#818CF8",
+];
 
 interface SNMPTelemetrySeriesPoint {
   time: string;
@@ -1981,6 +2001,12 @@ const DualAreaSparkChart: React.FC<{
   linear?: boolean;
   dropMarkers?: Array<{ label: string; lossPct?: number }>;
   dropLabel?: string;
+  extraSeries?: Array<{
+    key: string;
+    label: string;
+    color: string;
+    points: Array<{ label: string; val: number }>;
+  }>;
 }> = ({
   points,
   height = 210,
@@ -2003,6 +2029,7 @@ const DualAreaSparkChart: React.FC<{
   linear = false,
   dropMarkers,
   dropLabel = "Ping Drop",
+  extraSeries,
 }) => {
   const isDefaultBps = !formatValue;
   const formatVal = formatValue ?? formatBps;
@@ -2039,6 +2066,7 @@ const DualAreaSparkChart: React.FC<{
     boxX: number;
     boxY: number;
     dropLossPct?: number;
+    extraVals?: Array<{ key: string; label: string; color: string; val: number; yFrac: number }>;
   } | null>(null);
 
   useEffect(() => {
@@ -2228,6 +2256,28 @@ const DualAreaSparkChart: React.FC<{
   let fixedWindowSpanMs = 0;
   let hasVisibleSamples = points.length > 0;
   let dropCoords: Array<{ x: number; ts: number; lossPct: number }> = [];
+  const parsedExtras = (extraSeries || []).map((es) => ({
+    key: es.key,
+    label: es.label,
+    color: es.color,
+    samples:
+      liveMode || hasFixedWindow
+        ? es.points
+            .map((p) => ({
+              ts: new Date(p.label).getTime(),
+              val: Math.max(0, p.val || 0),
+            }))
+            .filter((s) => !Number.isNaN(s.ts))
+            .sort((a, b) => a.ts - b.ts)
+        : es.points.map((p) => ({ ts: 0, val: Math.max(0, p.val || 0) })),
+  }));
+  let extraCurves: Array<{
+    key: string;
+    label: string;
+    color: string;
+    pts: Array<{ x: number; y: number }>;
+    spline: { linePath: string; areaPath: string; segments: SplineSegment[] };
+  }> = [];
 
   if (useLiveRender) {
     const latestTs = liveSamples[liveSamples.length - 1].ts;
@@ -2248,12 +2298,29 @@ const DualAreaSparkChart: React.FC<{
       }
     }
     const visibleSlice = liveSamples.slice(startIdx);
-    hasVisibleSamples = visibleSlice.length > 0;
+    const visibleExtras = parsedExtras.map((es) => {
+      let eStart = 0;
+      for (let i = 0; i < es.samples.length; i++) {
+        if (es.samples[i].ts < liveWindowStart) {
+          eStart = i;
+        } else {
+          break;
+        }
+      }
+      return { ...es, slice: es.samples.slice(eStart) };
+    });
+    hasVisibleSamples =
+      visibleSlice.length > 0 || visibleExtras.some((es) => es.slice.length > 0);
 
     let peakNow = 0;
     for (const s of visibleSlice) {
       const m = hideSecondary ? s.inVal : Math.max(s.inVal, s.outVal, s.p95In);
       if (m > peakNow) peakNow = m;
+    }
+    for (const es of visibleExtras) {
+      for (const s of es.slice) {
+        if (s.val > peakNow) peakNow = s.val;
+      }
     }
     observedPeakBps = peakNow;
     maxVal =
@@ -2271,6 +2338,21 @@ const DualAreaSparkChart: React.FC<{
       x: ((s.ts - liveWindowStart) / liveWindowMs) * width,
       y: baselineY - (Math.min(Math.max(0, s.outVal), maxVal) / maxVal) * plotSpanY,
     }));
+    extraCurves = visibleExtras.map((es) => {
+      const ePts = es.slice.map((s) => ({
+        x: ((s.ts - liveWindowStart) / liveWindowMs) * width,
+        y: baselineY - (Math.min(Math.max(0, s.val), maxVal) / maxVal) * plotSpanY,
+      }));
+      return {
+        key: es.key,
+        label: es.label,
+        color: es.color,
+        pts: ePts,
+        spline: linear
+          ? buildLinearPath(ePts, baselineY)
+          : buildMonotoneSpline(ePts, topPad, baselineY),
+      };
+    });
 
     const liveTicks = 6;
     for (let t = 0; t < liveTicks; t++) {
@@ -2302,12 +2384,24 @@ const DualAreaSparkChart: React.FC<{
       const startSliceIdx = firstInRangeIdx > 0 ? firstInRangeIdx - 1 : firstInRangeIdx;
       windowedSlice = parsedSortedSamples.slice(startSliceIdx);
     }
-    hasVisibleSamples = windowedSlice.length > 0;
+    const windowedExtras = parsedExtras.map((es) => {
+      const eIdx = es.samples.findIndex((s) => s.ts >= fixedWindowStart);
+      const eSlice =
+        eIdx !== -1 ? es.samples.slice(eIdx > 0 ? eIdx - 1 : eIdx) : [];
+      return { ...es, slice: eSlice };
+    });
+    hasVisibleSamples =
+      windowedSlice.length > 0 || windowedExtras.some((es) => es.slice.length > 0);
 
     let peakNow = 0;
     for (const s of windowedSlice) {
       const m = hideSecondary ? s.inVal : Math.max(s.inVal, s.outVal, s.p95In);
       if (m > peakNow) peakNow = m;
+    }
+    for (const es of windowedExtras) {
+      for (const s of es.slice) {
+        if (s.val > peakNow) peakNow = s.val;
+      }
     }
     observedPeakBps = peakNow;
     maxVal =
@@ -2325,6 +2419,21 @@ const DualAreaSparkChart: React.FC<{
       x: ((s.ts - fixedWindowStart) / fixedWindowSpanMs) * width,
       y: baselineY - (Math.min(Math.max(0, s.outVal), maxVal) / maxVal) * plotSpanY,
     }));
+    extraCurves = windowedExtras.map((es) => {
+      const ePts = es.slice.map((s) => ({
+        x: ((s.ts - fixedWindowStart) / fixedWindowSpanMs) * width,
+        y: baselineY - (Math.min(Math.max(0, s.val), maxVal) / maxVal) * plotSpanY,
+      }));
+      return {
+        key: es.key,
+        label: es.label,
+        color: es.color,
+        pts: ePts,
+        spline: linear
+          ? buildLinearPath(ePts, baselineY)
+          : buildMonotoneSpline(ePts, topPad, baselineY),
+      };
+    });
 
     const isApproxDaySpan =
       fixedWindowSpanMs >= 18 * 3_600_000 && fixedWindowSpanMs <= 36 * 3_600_000;
@@ -2359,6 +2468,7 @@ const DualAreaSparkChart: React.FC<{
     observedPeakBps = Math.max(
       0,
       ...points.map((p) => (hideSecondary ? p.inVal : Math.max(p.inVal, p.outVal, p.p95In || 0))),
+      ...parsedExtras.flatMap((es) => es.samples.map((s) => s.val)),
     );
     maxVal =
       fixedMaxBps && fixedMaxBps > 0
@@ -2388,11 +2498,23 @@ const DualAreaSparkChart: React.FC<{
 
     const toPts = (vals: number[]) =>
       vals.map((v, i) => ({
-        x: points.length === 1 ? width / 2 : (i / (points.length - 1)) * width,
+        x: vals.length === 1 ? width / 2 : (i / (vals.length - 1)) * width,
         y: baselineY - (Math.min(Math.max(0, v), maxVal) / maxVal) * plotSpanY,
       }));
     inPts = toPts(points.map((p) => p.inVal));
     outPts = toPts(points.map((p) => p.outVal));
+    extraCurves = parsedExtras.map((es) => {
+      const ePts = toPts(es.samples.map((s) => s.val));
+      return {
+        key: es.key,
+        label: es.label,
+        color: es.color,
+        pts: ePts,
+        spline: linear
+          ? buildLinearPath(ePts, baselineY)
+          : buildMonotoneSpline(ePts, topPad, baselineY),
+      };
+    });
   }
 
   if (dropMarkers && dropMarkers.length > 0 && (useLiveRender || useFixedWindow)) {
@@ -2435,6 +2557,7 @@ const DualAreaSparkChart: React.FC<{
     let outY: number;
     let timeText = "—";
     let matchedDrop: { x: number; ts: number; lossPct: number } | undefined;
+    const extraVals: Array<{ key: string; label: string; color: string; val: number; yFrac: number }> = [];
 
     if (useLiveRender || useFixedWindow) {
       const winStart = useLiveRender ? liveWindowStart : fixedWindowStart;
@@ -2461,6 +2584,17 @@ const DualAreaSparkChart: React.FC<{
       ratio = targetX / width;
       inY = inPts.length > 0 ? evalSplineAtX(inSpline.segments, inPts, targetX) : baselineY;
       outY = outPts.length > 0 ? evalSplineAtX(outSpline.segments, outPts, targetX) : baselineY;
+      for (const ec of extraCurves) {
+        if (ec.pts.length === 0) continue;
+        const ey = evalSplineAtX(ec.spline.segments, ec.pts, targetX);
+        extraVals.push({
+          key: ec.key,
+          label: ec.label,
+          color: ec.color,
+          val: Math.max(0, ((baselineY - ey) / plotSpanY) * maxVal),
+          yFrac: ey / height,
+        });
+      }
       if (dropCoords.length > 0) {
         let bestDist = Infinity;
         for (const dm of dropCoords) {
@@ -2477,6 +2611,17 @@ const DualAreaSparkChart: React.FC<{
       ratio = points.length === 1 ? 0.5 : ratio;
       inY = inPts.length > 0 ? evalSplineY(inSpline.segments, inPts, ratio) : baselineY;
       outY = outPts.length > 0 ? evalSplineY(outSpline.segments, outPts, ratio) : baselineY;
+      for (const ec of extraCurves) {
+        if (ec.pts.length === 0) continue;
+        const ey = evalSplineY(ec.spline.segments, ec.pts, ratio);
+        extraVals.push({
+          key: ec.key,
+          label: ec.label,
+          color: ec.color,
+          val: Math.max(0, ((baselineY - ey) / plotSpanY) * maxVal),
+          yFrac: ey / height,
+        });
+      }
 
       if (points.length === 1) {
         timeText = formatChartTooltipTimestamp(
@@ -2512,8 +2657,11 @@ const DualAreaSparkChart: React.FC<{
     const outVal =
       outPts.length > 0 ? Math.max(0, ((baselineY - outY) / plotSpanY) * maxVal) : 0;
 
-    const tooltipW = 204;
-    const tooltipH = 82;
+    const tooltipW = extraCurves.length >= 3 ? 244 : 204;
+    const tooltipH =
+      extraCurves.length >= 3
+        ? Math.min(180, 56 + Math.ceil((1 + extraCurves.length) / 2) * 20)
+        : 82 + extraCurves.length * 18;
     const cursorX = ratio * rectW;
     const rightX = cursorX + 14;
     const leftX = cursorX - tooltipW - 14;
@@ -2532,6 +2680,7 @@ const DualAreaSparkChart: React.FC<{
       boxX,
       boxY,
       dropLossPct: matchedDrop?.lossPct,
+      extraVals,
     };
   };
 
@@ -2595,7 +2744,7 @@ const DualAreaSparkChart: React.FC<{
   return (
     <div className="relative w-full overflow-visible rounded-lg border border-slate-800/80 bg-[#0B101B] p-3">
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
-        <div className="flex items-center gap-4">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
           {showYAxis && (
             <span className="w-14 text-right font-mono-tabular text-[11px] font-medium uppercase tracking-wider text-slate-500">
               {effectiveYAxisLabel}
@@ -2617,6 +2766,15 @@ const DualAreaSparkChart: React.FC<{
               {secondaryLabel}
             </span>
           )}
+          {extraCurves.map((ec) => (
+            <span key={ec.key} className="flex items-center gap-1.5">
+              <span
+                className="h-2 w-2 rounded-full"
+                style={{ backgroundColor: ec.color }}
+              />
+              {ec.label}
+            </span>
+          ))}
           {dropCoords.length > 0 && (
             <span className="flex items-center gap-1.5 text-rose-400">
               <span className="h-2.5 w-0.5 bg-red-500" />
@@ -2722,8 +2880,10 @@ const DualAreaSparkChart: React.FC<{
                     vectorEffect="non-scaling-stroke"
                   />
                 ))}
-                {inSpline.areaPath && <path d={inSpline.areaPath} fill={`url(#${rxGradId})`} />}
-                {!hideSecondary && outSpline.areaPath && (
+                {inSpline.areaPath && extraCurves.length === 0 && (
+                  <path d={inSpline.areaPath} fill={`url(#${rxGradId})`} />
+                )}
+                {!hideSecondary && outSpline.areaPath && extraCurves.length === 0 && (
                   <path d={outSpline.areaPath} fill={`url(#${txGradId})`} />
                 )}
                 {inSpline.linePath && (
@@ -2731,7 +2891,7 @@ const DualAreaSparkChart: React.FC<{
                     d={inSpline.linePath}
                     fill="none"
                     stroke={primaryColor}
-                    strokeWidth={linear ? "1.7" : "2.2"}
+                    strokeWidth={linear || extraCurves.length > 0 ? "1.8" : "2.2"}
                     strokeLinecap={linear ? "butt" : "round"}
                     strokeLinejoin={linear ? "miter" : "round"}
                     vectorEffect="non-scaling-stroke"
@@ -2747,6 +2907,21 @@ const DualAreaSparkChart: React.FC<{
                     strokeLinejoin={linear ? "miter" : "round"}
                     vectorEffect="non-scaling-stroke"
                   />
+                )}
+                {extraCurves.map(
+                  (ec) =>
+                    ec.spline.linePath && (
+                      <path
+                        key={ec.key}
+                        d={ec.spline.linePath}
+                        fill="none"
+                        stroke={ec.color}
+                        strokeWidth="1.8"
+                        strokeLinecap={linear ? "butt" : "round"}
+                        strokeLinejoin={linear ? "miter" : "round"}
+                        vectorEffect="non-scaling-stroke"
+                      />
+                    ),
                 )}
                 {showEndpointMarkers && (
                   <>
@@ -2824,10 +2999,31 @@ const DualAreaSparkChart: React.FC<{
                     }}
                   />
                 )}
+                {displayedHover.extraVals &&
+                  displayedHover.extraVals.map((ev) => (
+                    <div
+                      key={ev.key}
+                      className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-[#0B101B] motion-reduce:transition-none"
+                      style={{
+                        backgroundColor: ev.color,
+                        boxShadow: `0 0 8px ${ev.color}`,
+                        left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
+                        top: `${(ev.yFrac * 100).toFixed(3)}%`,
+                        opacity: isHovering ? 1 : 0,
+                        transition: smoothPosTransition
+                          ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
+                          : "opacity 180ms ease-out",
+                      }}
+                    />
+                  ))}
 
                 {/* Smooth floating tooltip box */}
                 <div
-                  className="pointer-events-none absolute top-0 left-0 z-20 w-[212px] will-change-transform motion-reduce:transition-none"
+                  className={`pointer-events-none absolute top-0 left-0 z-20 will-change-transform motion-reduce:transition-none ${
+                    displayedHover.extraVals && displayedHover.extraVals.length >= 3
+                      ? "w-[244px]"
+                      : "w-[212px]"
+                  }`}
                   style={{
                     transform: `translate3d(${displayedHover.boxX.toFixed(1)}px, ${displayedHover.boxY.toFixed(1)}px, 0)`,
                     transition: smoothPosTransition
@@ -2845,7 +3041,13 @@ const DualAreaSparkChart: React.FC<{
                     <div className="mb-1.5 border-b border-slate-800/80 pb-1 font-mono-tabular text-[11px] text-slate-400">
                       {displayedHover.timeText}
                     </div>
-                    <div className="space-y-1">
+                    <div
+                      className={
+                        displayedHover.extraVals && displayedHover.extraVals.length >= 3
+                          ? "grid grid-cols-2 gap-x-3 gap-y-1"
+                          : "space-y-1"
+                      }
+                    >
                       <div className="flex items-center justify-between gap-2">
                         <span className="flex items-center gap-1.5 text-slate-300">
                           <span
@@ -2878,6 +3080,24 @@ const DualAreaSparkChart: React.FC<{
                           </span>
                         </div>
                       )}
+                      {displayedHover.extraVals &&
+                        displayedHover.extraVals.map((ev) => (
+                          <div key={ev.key} className="flex items-center justify-between gap-2">
+                            <span className="flex items-center gap-1.5 text-slate-300">
+                              <span
+                                className="h-2 w-2 rounded-full"
+                                style={{ backgroundColor: ev.color }}
+                              />
+                              {ev.label}
+                            </span>
+                            <span
+                              className="font-mono-tabular font-semibold"
+                              style={{ color: ev.color }}
+                            >
+                              {formatVal(ev.val)}
+                            </span>
+                          </div>
+                        ))}
                       {displayedHover.dropLossPct != null && (
                         <div className="flex items-center justify-between gap-2 text-rose-400">
                           <span className="flex items-center gap-1.5">
@@ -3258,6 +3478,7 @@ export const App: React.FC = () => {
   >("clients");
   const [systemHistory, setSystemHistory] = useState<DeviceSystemHistoryPoint[]>([]);
   const [systemHistoryVolumes, setSystemHistoryVolumes] = useState<string[]>([]);
+  const [systemHistoryCores, setSystemHistoryCores] = useState<string[]>([]);
   const [systemHistoryRange, setSystemHistoryRange] = useState<
     "1h" | "6h" | "24h" | "7d" | "30d" | "1y" | "all"
   >("24h");
@@ -3635,6 +3856,7 @@ export const App: React.FC = () => {
         } else {
           setSystemHistory([]);
           setSystemHistoryVolumes([]);
+          setSystemHistoryCores([]);
         }
         if (data.icmp_host) {
           fetchIcmpHistory(data.ip_address, icmpHistoryRange);
@@ -4624,6 +4846,7 @@ export const App: React.FC = () => {
         const data = await r.json();
         setSystemHistory(data.series || []);
         setSystemHistoryVolumes(Array.isArray(data.volumes) ? data.volumes : []);
+        setSystemHistoryCores(Array.isArray(data.cpu_cores) ? data.cpu_cores : []);
       }
     } catch {
       // ignore
@@ -10164,6 +10387,34 @@ export const App: React.FC = () => {
                       inVal: pt.cpu_usage_pct ?? 0,
                       outVal: 0,
                     }));
+                  const multiCoreCpuNames = systemHistoryCores.filter((coreName) =>
+                    systemHistory.some((pt) => pt.cores?.[coreName] != null),
+                  );
+                  const useMultiCoreCpu = multiCoreCpuNames.length > 1;
+                  const cpuPrimaryCoreName = useMultiCoreCpu ? multiCoreCpuNames[0] : "CPU Usage (%)";
+                  const cpuPrimaryShortName = useMultiCoreCpu ? multiCoreCpuNames[0] : "CPU";
+                  const cpuPrimaryChartPts = useMultiCoreCpu
+                    ? systemHistory
+                        .filter((pt) => pt.cores?.[cpuPrimaryCoreName] != null)
+                        .map((pt) => ({
+                          label: pt.time,
+                          inVal: pt.cores?.[cpuPrimaryCoreName] ?? 0,
+                          outVal: 0,
+                        }))
+                    : cpuChartPts;
+                  const cpuExtraSeries = useMultiCoreCpu
+                    ? multiCoreCpuNames.slice(1).map((coreName, idx) => ({
+                        key: coreName,
+                        label: coreName,
+                        color: CPU_CORE_COLORS[(idx + 1) % CPU_CORE_COLORS.length],
+                        points: systemHistory
+                          .filter((pt) => pt.cores?.[coreName] != null)
+                          .map((pt) => ({
+                            label: pt.time,
+                            val: pt.cores?.[coreName] ?? 0,
+                          })),
+                      }))
+                    : undefined;
                   const memChartPts = systemHistory
                     .filter((pt) => pt.mem_usage_pct != null)
                     .map((pt) => ({
@@ -10185,7 +10436,14 @@ export const App: React.FC = () => {
                     })
                     .filter((x): x is { label: string; inVal: number; outVal: number } => x !== null);
 
-                  const cpuMaxY = computePctAxisMax(cpuChartPts.map((p) => p.inVal));
+                  const cpuMaxY = computePctAxisMax(
+                    useMultiCoreCpu
+                      ? [
+                          ...cpuPrimaryChartPts.map((p) => p.inVal),
+                          ...(cpuExtraSeries || []).flatMap((s) => s.points.map((p) => p.val)),
+                        ]
+                      : cpuChartPts.map((p) => p.inVal),
+                  );
                   const memMaxY = computePctAxisMax(memChartPts.map((p) => p.inVal));
                   const storageMaxY = computePctAxisMax(storageChartPts.map((p) => p.inVal));
 
@@ -10315,14 +10573,15 @@ export const App: React.FC = () => {
                             hideSecondary
                             windowMs={rangeKeyToWindowMs(systemHistoryRange)}
                             fixedMaxBps={cpuMaxY}
-                            primaryLabel="CPU Usage (%)"
-                            primaryShortLabel="CPU"
-                            primaryColor="#10B981"
+                            primaryLabel={cpuPrimaryCoreName}
+                            primaryShortLabel={cpuPrimaryShortName}
+                            primaryColor={CPU_CORE_COLORS[0]}
+                            extraSeries={cpuExtraSeries}
                             yAxisLabel="%"
                             formatValue={(v) => `${v.toFixed(1)}%`}
                             formatAxisTick={(v) => `${Math.round(v)}%`}
                             emptyMessage="Collecting CPU utilization samples..."
-                            points={cpuChartPts}
+                            points={cpuPrimaryChartPts}
                           />
                         </div>
 

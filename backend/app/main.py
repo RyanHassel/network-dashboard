@@ -5230,7 +5230,8 @@ async def get_device_system_history(
                        storage_total_bytes,
                        temp_celsius,
                        load_1m,
-                       volume_metrics
+                       volume_metrics,
+                       cpu_core_metrics
                 FROM device_system_metrics_raw
                 WHERE device_ip = $1
                   {where_clause}
@@ -5255,7 +5256,12 @@ async def get_device_system_history(
                            WHERE volume_metrics IS NOT NULL
                              AND jsonb_typeof(volume_metrics) = 'array'
                              AND jsonb_array_length(volume_metrics) > 0
-                       ))[1] AS volume_metrics
+                       ))[1] AS volume_metrics,
+                       (ARRAY_AGG(cpu_core_metrics ORDER BY time DESC) FILTER (
+                           WHERE cpu_core_metrics IS NOT NULL
+                             AND jsonb_typeof(cpu_core_metrics) = 'array'
+                             AND jsonb_array_length(cpu_core_metrics) > 0
+                       ))[1] AS cpu_core_metrics
                 FROM device_system_metrics_raw
                 WHERE device_ip = $1
                   {where_clause}
@@ -5372,6 +5378,8 @@ async def get_device_system_history(
 
     available_volumes: List[str] = []
     seen_vols = set()
+    available_cores: List[str] = []
+    seen_cores = set()
     series: List[Dict[str, Any]] = []
 
     for r in backfill_rows or gw_backfill_rows:
@@ -5389,6 +5397,7 @@ async def get_device_system_history(
                 "temp_celsius": _opt_round(rd.get("temp_celsius"), 1),
                 "load_1m": None,
                 "volumes": {},
+                "cores": {},
             }
         )
 
@@ -5415,6 +5424,30 @@ async def get_device_system_history(
                     "used_bytes": int(v.get("used_bytes") or 0),
                     "total_bytes": int(v.get("total_bytes") or 0),
                 }
+
+        raw_cores = r["cpu_core_metrics"]
+        if isinstance(raw_cores, str):
+            try:
+                raw_cores = json.loads(raw_cores)
+            except Exception:
+                raw_cores = []
+        cores_map: Dict[str, float] = {}
+        if isinstance(raw_cores, list):
+            for c in raw_cores:
+                if not isinstance(c, dict):
+                    continue
+                core_lbl = str(c.get("label") or "").strip()
+                if not core_lbl:
+                    core_num = c.get("core")
+                    if core_num is not None:
+                        core_lbl = f"CPU {core_num}"
+                if not core_lbl:
+                    continue
+                if core_lbl not in seen_cores:
+                    seen_cores.add(core_lbl)
+                    available_cores.append(core_lbl)
+                cores_map[core_lbl] = round(float(c.get("usage_pct") or 0.0), 1)
+
         series.append(
             {
                 "time": r["bucket"].isoformat(),
@@ -5428,6 +5461,7 @@ async def get_device_system_history(
                 "temp_celsius": _opt_round(r["temp_celsius"], 1),
                 "load_1m": _opt_round(r["load_1m"], 2),
                 "volumes": vols_map,
+                "cores": cores_map,
             }
         )
 
@@ -5436,6 +5470,7 @@ async def get_device_system_history(
         "device_ip": device_ip,
         "range": rk,
         "volumes": available_volumes,
+        "cpu_cores": available_cores,
         "series": series,
     }
 

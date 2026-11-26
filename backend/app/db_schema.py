@@ -183,8 +183,12 @@ CREATE TABLE IF NOT EXISTS device_system_metrics_raw (
     storage_total_bytes BIGINT,
     temp_celsius        DOUBLE PRECISION,
     load_1m             DOUBLE PRECISION,
-    volume_metrics      JSONB DEFAULT '[]'::jsonb
+    volume_metrics      JSONB DEFAULT '[]'::jsonb,
+    cpu_core_metrics    JSONB DEFAULT '[]'::jsonb
 );
+
+ALTER TABLE device_system_metrics_raw
+    ADD COLUMN IF NOT EXISTS cpu_core_metrics JSONB DEFAULT '[]'::jsonb;
 
 CREATE INDEX IF NOT EXISTS idx_device_system_metrics_dev_time
     ON device_system_metrics_raw (device_ip, time DESC);
