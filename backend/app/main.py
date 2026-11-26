@@ -4560,7 +4560,8 @@ async def get_device_detail(device_ref: str) -> Dict[str, Any]:
         icmp_row = await conn.fetchrow(
             """
             SELECT id, device_ip, label, poll_interval, enabled, resolved_hostname,
-                   is_reachable, last_rtt_ms, packet_loss_pct, status_since, last_polled
+                   is_reachable, last_rtt_ms, packet_loss_pct, status_since, last_polled,
+                   created_at
             FROM icmp_targets_config
             WHERE device_ip = $1
             """,
@@ -4776,7 +4777,16 @@ async def get_device_detail(device_ref: str) -> Dict[str, Any]:
             "uptime_pct_7d": float(icmp_uptime_row["uptime_pct_7d"]) if icmp_uptime_row and icmp_uptime_row["uptime_pct_7d"] is not None else None,
             "samples_24h": int(icmp_uptime_row["samples_24h"] or 0) if icmp_uptime_row else 0,
             "last_polled": ih["last_polled"].isoformat() if ih.get("last_polled") else None,
+            "created_at": ih["created_at"].isoformat() if ih.get("created_at") else None,
         }
+        resolved_identity["first_seen"] = _pick_ts(
+            [resolved_identity.get("first_seen"), icmp_host_dict.get("created_at")],
+            pick_min=True,
+        )
+        resolved_identity["last_seen"] = _pick_ts(
+            [resolved_identity.get("last_seen"), icmp_host_dict.get("last_polled")],
+            pick_min=False,
+        )
         if icmp_host_dict["resolved_hostname"]:
             resolved_identity["dns_hostname"] = icmp_host_dict["resolved_hostname"]
             if resolved_identity["hostname"] == device_ip:

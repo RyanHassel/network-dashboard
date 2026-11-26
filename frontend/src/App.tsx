@@ -958,6 +958,7 @@ interface DeviceDetailPayload {
     uptime_pct_7d: number | null;
     samples_24h: number;
     last_polled: string | null;
+    created_at?: string | null;
   } | null;
   device_settings?: {
     custom_name: string | null;
@@ -7352,6 +7353,185 @@ export const App: React.FC = () => {
                   </div>
                 </div>
               </form>
+            ) : detailProfileType === "icmp" &&
+              deviceDetail?.icmp_host &&
+              !deviceDetail?.snmp_system &&
+              !deviceDetail?.unifi_device ? (
+              (() => {
+                const ih = deviceDetail.icmp_host;
+                const dnsLookup =
+                  ih.resolved_hostname ||
+                  deviceDetail.resolved_identity?.dns_hostname ||
+                  null;
+                const firstSeen =
+                  deviceDetail.resolved_identity?.first_seen ||
+                  ih.created_at ||
+                  deviceDetail.discovered_host?.first_seen ||
+                  null;
+                const lastSeen =
+                  deviceDetail.resolved_identity?.last_seen ||
+                  ih.last_polled ||
+                  deviceDetail.discovered_host?.last_seen ||
+                  null;
+                const rttChartPts = icmpHistory
+                  .filter((pt) => pt.rtt_ms != null)
+                  .map((pt) => ({
+                    label: pt.time,
+                    inVal: pt.rtt_ms ?? 0,
+                    outVal: 0,
+                  }));
+                return (
+                  <div className="space-y-6">
+                    {deviceDetail?.device_settings?.notes && (
+                      <div className="rounded-xl border border-slate-800 bg-[#111827] px-5 py-3.5">
+                        <div className="mb-1 flex items-center justify-between">
+                          <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                            Device Notes
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              selectedDeviceRef &&
+                              navigateToPath(
+                                `/devices/${encodeURIComponent(selectedDeviceRef)}/settings`,
+                              )
+                            }
+                            className="text-[11px] font-medium text-emerald-400 hover:text-emerald-300"
+                          >
+                            Edit Notes
+                          </button>
+                        </div>
+                        <p className="whitespace-pre-wrap text-xs text-slate-200">
+                          {deviceDetail.device_settings.notes}
+                        </p>
+                      </div>
+                    )}
+
+                    {/* Simplified ICMP Host Identity */}
+                    <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+                      <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold text-white">
+                        <Activity className="h-4 w-4 text-cyan-400" />
+                        ICMP Host Details
+                      </h3>
+                      <dl className="grid grid-cols-1 gap-4 text-xs sm:grid-cols-2 lg:grid-cols-4">
+                        <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                          <dt className="text-slate-400">IP Address</dt>
+                          <dd className="mt-1 font-mono-tabular text-sm font-semibold text-emerald-400">
+                            {activeDetailIp || ih.device_ip}
+                          </dd>
+                        </div>
+                        <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                          <dt className="text-slate-400">Reverse DNS Lookup</dt>
+                          <dd className="mt-1 truncate font-mono-tabular text-sm font-medium text-sky-300">
+                            {dnsLookup || "Unresolved"}
+                          </dd>
+                        </div>
+                        <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                          <dt className="text-slate-400">First Time Seen</dt>
+                          <dd className="mt-1 font-mono-tabular text-slate-200">
+                            {firstSeen ? new Date(firstSeen).toLocaleString() : "—"}
+                          </dd>
+                        </div>
+                        <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                          <dt className="text-slate-400">Last Time Seen</dt>
+                          <dd className="mt-1 font-mono-tabular text-slate-200">
+                            {lastSeen ? new Date(lastSeen).toLocaleString() : "—"}
+                          </dd>
+                        </div>
+                      </dl>
+                    </div>
+
+                    {/* ICMP Ping Latency & Uptime Panel */}
+                    <div className="rounded-xl border border-cyan-500/30 bg-[#111827] p-5 space-y-4">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
+                            <Activity className="h-4 w-4 text-cyan-400" />
+                            ICMP Ping Response &amp; Uptime
+                          </h3>
+                          <p className="mt-0.5 text-xs text-slate-400">
+                            Echo probes every {ih.poll_interval}s
+                            {dnsLookup ? ` • Reverse DNS: ${dnsLookup}` : ""}
+                            {ih.last_polled
+                              ? ` • Last probe: ${new Date(ih.last_polled).toLocaleTimeString()}`
+                              : ""}
+                          </p>
+                        </div>
+                        <div className="inline-flex items-center rounded-md border border-slate-800 bg-[#090D16] p-0.5 text-[11px] font-medium">
+                          {(["1h", "6h", "24h", "7d", "30d"] as const).map((rk) => (
+                            <button
+                              key={rk}
+                              type="button"
+                              onClick={() => setIcmpHistoryRange(rk)}
+                              className={`rounded px-2 py-0.5 uppercase transition ${
+                                icmpHistoryRange === rk
+                                  ? "bg-cyan-500/20 text-cyan-300"
+                                  : "text-slate-400 hover:text-slate-200"
+                              }`}
+                            >
+                              {rk}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                        <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                          <div className="text-[11px] text-slate-400">Response Time</div>
+                          <div className="mt-1 font-mono-tabular text-lg font-semibold text-cyan-300">
+                            {ih.last_rtt_ms != null ? `${ih.last_rtt_ms.toFixed(2)} ms` : "—"}
+                          </div>
+                        </div>
+                        <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                          <div className="text-[11px] text-slate-400">Continuous Uptime</div>
+                          <div className="mt-1 font-mono-tabular text-lg font-semibold text-emerald-400">
+                            {ih.uptime_sec != null && ih.uptime_sec > 0
+                              ? formatDurationCompact(ih.uptime_sec)
+                              : ih.is_reachable
+                                ? "<1m"
+                                : "Down"}
+                          </div>
+                        </div>
+                        <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                          <div className="text-[11px] text-slate-400">24h Uptime</div>
+                          <div className="mt-1 font-mono-tabular text-lg font-semibold text-white">
+                            {ih.uptime_pct_24h != null ? `${ih.uptime_pct_24h.toFixed(1)}%` : "—"}
+                          </div>
+                        </div>
+                        <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                          <div className="text-[11px] text-slate-400">7d Uptime / Loss</div>
+                          <div className="mt-1 font-mono-tabular text-lg font-semibold text-slate-200">
+                            {ih.uptime_pct_7d != null ? `${ih.uptime_pct_7d.toFixed(1)}%` : "—"}{" "}
+                            <span className="text-xs font-normal text-slate-400">
+                              ({ih.packet_loss_pct.toFixed(0)}% loss)
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                        <div className="mb-2 text-xs font-medium text-slate-300">
+                          ICMP Round-Trip Latency ({icmpHistoryRange.toUpperCase()})
+                        </div>
+                        <DualAreaSparkChart
+                          points={rttChartPts}
+                          height={180}
+                          showYAxis={true}
+                          hideSecondary={true}
+                          windowMs={rangeKeyToWindowMs(icmpHistoryRange)}
+                          primaryLabel="Ping Latency (ms)"
+                          primaryShortLabel="Latency"
+                          primaryColor="#22D3EE"
+                          yAxisLabel="ms"
+                          formatValue={(v) => `${v.toFixed(2)} ms`}
+                          formatAxisTick={(v) => (v >= 100 ? `${Math.round(v)}` : v.toFixed(1))}
+                          emptyMessage="Waiting for ICMP ping samples..."
+                        />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()
             ) : (
               <>
                 {deviceDetail?.device_settings?.notes && (
@@ -9267,6 +9447,7 @@ export const App: React.FC = () => {
                           height={180}
                           showYAxis={true}
                           hideSecondary={true}
+                          windowMs={rangeKeyToWindowMs(icmpHistoryRange)}
                           primaryLabel="Ping Latency (ms)"
                           primaryShortLabel="Latency"
                           primaryColor="#22D3EE"
