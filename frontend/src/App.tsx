@@ -199,6 +199,8 @@ interface GitCommitInfo {
   sha: string;
   subject: string;
   summary_bullets?: string[];
+  areas?: string[];
+  files_changed?: number;
   author: string;
   date: string;
   commit_date?: string;
@@ -4999,6 +5001,14 @@ export const App: React.FC = () => {
                       upd.summary_bullets && upd.summary_bullets.length > 0
                         ? upd.summary_bullets
                         : [upd.subject];
+                    const normSubject = (upd.subject || "").trim().replace(/\.$/, "").toLowerCase();
+                    const soleBulletNorm =
+                      bullets.length === 1
+                        ? (bullets[0] || "").trim().replace(/\.$/, "").toLowerCase()
+                        : "";
+                    const showHeadline = Boolean(normSubject && soleBulletNorm !== normSubject);
+                    const hasAreas = Boolean(upd.areas && upd.areas.length > 0);
+                    const hasFileCount = typeof upd.files_changed === "number" && upd.files_changed > 0;
                     return (
                       <div
                         key={upd.sha}
@@ -5015,12 +5025,49 @@ export const App: React.FC = () => {
                           </div>
                           <span className="text-[11px] text-slate-500">{upd.date}</span>
                         </div>
+                        {showHeadline && (
+                          <div className="mt-2 text-xs font-semibold text-slate-100">
+                            {upd.subject}
+                          </div>
+                        )}
+                        {(hasAreas || hasFileCount) && (
+                          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                            {(upd.areas || []).map((area) => (
+                              <span
+                                key={area}
+                                className="rounded border border-slate-800 bg-slate-900/80 px-1.5 py-0.5 text-[10px] font-medium text-slate-400"
+                              >
+                                {area}
+                              </span>
+                            ))}
+                            {hasFileCount && (
+                              <span className="font-mono-tabular text-[10px] text-slate-500">
+                                {upd.files_changed} file{upd.files_changed === 1 ? "" : "s"}
+                              </span>
+                            )}
+                          </div>
+                        )}
                         <ul className="mt-2 list-disc space-y-1 pl-4 text-xs text-slate-200">
-                          {bullets.map((b, bIdx) => (
-                            <li key={bIdx} className="leading-relaxed">
-                              {b}
-                            </li>
-                          ))}
+                          {bullets.map((b, bIdx) => {
+                            const colonIdx = b.indexOf(": ");
+                            const hasTopic = colonIdx >= 1 && colonIdx <= 48;
+                            return (
+                              <li key={bIdx} className="leading-relaxed">
+                                {hasTopic ? (
+                                  <>
+                                    <span className="font-medium text-slate-100">
+                                      {b.slice(0, colonIdx)}:
+                                    </span>{" "}
+                                    <span className="text-slate-300">
+                                      {b.slice(colonIdx + 2)}
+                                    </span>
+                                  </>
+                                ) : (
+                                  b
+                                )}
+                              </li>
+                            );
+                          })}
                         </ul>
                       </div>
                     );
@@ -10302,7 +10349,7 @@ export const App: React.FC = () => {
                           Update Available ({updateInfo.commits_behind} update
                           {updateInfo.commits_behind === 1 ? "" : "s"})
                         </span>
-                        {!installingUpdate && promptDismissedSha === updateInfo.remote_sha && (
+                        {!installingUpdate && (
                           <button
                             type="button"
                             onClick={openUpdateModal}

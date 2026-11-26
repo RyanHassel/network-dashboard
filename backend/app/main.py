@@ -99,29 +99,97 @@ def _read_update_progress() -> Dict[str, Any]:
     return _default_idle_progress()
 
 
+_GIT_TRAILER_PREFIXES = (
+    "signed-off-by:",
+    "co-authored-by:",
+    "reviewed-by:",
+    "acked-by:",
+    "tested-by:",
+)
+
+
+def _summarize_changed_areas(file_paths: List[str]) -> List[str]:
+    """Maps changed repository file paths to ordered, deduplicated component labels."""
+    areas: List[str] = []
+
+    def _add(label: str) -> None:
+        if label not in areas:
+            areas.append(label)
+
+    for raw_path in file_paths:
+        path = raw_path.strip().lstrip("./")
+        if not path:
+            continue
+        if path.startswith("frontend/"):
+            _add("Frontend UI")
+        elif path in ("backend/app/snmp_poller.py", "backend/app/mib_catalog.py") or path.startswith("backend/mibs/"):
+            _add("SNMP & MIBs")
+        elif path == "backend/app/unifi.py":
+            _add("UniFi Telemetry")
+        elif path == "backend/app/scanner.py":
+            _add("Subnet Scanner")
+        elif path == "backend/app/syslog_parser.py" or path.startswith("vector/"):
+            _add("Syslog / Vector")
+        elif path == "backend/app/db_schema.py" or path.startswith("db-init/"):
+            _add("Database Schema")
+        elif path.startswith("backend/app/") or path.startswith("backend/"):
+            _add("Backend API")
+        elif path in ("docker-compose.yml", "install-netdash.sh") or path.startswith("scripts/"):
+            _add("Docker & Ops")
+        else:
+            _add("Docs & Config")
+    return areas
+
+
 def _extract_commit_bullets(subject: str, body: str = "") -> List[str]:
-    """Extracts clean per-commit bullet points from body or multi-clause subject."""
+    """Extracts clean per-commit bullet points from body or subject fallback."""
     bullets: List[str] = []
+    has_active_bullet = False
+
     for bline in (body or "").splitlines():
         bclean = bline.strip()
+        if not bclean:
+            has_active_bullet = False
+            continue
+        if bclean.lower().startswith(_GIT_TRAILER_PREFIXES):
+            has_active_bullet = False
+            continue
         if bclean.startswith(("- ", "* ", "• ")):
             btext = bclean[2:].strip()
             if btext and btext not in bullets:
                 bullets.append(btext)
+                has_active_bullet = True
+            else:
+                has_active_bullet = False
+        elif has_active_bullet and bullets:
+            bullets[-1] = f"{bullets[-1]} {bclean}".strip()
+
     if bullets:
         return bullets
 
-    raw_clauses = [
-        c.strip().rstrip(".")
-        for c in (subject or "").replace(" and ", ", ").split(",")
-        if c.strip()
-    ]
-    for clause in raw_clauses:
-        formatted = clause[0].upper() + clause[1:] if clause else ""
-        if formatted and formatted not in bullets:
-            bullets.append(formatted)
-    if not bullets and subject.strip():
-        bullets.append(subject.strip())
+    # Fallback when body uses prose lines instead of explicit bullet markers
+    for bline in (body or "").splitlines():
+        bclean = bline.strip()
+        if not bclean or bclean.lower().startswith(_GIT_TRAILER_PREFIXES):
+            continue
+        if bclean not in bullets:
+            bullets.append(bclean)
+
+    if bullets:
+        return bullets
+
+    subj_clean = (subject or "").strip()
+    if "; " in subj_clean:
+        for clause in subj_clean.split("; "):
+            c = clause.strip().rstrip(".")
+            if c:
+                formatted = c[0].upper() + c[1:]
+                if formatted not in bullets:
+                    bullets.append(formatted)
+    elif subj_clean:
+        c = subj_clean.rstrip(".")
+        if c:
+            bullets.append(c[0].upper() + c[1:])
     return bullets
 
 
@@ -531,13 +599,14 @@ async def _inspect_git_update(do_fetch: bool = False) -> Dict[str, Any]:
             "HEAD..origin/main",
             "-n",
             "20",
-            "--pretty=format:%h%x1f%s%x1f%an%x1f%ar%x1f%cs%x1f%b%x1e",
+            "--pretty=format:%x1e%h%x1f%s%x1f%an%x1f%ar%x1f%cs%x1f%b%x1f",
+            "--name-only",
         )
         for rec in log_out.split("\x1e"):
             rec = rec.strip()
             if not rec:
                 continue
-            parts = rec.split("\x1f", 5)
+            parts = rec.split("\x1f", 6)
             if len(parts) >= 5:
                 sha_val = parts[0].strip()
                 subj_val = parts[1].strip()
@@ -545,6 +614,10 @@ async def _inspect_git_update(do_fetch: bool = False) -> Dict[str, Any]:
                 date_val = parts[3].strip()
                 commit_date_val = parts[4].strip()
                 body_val = parts[5].strip() if len(parts) > 5 else ""
+                files_raw = parts[6] if len(parts) > 6 else ""
+                changed_files = [ln.strip() for ln in files_raw.splitlines() if ln.strip()]
+                areas = _summarize_changed_areas(changed_files)
+                files_changed = len(changed_files)
 
                 per_bullets = _extract_commit_bullets(subj_val, body_val)
                 commits.append(
@@ -553,6 +626,8 @@ async def _inspect_git_update(do_fetch: bool = False) -> Dict[str, Any]:
                         "sha": sha_val,
                         "subject": subj_val,
                         "summary_bullets": per_bullets,
+                        "areas": areas,
+                        "files_changed": files_changed,
                         "author": auth_val,
                         "date": date_val,
                         "commit_date": commit_date_val,
