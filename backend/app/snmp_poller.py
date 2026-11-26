@@ -835,7 +835,7 @@ def _has_wireless_ap_hint(sys_descr: str, sys_name: str = "") -> bool:
     return bool(
         re.search(
             r"(?:^|[^a-z0-9])(uap|u6(?:\+|[\s-]|$)|u7(?:\+|[\s-]|$)|nanohd|flexhd|beaconhd|iw-hd|uk-ultra|uwb|"
-            r"airmax|nanobeam|powerbeam|litebeam|airfiber|access point|wireless ap|eap\d+|aironet|iap-\d+|aruba|ruckus|routeros)",
+            r"airmax|nanobeam|powerbeam|litebeam|airfiber|access point|wireless ap|eap\d+|aironet|iap-\d+|ruckus)",
             combined,
         )
     )
@@ -1682,18 +1682,15 @@ def _finalize_wireless_telemetry(
     wireless_if_list: List[Dict[str, Any]],
 ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """Correlates wireless VAPs with IF-MIB rates, computes summary KPIs, and emits legacy wireless_radios."""
-    if wireless_data is None and not wireless_if_list:
+    if wireless_data is None:
         return (None, [])
 
-    if wireless_data is None:
-        wireless_data = {
-            "source_mibs": ["IF-MIB"],
-            "mode": "Wireless Interface",
-            "is_isolated": None,
-            "radios": [],
-            "vaps": [],
-            "stations": [],
-        }
+    if not (
+        wireless_data.get("radios")
+        or wireless_data.get("vaps")
+        or wireless_data.get("stations")
+    ):
+        return (None, [])
 
     by_name: Dict[str, Dict[str, Any]] = {}
     by_mac: Dict[str, Dict[str, Any]] = {}
@@ -1880,6 +1877,56 @@ def _finalize_wireless_telemetry(
             )
 
     return (finalized, legacy_radios)
+
+
+def _compute_storage_summary(storage_volumes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Computes deduplicated aggregate storage utilization and trimmed per-volume snapshots."""
+    if not storage_volumes:
+        return {
+            "storage_usage_pct": None,
+            "storage_used_bytes": None,
+            "storage_total_bytes": None,
+            "volume_metrics": [],
+        }
+
+    # Prefer shorter canonical mount paths first (e.g. '/' before '/var/lib/...') when deduplicating bind mounts
+    ordered = sorted(
+        [v for v in storage_volumes if isinstance(v, dict) and v.get("mount")],
+        key=lambda v: (len(str(v.get("mount") or "")), str(v.get("mount") or "")),
+    )
+    seen_totals: Set[Tuple[int, int]] = set()
+    sum_used = 0
+    sum_total = 0
+    vol_metrics: List[Dict[str, Any]] = []
+    for vol in ordered:
+        mount = str(vol.get("mount") or "").strip()
+        tot_b = max(0, int(vol.get("total_bytes") or 0))
+        usd_b = max(0, int(vol.get("used_bytes") or 0))
+        pct_val = vol.get("usage_pct")
+        if pct_val is None and tot_b > 0:
+            pct_val = round((usd_b / tot_b) * 100.0, 1)
+        vol_metrics.append(
+            {
+                "mount": mount,
+                "usage_pct": round(float(pct_val or 0.0), 1),
+                "used_bytes": usd_b,
+                "total_bytes": tot_b,
+            }
+        )
+        if tot_b > 0:
+            sig = (tot_b, usd_b)
+            if sig not in seen_totals:
+                seen_totals.add(sig)
+                sum_total += tot_b
+                sum_used += usd_b
+
+    agg_pct = round((sum_used / sum_total) * 100.0, 1) if sum_total > 0 else None
+    return {
+        "storage_usage_pct": agg_pct,
+        "storage_used_bytes": sum_used if sum_total > 0 else None,
+        "storage_total_bytes": sum_total if sum_total > 0 else None,
+        "volume_metrics": vol_metrics[:16],
+    }
 
 
 class SNMPPoller:
@@ -2183,7 +2230,9 @@ class SNMPPoller:
                 k.split(".", 1)[1] for k in hr_storage.keys() if k.startswith("3.") and "." in k
             }
             for s_idx in sorted(storage_indices, key=lambda x: int(x) if x.isdigit() else 999):
-                descr = hr_storage.get(f"3.{s_idx}", "")
+                hr_type = (hr_storage.get(f"2.{s_idx}") or "").strip()
+                descr = (hr_storage.get(f"3.{s_idx}") or "").strip()
+                descr_l = descr.lower()
                 unit_bytes = _to_int(hr_storage.get(f"4.{s_idx}"), 0)
                 size_units = _to_int(hr_storage.get(f"5.{s_idx}"), 0)
                 used_units = _to_int(hr_storage.get(f"6.{s_idx}"), 0)
@@ -2192,7 +2241,7 @@ class SNMPPoller:
                 total_b = unit_bytes * size_units
                 used_b = unit_bytes * used_units
                 pct = round((used_b / total_b) * 100.0, 1) if total_b > 0 else 0.0
-                if "physical memory" in descr.lower() or descr == "RAM":
+                if hr_type.endswith(".25.2.1.2") or descr_l in ("physical memory", "ram", "main memory"):
                     if mem_pct is None:
                         mem_pct = pct
                         memory_details = {
@@ -2201,14 +2250,34 @@ class SNMPPoller:
                             "avail_bytes": max(0, total_b - used_b),
                             "usage_pct": pct,
                         }
-                elif (
+                    continue
+                # Skip Virtual Memory, Buffers/Cache/Shared Memory, Swap, and pseudo filesystems
+                if hr_type.endswith(".25.2.1.3"):
+                    continue
+                if hr_type.endswith(".25.2.1.1") and any(
+                    tok in descr_l for tok in ("memory", "buffer", "cache", "shm")
+                ):
+                    continue
+                if any(
+                    tok in descr_l
+                    for tok in ("memory", "buffers", "cached", "swap", "ram", "shm", "tmpfs")
+                ):
+                    continue
+                if any(
+                    descr.startswith(pfx)
+                    for pfx in ("/dev", "/run", "/sys", "/proc", "/snap", "/tmp", "/var/tmp")
+                ):
+                    continue
+                is_disk_type = hr_type.endswith((".25.2.1.4", ".25.2.1.9", ".25.2.1.10"))
+                is_disk_descr = (
                     descr.startswith("/")
                     or ":\\" in descr
-                    or "volume" in descr.lower()
-                    or "ram" in descr.lower()
-                ) and not any(
-                    skip in descr for skip in ("/dev", "/run", "/sys", "/proc", "/snap")
-                ):
+                    or any(
+                        kw in descr_l
+                        for kw in ("volume", "flash", "bootflash", "disk", "hdd", "ssd", "nvme", "nand")
+                    )
+                )
+                if is_disk_type or is_disk_descr:
                     storage_volumes.append(
                         {
                             "mount": descr,
@@ -3226,6 +3295,43 @@ class SNMPPoller:
                     )
                 except Exception as exc:
                     logger.debug("wireless_metrics_raw insert skipped: %s", exc)
+
+            ext_m = enrichment["extended_metrics"]
+            mem_det = ext_m.get("memory_details") if isinstance(ext_m.get("memory_details"), dict) else {}
+            cpu_det = ext_m.get("cpu_details") if isinstance(ext_m.get("cpu_details"), dict) else {}
+            stor_sum = _compute_storage_summary(ext_m.get("storage_volumes") or [])
+            has_cpu_metric = bool(cpu_vals or enrichment.get("cpu_pct") is not None)
+            has_mem_metric = bool(enrichment.get("mem_pct") is not None or mem_det.get("total_bytes"))
+            if (
+                has_cpu_metric
+                or has_mem_metric
+                or stor_sum["storage_usage_pct"] is not None
+                or temp_celsius is not None
+            ):
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO device_system_metrics_raw (
+                            time, device_ip, cpu_usage_pct, mem_usage_pct,
+                            mem_used_bytes, mem_total_bytes, storage_usage_pct,
+                            storage_used_bytes, storage_total_bytes, temp_celsius,
+                            load_1m, volume_metrics
+                        ) VALUES (NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+                        """,
+                        target,
+                        avg_cpu if has_cpu_metric else None,
+                        mem_usage if has_mem_metric else None,
+                        mem_det.get("used_bytes"),
+                        mem_det.get("total_bytes"),
+                        stor_sum["storage_usage_pct"],
+                        stor_sum["storage_used_bytes"],
+                        stor_sum["storage_total_bytes"],
+                        temp_celsius,
+                        cpu_det.get("load_1m"),
+                        json.dumps(stor_sum["volume_metrics"]),
+                    )
+                except Exception as exc:
+                    logger.debug("device_system_metrics_raw insert skipped: %s", exc)
 
         return {
             "device_ip": target,

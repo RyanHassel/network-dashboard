@@ -150,6 +150,24 @@ CREATE TABLE IF NOT EXISTS wireless_metrics_raw (
 
 CREATE INDEX IF NOT EXISTS idx_wireless_metrics_raw_dev_time
     ON wireless_metrics_raw (device_ip, time DESC);
+
+CREATE TABLE IF NOT EXISTS device_system_metrics_raw (
+    time                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    device_ip           TEXT NOT NULL,
+    cpu_usage_pct       DOUBLE PRECISION,
+    mem_usage_pct       DOUBLE PRECISION,
+    mem_used_bytes      BIGINT,
+    mem_total_bytes     BIGINT,
+    storage_usage_pct   DOUBLE PRECISION,
+    storage_used_bytes  BIGINT,
+    storage_total_bytes BIGINT,
+    temp_celsius        DOUBLE PRECISION,
+    load_1m             DOUBLE PRECISION,
+    volume_metrics      JSONB DEFAULT '[]'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_system_metrics_dev_time
+    ON device_system_metrics_raw (device_ip, time DESC);
 """
 
 
@@ -252,6 +270,7 @@ async def ensure_dynamic_config_tables(pool: asyncpg.Pool) -> None:
             ("snmp_poll_metrics", 30),
             ("ups_metrics_raw", 180),
             ("wireless_metrics_raw", 180),
+            ("device_system_metrics_raw", 180),
         ):
             try:
                 await conn.execute(
@@ -265,6 +284,21 @@ async def ensure_dynamic_config_tables(pool: asyncpg.Pool) -> None:
                 )
             except Exception as exc:
                 logger.debug("add_retention_policy(%s) note: %s", tbl, exc)
+
+        # Clean up stale IF-MIB-only wireless_telemetry entries lacking radios/vaps/stations
+        try:
+            await conn.execute(
+                """
+                UPDATE snmp_devices
+                SET extended_metrics = extended_metrics - 'wireless_telemetry'
+                WHERE extended_metrics ? 'wireless_telemetry'
+                  AND jsonb_array_length(COALESCE(extended_metrics->'wireless_telemetry'->'radios', '[]'::jsonb)) = 0
+                  AND jsonb_array_length(COALESCE(extended_metrics->'wireless_telemetry'->'vaps', '[]'::jsonb)) = 0
+                  AND jsonb_array_length(COALESCE(extended_metrics->'wireless_telemetry'->'stations', '[]'::jsonb)) = 0
+                """
+            )
+        except Exception as exc:
+            logger.debug("stale wireless_telemetry cleanup skipped: %s", exc)
 
         await conn.execute(
             """

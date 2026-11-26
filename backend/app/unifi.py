@@ -109,6 +109,7 @@ class UniFiCollector:
 
             async with pool.acquire() as conn:
                 unifi_ips: List[str] = []
+                sys_candidates: List[tuple] = []
                 for dev in device_data:
                     mac = str(dev.get("mac", "")).lower()
                     if not mac:
@@ -242,6 +243,13 @@ class UniFiCollector:
                         tx_bps,
                         json.dumps(slim_ports),
                     )
+                    primary_sys_ip = lan_ip or ip_addr
+                    if (
+                        status == "online"
+                        and primary_sys_ip
+                        and (cpu_pct > 0.0 or mem_pct > 0.0 or temp_val is not None)
+                    ):
+                        sys_candidates.append((primary_sys_ip, cpu_pct, mem_pct, temp_val))
 
                 for sta in client_data:
                     mac = str(sta.get("mac", "")).lower()
@@ -324,6 +332,37 @@ class UniFiCollector:
 
                 if unifi_ips:
                     await ensure_device_ids(conn, unifi_ips, touch_last_seen=True)
+
+                if sys_candidates:
+                    try:
+                        cand_ips = list({row[0] for row in sys_candidates})
+                        covered_rows = await conn.fetch(
+                            """
+                            SELECT DISTINCT device_ip
+                            FROM device_system_metrics_raw
+                            WHERE device_ip = ANY($1::text[])
+                              AND time > NOW() - INTERVAL '3 minutes'
+                              AND (storage_usage_pct IS NOT NULL OR mem_total_bytes IS NOT NULL)
+                            """,
+                            cand_ips,
+                        )
+                        snmp_covered = {str(r["device_ip"]) for r in covered_rows}
+                        fallback_rows = [
+                            (ip_val, cpu_val, mem_val, t_val)
+                            for ip_val, cpu_val, mem_val, t_val in sys_candidates
+                            if ip_val not in snmp_covered
+                        ]
+                        if fallback_rows:
+                            await conn.executemany(
+                                """
+                                INSERT INTO device_system_metrics_raw (
+                                    time, device_ip, cpu_usage_pct, mem_usage_pct, temp_celsius
+                                ) VALUES (NOW(), $1, $2, $3, $4)
+                                """,
+                                fallback_rows,
+                            )
+                    except Exception as exc:
+                        logger.debug("UniFi device_system_metrics_raw fallback skipped: %s", exc)
 
                 await conn.execute(
                     """

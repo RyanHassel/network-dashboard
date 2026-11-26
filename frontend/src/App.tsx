@@ -546,6 +546,26 @@ interface WirelessHistoryPoint {
   tx_bps: number | null;
 }
 
+interface DeviceSystemVolumePoint {
+  usage_pct: number;
+  used_bytes: number;
+  total_bytes: number;
+}
+
+interface DeviceSystemHistoryPoint {
+  time: string;
+  cpu_usage_pct: number | null;
+  mem_usage_pct: number | null;
+  mem_used_bytes: number | null;
+  mem_total_bytes: number | null;
+  storage_usage_pct: number | null;
+  storage_used_bytes: number | null;
+  storage_total_bytes: number | null;
+  temp_celsius: number | null;
+  load_1m: number | null;
+  volumes?: Record<string, DeviceSystemVolumePoint>;
+}
+
 interface SNMPTelemetrySeriesPoint {
   time: string;
   oids_collected: number;
@@ -2298,6 +2318,13 @@ export const App: React.FC = () => {
   const [wirelessChartMode, setWirelessChartMode] = useState<
     "clients" | "utilization" | "traffic" | "ccq" | "rf_dbm"
   >("clients");
+  const [systemHistory, setSystemHistory] = useState<DeviceSystemHistoryPoint[]>([]);
+  const [systemHistoryVolumes, setSystemHistoryVolumes] = useState<string[]>([]);
+  const [systemHistoryRange, setSystemHistoryRange] = useState<
+    "1h" | "6h" | "24h" | "7d" | "30d" | "1y" | "all"
+  >("24h");
+  const [systemScaleMode, setSystemScaleMode] = useState<"auto" | "full">("auto");
+  const [selectedStorageMount, setSelectedStorageMount] = useState<string>("__all__");
 
   const [subnets, setSubnets] = useState<string[]>([]);
   const [selectedSubnet, setSelectedSubnet] = useState<string>("");
@@ -2639,12 +2666,23 @@ export const App: React.FC = () => {
         }
         if (
           data.device_profile_type === "wireless" ||
-          Boolean(data.snmp_system?.extended_metrics?.wireless_telemetry) ||
+          Boolean(
+            data.snmp_system?.extended_metrics?.wireless_telemetry &&
+              ((data.snmp_system.extended_metrics.wireless_telemetry.radios?.length ?? 0) > 0 ||
+                (data.snmp_system.extended_metrics.wireless_telemetry.vaps?.length ?? 0) > 0 ||
+                (data.snmp_system.extended_metrics.wireless_telemetry.stations?.length ?? 0) > 0),
+          ) ||
           (data.snmp_system?.extended_metrics?.wireless_radios?.length ?? 0) > 0
         ) {
           fetchWirelessHistory(data.ip_address, wirelessHistoryRange);
         } else {
           setWirelessHistory([]);
+        }
+        if (data.snmp_system || data.unifi_device) {
+          fetchSystemHistory(data.ip_address, systemHistoryRange);
+        } else {
+          setSystemHistory([]);
+          setSystemHistoryVolumes([]);
         }
       } else {
         setDeviceDetail(null);
@@ -3472,6 +3510,22 @@ export const App: React.FC = () => {
     }
   };
 
+  const fetchSystemHistory = async (ip: string, rk = systemHistoryRange) => {
+    if (!ip) return;
+    try {
+      const r = await fetch(
+        `/api/devices/${encodeURIComponent(ip)}/system-history?range=${encodeURIComponent(rk)}`,
+      );
+      if (r.ok) {
+        const data = await r.json();
+        setSystemHistory(data.series || []);
+        setSystemHistoryVolumes(Array.isArray(data.volumes) ? data.volumes : []);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
   const fetchScanner = async () => {
     try {
       const r = await fetch("/api/scanner/hosts");
@@ -3671,6 +3725,19 @@ export const App: React.FC = () => {
       fetchDetailTrend(devIp, detailIfIndex, detailTrendRange);
     }
   }, [deviceDetail?.ip_address, selectedDeviceDetailIp, detailIfIndex, detailTrendRange]);
+
+  useEffect(() => {
+    const devIp = deviceDetail?.ip_address || selectedDeviceDetailIp;
+    if (devIp && (deviceDetail?.snmp_system || deviceDetail?.unifi_device)) {
+      fetchSystemHistory(devIp, systemHistoryRange);
+    }
+  }, [
+    deviceDetail?.ip_address,
+    selectedDeviceDetailIp,
+    systemHistoryRange,
+    Boolean(deviceDetail?.snmp_system),
+    Boolean(deviceDetail?.unifi_device),
+  ]);
 
   useEffect(() => {
     if (typeof document === "undefined") return;
@@ -4369,8 +4436,14 @@ export const App: React.FC = () => {
   const detailUps = deviceDetail?.snmp_system?.extended_metrics?.ups_telemetry || null;
   const detailPrinterSupplies =
     deviceDetail?.snmp_system?.extended_metrics?.printer_supplies || [];
+  const rawWirelessObj = deviceDetail?.snmp_system?.extended_metrics?.wireless_telemetry || null;
   const rawWirelessTelemetry =
-    deviceDetail?.snmp_system?.extended_metrics?.wireless_telemetry || null;
+    rawWirelessObj &&
+    ((rawWirelessObj.radios?.length ?? 0) > 0 ||
+      (rawWirelessObj.vaps?.length ?? 0) > 0 ||
+      (rawWirelessObj.stations?.length ?? 0) > 0)
+      ? rawWirelessObj
+      : null;
   const legacyWirelessRadios =
     deviceDetail?.snmp_system?.extended_metrics?.wireless_radios || [];
   const detailWireless: WirelessTelemetry | null = rawWirelessTelemetry
@@ -4455,6 +4528,34 @@ export const App: React.FC = () => {
                     : hasWlRfDbm
                       ? "rf_dbm"
                       : "clients";
+
+  const detailStorageVolumes =
+    deviceDetail?.snmp_system?.extended_metrics?.storage_volumes || [];
+  const detailMemDetails = deviceDetail?.snmp_system?.extended_metrics?.memory_details || null;
+  const detailCpuDetails = deviceDetail?.snmp_system?.extended_metrics?.cpu_details || null;
+  const storageMountChoices = Array.from(
+    new Set([
+      ...detailStorageVolumes.map((v) => v.mount).filter(Boolean),
+      ...systemHistoryVolumes,
+    ]),
+  );
+  const activeStorageMount =
+    selectedStorageMount !== "__all__" && storageMountChoices.includes(selectedStorageMount)
+      ? selectedStorageMount
+      : "__all__";
+  const hasSystemCpuPts = systemHistory.some((p) => p.cpu_usage_pct != null);
+  const hasSystemMemPts = systemHistory.some((p) => p.mem_usage_pct != null);
+  const hasSystemStoragePts = systemHistory.some((p) => p.storage_usage_pct != null);
+  const showSystemResourceCard =
+    (detailProfileType !== "ups" || hasSystemCpuPts || hasSystemMemPts || hasSystemStoragePts) &&
+    (deviceDetail?.snmp_system != null ||
+      deviceDetail?.unifi_device != null ||
+      systemHistory.length > 0);
+  const computePctAxisMax = (values: number[]) => {
+    if (systemScaleMode === "full") return 100;
+    const peak = Math.max(0, ...values);
+    return Math.min(100, Math.max(12, Math.ceil((peak * 1.25) / 4) * 4));
+  };
 
   return (
     <div className="min-h-screen bg-[#090D16] text-slate-100">
@@ -7864,6 +7965,346 @@ export const App: React.FC = () => {
                   </div>
                 )}
 
+                {/* System Resource Telemetry: CPU, Memory & Storage Historical Graphs */}
+                {showSystemResourceCard && (() => {
+                  const liveCpuPct =
+                    deviceDetail?.snmp_system?.cpu_usage_pct ??
+                    deviceDetail?.unifi_device?.cpu_usage_pct ??
+                    null;
+                  const liveMemPct =
+                    deviceDetail?.snmp_system?.mem_usage_pct ??
+                    deviceDetail?.unifi_device?.mem_usage_pct ??
+                    detailMemDetails?.usage_pct ??
+                    null;
+                  const liveTempC =
+                    deviceDetail?.snmp_system?.temp_celsius ??
+                    deviceDetail?.unifi_device?.temp_celsius ??
+                    null;
+
+                  const cpuChartPts = systemHistory
+                    .filter((pt) => pt.cpu_usage_pct != null)
+                    .map((pt) => ({
+                      label: pt.time,
+                      inVal: pt.cpu_usage_pct ?? 0,
+                      outVal: 0,
+                    }));
+                  const memChartPts = systemHistory
+                    .filter((pt) => pt.mem_usage_pct != null)
+                    .map((pt) => ({
+                      label: pt.time,
+                      inVal: pt.mem_usage_pct ?? 0,
+                      outVal: 0,
+                    }));
+                  const storageChartPts = systemHistory
+                    .map((pt) => {
+                      if (activeStorageMount === "__all__") {
+                        return pt.storage_usage_pct != null
+                          ? { label: pt.time, inVal: pt.storage_usage_pct, outVal: 0 }
+                          : null;
+                      }
+                      const vol = pt.volumes?.[activeStorageMount];
+                      return vol != null
+                        ? { label: pt.time, inVal: vol.usage_pct, outVal: 0 }
+                        : null;
+                    })
+                    .filter((x): x is { label: string; inVal: number; outVal: number } => x !== null);
+
+                  const cpuMaxY = computePctAxisMax(cpuChartPts.map((p) => p.inVal));
+                  const memMaxY = computePctAxisMax(memChartPts.map((p) => p.inVal));
+                  const storageMaxY = computePctAxisMax(storageChartPts.map((p) => p.inVal));
+
+                  const latestSysPt =
+                    systemHistory.length > 0 ? systemHistory[systemHistory.length - 1] : null;
+                  const selectedLiveVol =
+                    activeStorageMount === "__all__"
+                      ? null
+                      : detailStorageVolumes.find((v) => v.mount === activeStorageMount) || null;
+                  const hasStorageSection =
+                    detailStorageVolumes.length > 0 || storageChartPts.length > 0;
+
+                  const aggStorageTotals = (() => {
+                    if (detailStorageVolumes.length === 0) {
+                      return {
+                        used: latestSysPt?.storage_used_bytes ?? null,
+                        total: latestSysPt?.storage_total_bytes ?? null,
+                        pct: latestSysPt?.storage_usage_pct ?? null,
+                      };
+                    }
+                    const seenSig = new Set<string>();
+                    let used = 0;
+                    let total = 0;
+                    const sorted = [...detailStorageVolumes].sort(
+                      (a, b) => a.mount.length - b.mount.length,
+                    );
+                    for (const v of sorted) {
+                      const sig = `${v.total_bytes}:${v.used_bytes}`;
+                      if (v.total_bytes > 0 && !seenSig.has(sig)) {
+                        seenSig.add(sig);
+                        total += v.total_bytes;
+                        used += v.used_bytes;
+                      }
+                    }
+                    return {
+                      used,
+                      total,
+                      pct: total > 0 ? Math.round((used / total) * 1000) / 10 : null,
+                    };
+                  })();
+
+                  return (
+                    <div className="space-y-4 rounded-xl border border-slate-800 bg-[#111827] p-5">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
+                            <Cpu className="h-4 w-4 text-emerald-400" />
+                            System Resource Telemetry — CPU, Memory &amp; Storage
+                          </h3>
+                          <p className="text-xs text-slate-400">
+                            Historical processor, RAM, and filesystem utilization polled from SNMP /
+                            UniFi telemetry
+                          </p>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-2">
+                          <div className="flex items-center gap-1 rounded-lg border border-slate-800 bg-[#090D16] p-1">
+                            <button
+                              type="button"
+                              onClick={() => setSystemScaleMode("auto")}
+                              className={`rounded px-2.5 py-1 text-xs font-medium transition ${
+                                systemScaleMode === "auto"
+                                  ? "bg-sky-600 text-white"
+                                  : "text-slate-400 hover:text-slate-200"
+                              }`}
+                            >
+                              Auto Scale
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setSystemScaleMode("full")}
+                              className={`rounded px-2.5 py-1 font-mono-tabular text-xs font-medium transition ${
+                                systemScaleMode === "full"
+                                  ? "bg-sky-600 text-white"
+                                  : "text-slate-400 hover:text-slate-200"
+                              }`}
+                            >
+                              0–100%
+                            </button>
+                          </div>
+
+                          <div className="flex items-center gap-1 rounded-lg border border-slate-800 bg-[#090D16] p-1">
+                            {(["1h", "6h", "24h", "7d", "30d", "1y", "all"] as const).map((rk) => (
+                              <button
+                                key={rk}
+                                type="button"
+                                onClick={() => setSystemHistoryRange(rk)}
+                                className={`rounded px-2.5 py-1 font-mono-tabular text-xs font-medium uppercase transition ${
+                                  systemHistoryRange === rk
+                                    ? "bg-emerald-600 text-white"
+                                    : "text-slate-400 hover:text-slate-200"
+                                }`}
+                              >
+                                {rk}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                        {/* CPU Usage Graph */}
+                        <div className="space-y-3 rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <div className="flex items-center gap-1.5 text-xs font-semibold text-white">
+                                <Cpu className="h-3.5 w-3.5 text-emerald-400" />
+                                CPU Utilization
+                              </div>
+                              <div className="mt-0.5 font-mono-tabular text-[11px] text-slate-400">
+                                {detailCpuDetails?.core_count != null
+                                  ? `${detailCpuDetails.core_count} cores`
+                                  : "Processor load"}
+                                {detailCpuDetails?.load_1m != null
+                                  ? ` • Load ${detailCpuDetails.load_1m} / ${detailCpuDetails.load_5m ?? "—"} / ${detailCpuDetails.load_15m ?? "—"}`
+                                  : ""}
+                                {liveTempC != null ? ` • ${liveTempC.toFixed(1)}°C` : ""}
+                              </div>
+                            </div>
+                            <div className="font-mono-tabular text-lg font-bold text-emerald-400">
+                              {liveCpuPct != null ? `${liveCpuPct.toFixed(1)}%` : "—"}
+                            </div>
+                          </div>
+
+                          <DualAreaSparkChart
+                            showYAxis
+                            hideSecondary
+                            windowMs={rangeKeyToWindowMs(systemHistoryRange)}
+                            fixedMaxBps={cpuMaxY}
+                            primaryLabel="CPU Usage (%)"
+                            primaryShortLabel="CPU"
+                            primaryColor="#10B981"
+                            yAxisLabel="%"
+                            formatValue={(v) => `${v.toFixed(1)}%`}
+                            formatAxisTick={(v) => `${Math.round(v)}%`}
+                            emptyMessage="Collecting CPU utilization samples..."
+                            points={cpuChartPts}
+                          />
+                        </div>
+
+                        {/* Memory Usage Graph */}
+                        <div className="space-y-3 rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <div className="flex items-center gap-1.5 text-xs font-semibold text-white">
+                                <Server className="h-3.5 w-3.5 text-sky-400" />
+                                Memory (RAM) Utilization
+                              </div>
+                              <div className="mt-0.5 font-mono-tabular text-[11px] text-slate-400">
+                                {detailMemDetails?.total_bytes != null
+                                  ? `${formatBytes(detailMemDetails.used_bytes)} / ${formatBytes(detailMemDetails.total_bytes)}`
+                                  : latestSysPt?.mem_total_bytes != null
+                                    ? `${formatBytes(latestSysPt.mem_used_bytes)} / ${formatBytes(latestSysPt.mem_total_bytes)}`
+                                    : "Physical RAM usage"}
+                              </div>
+                            </div>
+                            <div className="font-mono-tabular text-lg font-bold text-sky-400">
+                              {liveMemPct != null ? `${liveMemPct.toFixed(1)}%` : "—"}
+                            </div>
+                          </div>
+
+                          <DualAreaSparkChart
+                            showYAxis
+                            hideSecondary
+                            windowMs={rangeKeyToWindowMs(systemHistoryRange)}
+                            fixedMaxBps={memMaxY}
+                            primaryLabel="Memory Usage (%)"
+                            primaryShortLabel="RAM"
+                            primaryColor="#38BDF8"
+                            yAxisLabel="%"
+                            formatValue={(v) => `${v.toFixed(1)}%`}
+                            formatAxisTick={(v) => `${Math.round(v)}%`}
+                            emptyMessage="Collecting memory utilization samples..."
+                            points={memChartPts}
+                          />
+                        </div>
+                      </div>
+
+                      {/* Storage & Filesystem Graph */}
+                      {hasStorageSection ? (
+                        <div className="space-y-3 rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <div className="flex items-center gap-1.5 text-xs font-semibold text-white">
+                                <HardDrive className="h-3.5 w-3.5 text-violet-400" />
+                                Storage &amp; Filesystem Utilization
+                              </div>
+                              <div className="mt-0.5 font-mono-tabular text-[11px] text-slate-400">
+                                {selectedLiveVol
+                                  ? `${selectedLiveVol.mount}: ${formatBytes(selectedLiveVol.used_bytes)} / ${formatBytes(selectedLiveVol.total_bytes)}`
+                                  : aggStorageTotals.total != null
+                                    ? `Combined: ${formatBytes(aggStorageTotals.used)} / ${formatBytes(aggStorageTotals.total)}`
+                                    : "HOST-RESOURCES-MIB / UCD-SNMP-MIB storage"}
+                              </div>
+                            </div>
+
+                            <div className="flex flex-wrap items-center gap-2">
+                              {storageMountChoices.length > 1 && (
+                                <div className="flex flex-wrap items-center gap-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => setSelectedStorageMount("__all__")}
+                                    className={`rounded border px-2 py-0.5 font-mono-tabular text-[11px] transition ${
+                                      activeStorageMount === "__all__"
+                                        ? "border-violet-500/50 bg-violet-600 text-white"
+                                        : "border-slate-700 bg-[#111827] text-slate-300 hover:bg-slate-800"
+                                    }`}
+                                  >
+                                    All Disks
+                                  </button>
+                                  {storageMountChoices.map((mnt) => (
+                                    <button
+                                      key={mnt}
+                                      type="button"
+                                      onClick={() => setSelectedStorageMount(mnt)}
+                                      className={`rounded border px-2 py-0.5 font-mono-tabular text-[11px] transition ${
+                                        activeStorageMount === mnt
+                                          ? "border-violet-500/50 bg-violet-600 text-white"
+                                          : "border-slate-700 bg-[#111827] text-slate-300 hover:bg-slate-800"
+                                      }`}
+                                    >
+                                      {mnt}
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                              <div className="font-mono-tabular text-lg font-bold text-violet-400">
+                                {selectedLiveVol
+                                  ? `${selectedLiveVol.usage_pct.toFixed(1)}%`
+                                  : aggStorageTotals.pct != null
+                                    ? `${aggStorageTotals.pct.toFixed(1)}%`
+                                    : "—"}
+                              </div>
+                            </div>
+                          </div>
+
+                          <DualAreaSparkChart
+                            showYAxis
+                            hideSecondary
+                            windowMs={rangeKeyToWindowMs(systemHistoryRange)}
+                            fixedMaxBps={storageMaxY}
+                            primaryLabel={
+                              activeStorageMount === "__all__"
+                                ? "Storage Usage (%)"
+                                : `${activeStorageMount} Usage (%)`
+                            }
+                            primaryShortLabel="Storage"
+                            primaryColor="#A78BFA"
+                            yAxisLabel="%"
+                            formatValue={(v) => `${v.toFixed(1)}%`}
+                            formatAxisTick={(v) => `${Math.round(v)}%`}
+                            emptyMessage="Collecting storage utilization samples..."
+                            points={storageChartPts}
+                          />
+
+                          {detailStorageVolumes.length > 0 && (
+                            <div className="grid grid-cols-1 gap-3 border-t border-slate-800/80 pt-3 sm:grid-cols-2 lg:grid-cols-3">
+                              {detailStorageVolumes.map((vol, idx) => (
+                                <div key={`${vol.mount}-${idx}`} className="text-xs">
+                                  <div className="mb-1 flex items-center justify-between gap-2 font-mono-tabular">
+                                    <span className="truncate font-semibold text-slate-200">
+                                      {vol.mount}
+                                    </span>
+                                    <span className="shrink-0 text-slate-400">
+                                      {formatBytes(vol.used_bytes)} / {formatBytes(vol.total_bytes)}{" "}
+                                      ({vol.usage_pct}%)
+                                    </span>
+                                  </div>
+                                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-[#111827]">
+                                    <div
+                                      style={{ width: `${Math.min(100, vol.usage_pct)}%` }}
+                                      className={`h-full rounded-full ${
+                                        vol.usage_pct >= 90
+                                          ? "bg-rose-500"
+                                          : vol.usage_pct >= 75
+                                            ? "bg-amber-500"
+                                            : "bg-emerald-500"
+                                      }`}
+                                    />
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="rounded-lg border border-slate-800/80 bg-[#090D16] px-3.5 py-2 text-[11px] text-slate-400">
+                          Storage: No filesystem/disk MIB (<code>HOST-RESOURCES-MIB</code> /{" "}
+                          <code>UCD-SNMP-MIB</code>) exposed by this device.
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+
                 {/* Extended Vendor MIB Telemetry: Sensors, CPU/RAM/Storage, Wireless VAPs, and LLDP Neighbors */}
                 {deviceDetail?.snmp_system?.extended_metrics && (
                   <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
@@ -7941,7 +8382,8 @@ export const App: React.FC = () => {
                     )}
 
                     {/* Storage Volumes & Filesystems (HOST-RESOURCES-MIB) */}
-                    {deviceDetail.snmp_system.extended_metrics.storage_volumes &&
+                    {!showSystemResourceCard &&
+                      deviceDetail.snmp_system.extended_metrics.storage_volumes &&
                       deviceDetail.snmp_system.extended_metrics.storage_volumes.length > 0 && (
                         <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
                           <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold text-white">

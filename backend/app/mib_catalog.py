@@ -47,7 +47,6 @@ VENDOR_CATALOG: List[Dict[str, Any]] = [
             "ENTITY-MIB",
             "LLDP-MIB",
             "UBNT-UniFi-MIB",
-            "UBNT-AirMAX-MIB",
             "FROGFOOT-RESOURCES-MIB",
             "UCD-SNMP-MIB",
         ],

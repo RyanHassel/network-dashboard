@@ -2802,39 +2802,43 @@ async def get_snmp_interfaces(device_ip: Optional[str] = None) -> Dict[str, Any]
 
 
 _HAS_WIRELESS_SQL = (
-    "COALESCE(((extended_metrics ? 'wireless_telemetry')"
-    " OR jsonb_array_length(COALESCE(extended_metrics->'wireless_radios', '[]'::jsonb)) > 0), FALSE)"
+    "COALESCE(("
+    "jsonb_array_length(COALESCE(extended_metrics->'wireless_telemetry'->'radios', '[]'::jsonb)) > 0"
+    " OR jsonb_array_length(COALESCE(extended_metrics->'wireless_telemetry'->'vaps', '[]'::jsonb)) > 0"
+    " OR jsonb_array_length(COALESCE(extended_metrics->'wireless_telemetry'->'stations', '[]'::jsonb)) > 0"
+    " OR jsonb_array_length(COALESCE(extended_metrics->'wireless_radios', '[]'::jsonb)) > 0"
+    "), FALSE)"
 )
 _HAS_WIRELESS_SQL_D = (
-    "COALESCE(((d.extended_metrics ? 'wireless_telemetry')"
-    " OR jsonb_array_length(COALESCE(d.extended_metrics->'wireless_radios', '[]'::jsonb)) > 0), FALSE)"
+    "COALESCE(("
+    "jsonb_array_length(COALESCE(d.extended_metrics->'wireless_telemetry'->'radios', '[]'::jsonb)) > 0"
+    " OR jsonb_array_length(COALESCE(d.extended_metrics->'wireless_telemetry'->'vaps', '[]'::jsonb)) > 0"
+    " OR jsonb_array_length(COALESCE(d.extended_metrics->'wireless_telemetry'->'stations', '[]'::jsonb)) > 0"
+    " OR jsonb_array_length(COALESCE(d.extended_metrics->'wireless_radios', '[]'::jsonb)) > 0"
+    "), FALSE)"
 )
 
 
-def _has_wireless_telemetry(snmp_sys: Optional[Dict[str, Any]]) -> tuple:
-    """Returns (has_ap_or_station_telemetry, has_any_wireless_telemetry)."""
+def _has_wireless_telemetry(snmp_sys: Optional[Dict[str, Any]]) -> bool:
+    """Returns True only when SNMP wireless radios, VAPs, stations, or legacy wireless_radios are present."""
     if not isinstance(snmp_sys, dict):
-        return (False, False)
+        return False
+    if snmp_sys.get("has_wireless_telemetry"):
+        return True
     ext = snmp_sys.get("extended_metrics")
-    has_ap = False
-    has_any = bool(snmp_sys.get("has_wireless_telemetry"))
     if isinstance(ext, dict):
         wl = ext.get("wireless_telemetry")
         if isinstance(wl, dict):
-            radios = wl.get("radios") or []
-            vaps = wl.get("vaps") or []
-            stations = wl.get("stations") or []
-            wl_ifs = wl.get("wireless_interfaces") or []
-            if radios or vaps or stations:
-                has_ap = True
-                has_any = True
-            elif wl_ifs:
-                has_any = True
+            if (
+                (wl.get("radios") or [])
+                or (wl.get("vaps") or [])
+                or (wl.get("stations") or [])
+            ):
+                return True
         w_rad = ext.get("wireless_radios")
         if isinstance(w_rad, list) and len(w_rad) > 0:
-            has_ap = True
-            has_any = True
-    return (has_ap, has_any)
+            return True
+    return False
 
 
 def _classify_device_profile(
@@ -2871,8 +2875,7 @@ def _classify_device_profile(
     ):
         return "ups"
 
-    has_ap_wl, has_any_wl = _has_wireless_telemetry(snmp_sys)
-    if has_ap_wl:
+    if _has_wireless_telemetry(snmp_sys):
         return "wireless"
 
     if "Printer-MIB" in mibs or re.search(r"\b(printer|mfp|laserjet|officejet)\b", combined):
@@ -2882,15 +2885,45 @@ def _classify_device_profile(
     ) or re.search(r"\b(nas|storage server|storage appliance|synology|truenas|freenas|qnap)\b", combined):
         return "nas"
 
-    if has_any_wl:
-        return "wireless"
+    if isinstance(unifi_dev, dict) and str(unifi_dev.get("device_type") or "").lower() in (
+        "udm",
+        "ugw",
+        "uxg",
+        "usw",
+        "usp",
+    ):
+        return "network"
+
+    id_parts: List[str] = []
+    for src in (snmp_sys, unifi_dev):
+        if not isinstance(src, dict):
+            continue
+        for key in ("sys_descr", "sys_name", "hardware_model", "model", "name"):
+            val = src.get(key)
+            if val:
+                id_parts.append(str(val))
+    if isinstance(fallback_mib, dict):
+        for key in ("sys_descr", "sys_name", "hardware_model", "model"):
+            val = fallback_mib.get(key)
+            if val:
+                id_parts.append(str(val))
+    identity_text = " ".join(id_parts).lower()
+
+    if re.search(
+        r"\b(udm[-\s]?pro|udm[-\s]?se|udm[-\s]?max|ucg|uxg|usg|usw|edgeswitch|edgerouter|dream machine pro)\b",
+        identity_text,
+    ):
+        return "network"
+
     if isinstance(unifi_dev, dict) and str(unifi_dev.get("device_type") or "").lower() == "uap":
         return "wireless"
+
     if re.search(
-        r"(?:^|[^a-z0-9])(uap|u6(?:\+|[\s-]|$)|u7(?:\+|[\s-]|$)|nanohd|flexhd|beaconhd|iw-hd|uk-ultra|uwb|airmax|nanobeam|powerbeam|litebeam|airfiber|access point|wireless ap|eap\d+|aironet|iap-\d+|ruckus)",
-        combined,
+        r"(?:^|[^a-z0-9])(uap|u6(?:\+|-(?:pro|lite|lr|mesh|iw|enterprise|extender)|\s+(?:pro|lite|lr|mesh|iw|enterprise|extender))|u7(?:\+|-(?:pro|lite|max|wall|outdoor)|\s+(?:pro|lite|max|wall|outdoor))|nanohd|flexhd|beaconhd|iw-hd|uk-ultra|uwb|nanobeam|powerbeam|litebeam|airfiber|access point|wireless ap|eap\d+|aironet|iap-\d+)",
+        identity_text,
     ):
         return "wireless"
+
     if unifi_dev or re.search(
         r"\b(switch|gateway|router|firewall|ubiquiti|unifi|udm|mikrotik|cisco|fortinet|juniper|aruba|arista|netgear|access point)\b",
         combined,
@@ -4299,6 +4332,257 @@ async def get_device_wireless_history(
         for r in rows
     ]
     return {"device_id": device_id, "device_ip": device_ip, "range": rk, "series": series}
+
+
+@app.get("/api/devices/{device_ref}/system-history")
+async def get_device_system_history(
+    device_ref: str,
+    range_key: str = Query(default="24h", alias="range"),
+) -> Dict[str, Any]:
+    """Returns time-series CPU, memory, storage, temperature, and load telemetry for a device."""
+    rk = (range_key or "24h").strip().lower()
+    if rk == "1d":
+        rk = "24h"
+    if rk not in ("1h", "6h", "24h", "7d", "30d", "1y", "all"):
+        rk = "24h"
+
+    range_map = {
+        "1h": ("1 hour", None),
+        "6h": ("6 hours", "2 minutes"),
+        "24h": ("24 hours", "5 minutes"),
+        "7d": ("7 days", "1 hour"),
+        "30d": ("30 days", "2 hours"),
+        "1y": ("365 days", "1 day"),
+        "all": (None, "1 day"),
+    }
+    sql_interval, bucket_size = range_map[rk]
+
+    pool = _get_pool()
+    async with pool.acquire() as conn:
+        device_id, device_ip = await _resolve_device_ref(conn, device_ref)
+        where_clause = f"AND time > NOW() - INTERVAL '{sql_interval}'" if sql_interval else ""
+
+        if bucket_size is None:
+            sys_rows = await conn.fetch(
+                f"""
+                SELECT time AS bucket,
+                       cpu_usage_pct,
+                       mem_usage_pct,
+                       mem_used_bytes,
+                       mem_total_bytes,
+                       storage_usage_pct,
+                       storage_used_bytes,
+                       storage_total_bytes,
+                       temp_celsius,
+                       load_1m,
+                       volume_metrics
+                FROM device_system_metrics_raw
+                WHERE device_ip = $1
+                  {where_clause}
+                ORDER BY time ASC
+                """,
+                device_ip,
+            )
+        else:
+            sys_rows = await conn.fetch(
+                f"""
+                SELECT time_bucket('{bucket_size}', time) AS bucket,
+                       AVG(cpu_usage_pct) AS cpu_usage_pct,
+                       AVG(mem_usage_pct) AS mem_usage_pct,
+                       ROUND(AVG(mem_used_bytes))::bigint AS mem_used_bytes,
+                       MAX(mem_total_bytes) AS mem_total_bytes,
+                       AVG(storage_usage_pct) AS storage_usage_pct,
+                       ROUND(AVG(storage_used_bytes))::bigint AS storage_used_bytes,
+                       MAX(storage_total_bytes) AS storage_total_bytes,
+                       AVG(temp_celsius) AS temp_celsius,
+                       AVG(load_1m) AS load_1m,
+                       (ARRAY_AGG(volume_metrics ORDER BY time DESC) FILTER (
+                           WHERE volume_metrics IS NOT NULL
+                             AND jsonb_typeof(volume_metrics) = 'array'
+                             AND jsonb_array_length(volume_metrics) > 0
+                       ))[1] AS volume_metrics
+                FROM device_system_metrics_raw
+                WHERE device_ip = $1
+                  {where_clause}
+                GROUP BY bucket
+                ORDER BY bucket ASC
+                """,
+                device_ip,
+            )
+
+        earliest_ts = sys_rows[0]["bucket"] if sys_rows else datetime.now(timezone.utc)
+        backfill_rows: List[asyncpg.Record] = []
+
+        if rk in ("1h", "6h", "24h"):
+            raw_bucket = "1 minute" if rk == "1h" else (bucket_size or "5 minutes")
+            backfill_rows = await conn.fetch(
+                f"""
+                SELECT time_bucket('{raw_bucket}', time) AS bucket,
+                       AVG(NULLIF(cpu_usage, 0)) AS cpu_usage_pct,
+                       AVG(NULLIF(mem_usage, 0)) AS mem_usage_pct
+                FROM snmp_metrics_raw
+                WHERE device_ip = $1
+                  AND time < $2
+                  {where_clause}
+                  AND (cpu_usage > 0 OR mem_usage > 0)
+                GROUP BY bucket
+                ORDER BY bucket ASC
+                """,
+                device_ip,
+                earliest_ts,
+            )
+        elif rk in ("7d", "30d"):
+            agg_where = f"AND bucket > NOW() - INTERVAL '{sql_interval}'" if sql_interval else ""
+            backfill_rows = await conn.fetch(
+                f"""
+                SELECT bucket,
+                       AVG(NULLIF(avg_cpu_usage, 0)) AS cpu_usage_pct,
+                       AVG(NULLIF(avg_mem_usage, 0)) AS mem_usage_pct
+                FROM snmp_metrics_hourly
+                WHERE device_ip = $1
+                  AND bucket < $2
+                  {agg_where}
+                  AND (avg_cpu_usage > 0 OR avg_mem_usage > 0)
+                GROUP BY bucket
+                ORDER BY bucket ASC
+                """,
+                device_ip,
+                earliest_ts,
+            )
+        else:
+            agg_where = f"AND bucket > NOW() - INTERVAL '{sql_interval}'" if sql_interval else ""
+            backfill_rows = await conn.fetch(
+                f"""
+                SELECT bucket,
+                       AVG(NULLIF(avg_cpu_usage, 0)) AS cpu_usage_pct,
+                       AVG(NULLIF(avg_mem_usage, 0)) AS mem_usage_pct
+                FROM snmp_metrics_daily
+                WHERE device_ip = $1
+                  AND bucket < $2
+                  {agg_where}
+                  AND (avg_cpu_usage > 0 OR avg_mem_usage > 0)
+                GROUP BY bucket
+                ORDER BY bucket ASC
+                """,
+                device_ip,
+                earliest_ts,
+            )
+
+        gw_backfill_rows: List[asyncpg.Record] = []
+        if not backfill_rows:
+            is_gw_ip = bool(
+                await conn.fetchval(
+                    """
+                    SELECT 1 FROM unifi_devices
+                    WHERE (ip_address = $1 OR lan_ip = $1)
+                      AND LOWER(COALESCE(device_type, '')) IN ('udm', 'ugw', 'uxg')
+                    LIMIT 1
+                    """,
+                    device_ip,
+                )
+            )
+            if is_gw_ip:
+                if bucket_size is None:
+                    gw_backfill_rows = await conn.fetch(
+                        f"""
+                        SELECT time AS bucket, cpu_usage_pct, mem_usage_pct, temp_celsius
+                        FROM unifi_gateway_metrics
+                        WHERE time < $1
+                          {where_clause}
+                        ORDER BY time ASC
+                        """,
+                        earliest_ts,
+                    )
+                else:
+                    gw_backfill_rows = await conn.fetch(
+                        f"""
+                        SELECT time_bucket('{bucket_size}', time) AS bucket,
+                               AVG(cpu_usage_pct) AS cpu_usage_pct,
+                               AVG(mem_usage_pct) AS mem_usage_pct,
+                               AVG(temp_celsius) AS temp_celsius
+                        FROM unifi_gateway_metrics
+                        WHERE time < $1
+                          {where_clause}
+                        GROUP BY bucket
+                        ORDER BY bucket ASC
+                        """,
+                        earliest_ts,
+                    )
+
+    def _opt_round(v: Any, digits: int = 1) -> Optional[float]:
+        return round(float(v), digits) if v is not None else None
+
+    def _opt_int_val(v: Any) -> Optional[int]:
+        return int(v) if v is not None else None
+
+    available_volumes: List[str] = []
+    seen_vols = set()
+    series: List[Dict[str, Any]] = []
+
+    for r in backfill_rows or gw_backfill_rows:
+        rd = dict(r)
+        series.append(
+            {
+                "time": rd["bucket"].isoformat(),
+                "cpu_usage_pct": _opt_round(rd.get("cpu_usage_pct"), 1),
+                "mem_usage_pct": _opt_round(rd.get("mem_usage_pct"), 1),
+                "mem_used_bytes": None,
+                "mem_total_bytes": None,
+                "storage_usage_pct": None,
+                "storage_used_bytes": None,
+                "storage_total_bytes": None,
+                "temp_celsius": _opt_round(rd.get("temp_celsius"), 1),
+                "load_1m": None,
+                "volumes": {},
+            }
+        )
+
+    for r in sys_rows:
+        raw_vols = r["volume_metrics"]
+        if isinstance(raw_vols, str):
+            try:
+                raw_vols = json.loads(raw_vols)
+            except Exception:
+                raw_vols = []
+        vols_map: Dict[str, Dict[str, Any]] = {}
+        if isinstance(raw_vols, list):
+            for v in raw_vols:
+                if not isinstance(v, dict):
+                    continue
+                mnt = str(v.get("mount") or "").strip()
+                if not mnt:
+                    continue
+                if mnt not in seen_vols:
+                    seen_vols.add(mnt)
+                    available_volumes.append(mnt)
+                vols_map[mnt] = {
+                    "usage_pct": round(float(v.get("usage_pct") or 0.0), 1),
+                    "used_bytes": int(v.get("used_bytes") or 0),
+                    "total_bytes": int(v.get("total_bytes") or 0),
+                }
+        series.append(
+            {
+                "time": r["bucket"].isoformat(),
+                "cpu_usage_pct": _opt_round(r["cpu_usage_pct"], 1),
+                "mem_usage_pct": _opt_round(r["mem_usage_pct"], 1),
+                "mem_used_bytes": _opt_int_val(r["mem_used_bytes"]),
+                "mem_total_bytes": _opt_int_val(r["mem_total_bytes"]),
+                "storage_usage_pct": _opt_round(r["storage_usage_pct"], 1),
+                "storage_used_bytes": _opt_int_val(r["storage_used_bytes"]),
+                "storage_total_bytes": _opt_int_val(r["storage_total_bytes"]),
+                "temp_celsius": _opt_round(r["temp_celsius"], 1),
+                "load_1m": _opt_round(r["load_1m"], 2),
+                "volumes": vols_map,
+            }
+        )
+
+    return {
+        "device_id": device_id,
+        "device_ip": device_ip,
+        "range": rk,
+        "volumes": available_volumes,
+        "series": series,
+    }
 
 
 @app.post("/api/devices/rematch-mibs")
