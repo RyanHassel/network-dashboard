@@ -100,10 +100,11 @@ function isModifiedClick(e: React.MouseEvent): boolean {
 type DeviceSortKey =
   | "device_id"
   | "status"
+  | "vendor_icon"
   | "ip_address"
   | "hostname"
+  | "device_type"
   | "mac_address"
-  | "vendor_icon"
   | "vendor"
   | "subnet"
   | "snmp"
@@ -117,7 +118,7 @@ type DeviceSortKey =
 type DeviceColumnKey = DeviceSortKey;
 type SortDirection = "asc" | "desc";
 
-const DEVICE_COLUMNS_STORAGE_KEY = "netdash_device_table_columns_v2";
+const DEVICE_COLUMNS_STORAGE_KEY = "netdash_device_table_columns_v3";
 
 const DEVICE_TABLE_COLUMNS: Array<{
   key: DeviceColumnKey;
@@ -127,10 +128,11 @@ const DEVICE_TABLE_COLUMNS: Array<{
 }> = [
   { key: "device_id", label: "ID", alignRight: false, defaultVisible: true },
   { key: "status", label: "Status", alignRight: false, defaultVisible: true },
+  { key: "vendor_icon", label: "Vendor", alignRight: false, defaultVisible: true },
   { key: "ip_address", label: "IPv4 Address", alignRight: false, defaultVisible: true },
   { key: "hostname", label: "Hostname / sysName", alignRight: false, defaultVisible: true },
+  { key: "device_type", label: "Type", alignRight: false, defaultVisible: true },
   { key: "mac_address", label: "MAC Address", alignRight: false, defaultVisible: true },
-  { key: "vendor_icon", label: "Vendor", alignRight: false, defaultVisible: true },
   { key: "vendor", label: "Vendor / Hardware", alignRight: false, defaultVisible: true },
   { key: "subnet", label: "Subnet / VLAN", alignRight: false, defaultVisible: true },
   { key: "snmp", label: "SNMP / Interfaces", alignRight: false, defaultVisible: true },
@@ -314,6 +316,8 @@ interface ICMPHistoryPoint {
   rtt_ms: number | null;
   packet_loss_pct: number;
   uptime_pct: number;
+  is_reachable?: boolean;
+  had_drop?: boolean;
 }
 
 interface SubnetConfig {
@@ -539,8 +543,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
   switch (key) {
     case "ubiquiti":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" aria-hidden="true">
             {/* Pixelated top-left stem cubes */}
             <rect x="4.5" y="2.5" width="2" height="2" rx="0.3" fill="#38BDF8" />
             <rect x="7.2" y="3.2" width="1.6" height="1.6" rx="0.2" fill="#0EA5E9" />
@@ -565,8 +569,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "debian":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" aria-hidden="true">
             <path
               d="M13.3 13.7c-.8 0-1.4-.5-1.3-1.2.1-.9 1-1.5 1.9-1.4 1.3.1 2.1 1.3 1.9 2.7-.3 1.9-2.2 3.1-4.2 2.8-2.7-.4-4.4-3-3.9-5.8.6-3.4 4-5.7 7.4-5 3.8.8 6.1 4.6 5.1 8.4-.7 2.8-2.8 5-5.5 6"
               stroke="#D70A53"
@@ -585,8 +589,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "ubuntu":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" aria-hidden="true">
             <circle cx="12" cy="12" r="5.8" stroke="#E95420" strokeWidth="2.4" />
             <circle cx="17.2" cy="6.2" r="2.1" fill="#E95420" stroke="#0B1120" strokeWidth="0.9" />
             <circle cx="17.2" cy="17.8" r="2.1" fill="#E95420" stroke="#0B1120" strokeWidth="0.9" />
@@ -596,8 +600,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "linux":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" aria-hidden="true">
             {/* Penguin body & flippers */}
             <path
               d="M12 2.5c-2.6 0-4.2 1.8-4.2 4.3 0 1.4.4 2.4-.5 3.6-1 1.3-2.3 3.2-2.3 5.2 0 1.5.7 2.6 1.8 3.2h10.4c1.1-.6 1.8-1.7 1.8-3.2 0-2-1.3-3.9-2.3-5.2-.9-1.2-.5-2.2-.5-3.6C16.2 4.3 14.6 2.5 12 2.5Z"
@@ -623,8 +627,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "raspberry":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" aria-hidden="true">
             <path d="M12 6.2c-1.8-2.2-4.2-2.6-5.2-1.5 1.1 1.6 3.1 2.2 5.2 1.5Z" fill="#6CC04A" />
             <path d="M12 6.2c1.8-2.2 4.2-2.6 5.2-1.5-1.1 1.6-3.1 2.2-5.2 1.5Z" fill="#4CA635" />
             <circle cx="12" cy="13.8" r="5.8" fill="#C51A4A" />
@@ -638,8 +642,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "apc":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 28 20" className="h-4.5 w-6" fill="none" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 28 20" className="h-5.5 w-7" fill="none" aria-hidden="true">
             <text
               x="14"
               y="12"
@@ -659,16 +663,16 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "apple":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center text-slate-200">
-          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="currentColor" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center text-slate-200">
+          <svg viewBox="0 0 24 24" className="h-5.5 w-5.5" fill="currentColor" aria-hidden="true">
             <path d="M16.36 12.76c-.02-2.2 1.8-3.26 1.88-3.31-1.03-1.5-2.62-1.7-3.18-1.73-1.35-.14-2.64.8-3.32.8-.69 0-1.75-.78-2.88-.76-1.48.02-2.84.86-3.6 2.18-1.54 2.67-.39 6.62 1.1 8.78.73 1.05 1.6 2.24 2.74 2.2 1.1-.04 1.52-.71 2.85-.71 1.33 0 1.71.71 2.87.69 1.19-.02 1.94-1.07 2.66-2.13.84-1.22 1.18-2.41 1.2-2.47-.03-.01-2.3-.88-2.32-3.54ZM14.18 6.31c.6-.73 1.01-1.75.9-2.77-.87.04-1.93.58-2.55 1.31-.55.64-1.04 1.68-.91 2.67.97.08 1.96-.49 2.56-1.21Z" />
           </svg>
         </span>
       );
     case "cisco":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#00BCEB" strokeWidth="2.1" strokeLinecap="round" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="#00BCEB" strokeWidth="2.1" strokeLinecap="round" aria-hidden="true">
             <path d="M3.5 13v-2M7.5 15V9M12 17V6M16.5 15V9M20.5 13v-2" />
             <path d="M5 17.5c4-2.4 10-2.4 14 0" stroke="#38BDF8" strokeWidth="1.4" />
           </svg>
@@ -676,8 +680,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "proxmox":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#E57000" strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="#E57000" strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M6.5 5.5L12 10.2l5.5-4.7" />
             <path d="M6.5 18.5L12 13.8l5.5 4.7" />
             <path d="M4.2 9.2c1.4 1.6 1.4 4 0 5.6M19.8 9.2c-1.4 1.6-1.4 4 0 5.6" stroke="#CBD5E1" strokeWidth="1.9" />
@@ -686,8 +690,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "microsoft":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5.5 w-5.5" fill="none" aria-hidden="true">
             <rect x="3" y="3" width="8.2" height="8.2" fill="#F25022" />
             <rect x="12.8" y="3" width="8.2" height="8.2" fill="#7FBA00" />
             <rect x="3" y="12.8" width="8.2" height="8.2" fill="#00A4EF" />
@@ -697,8 +701,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "synology":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#F59E0B" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="#F59E0B" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M16.5 7.5a5.5 5.5 0 0 0-9 0" />
             <path d="M7.5 16.5a5.5 5.5 0 0 0 9 0" />
             <path d="M8.5 10.3c0-1.2 1.6-2 3.5-2s3.5.8 3.5 2-1.6 1.7-3.5 1.7-3.5.7-3.5 1.8 1.6 2 3.5 2 3.5-.8 3.5-2" />
@@ -707,8 +711,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "dell":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" aria-hidden="true">
             <circle cx="12" cy="12" r="9" stroke="#007DB8" strokeWidth="2" />
             <text
               x="12"
@@ -726,8 +730,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "aruba":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#FF8300" strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="#FF8300" strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M4.5 18.5L12 5l7.5 13.5" />
             <path d="M8.2 13.5h7.6" />
           </svg>
@@ -735,8 +739,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "hp":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" aria-hidden="true">
             <circle cx="12" cy="12" r="9" stroke="#0096D6" strokeWidth="2" />
             <path d="M9.5 7v10M9.5 12h3v5M14.8 12v6" stroke="#38BDF8" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
@@ -744,8 +748,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "fortinet":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="#EE3124" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5.5 w-5.5" fill="#EE3124" aria-hidden="true">
             <rect x="3.5" y="5" width="4.5" height="3.2" rx="0.6" />
             <rect x="9.75" y="5" width="4.5" height="3.2" rx="0.6" />
             <rect x="16" y="5" width="4.5" height="3.2" rx="0.6" />
@@ -759,8 +763,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "mikrotik":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#CBD5E1" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="#CBD5E1" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M4 16V8l4 4 4-4v8" />
             <path d="M15 8v8M15 12l4.5-4M16.5 10.5L20 16" stroke="#38BDF8" />
           </svg>
@@ -768,8 +772,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "vmware":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <rect x="4" y="4" width="9.5" height="9.5" rx="2" stroke="#0091DA" />
             <rect x="10.5" y="10.5" width="9.5" height="9.5" rx="2" stroke="#00C1D5" />
           </svg>
@@ -777,14 +781,14 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "ups":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center text-amber-400">
-          <Zap className="h-4.5 w-4.5" />
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center text-amber-400">
+          <Zap className="h-5 w-5" />
         </span>
       );
     case "google":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-4.5 w-4.5" fill="none" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-5.5 w-5.5" fill="none" aria-hidden="true">
             <path d="M21 12.2c0-.7-.1-1.3-.2-2H12v3.8h5c-.2 1.2-.9 2.2-2 2.9v2.4h3.2c1.9-1.7 2.8-4.3 2.8-7.1Z" fill="#4285F4" />
             <path d="M12 21.3c2.7 0 4.9-.9 6.5-2.4l-3.2-2.4c-.9.6-2 .9-3.3.9-2.5 0-4.7-1.7-5.5-4H3.2v2.5c1.6 3.2 5 5.4 8.8 5.4Z" fill="#34A853" />
             <path d="M6.5 13.4c-.2-.6-.3-1.2-.3-1.9s.1-1.3.3-1.9V7.1H3.2C2.4 8.6 2 10.3 2 12s.4 3.4 1.2 4.9l3.3-2.5Z" fill="#FBBC05" />
@@ -794,8 +798,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "amazon":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#FF9900" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="#FF9900" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M4 15.5c4.5 3.3 11.5 3.3 16 0" />
             <path d="M17.5 13.5l2.8 1.7-.9 2.8" />
           </svg>
@@ -803,8 +807,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "samsung":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" aria-hidden="true">
             <ellipse cx="12" cy="12" rx="9" ry="4.8" transform="rotate(-14 12 12)" stroke="#3B82F6" strokeWidth="2" />
             <circle cx="12" cy="12" r="1.5" fill="#93C5FD" />
           </svg>
@@ -812,8 +816,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "intel":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" aria-hidden="true">
             <ellipse cx="12" cy="12" rx="9.5" ry="6" transform="rotate(-12 12 12)" stroke="#0071C5" strokeWidth="1.9" />
             <text x="12" y="14.2" textAnchor="middle" fill="#38BDF8" fontSize="6.8" fontWeight="700" fontFamily="system-ui, sans-serif">
               intel
@@ -823,8 +827,8 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "tplink":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="#2DD4BF" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="#2DD4BF" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M12 4a8 8 0 0 1 8 8" />
             <path d="M12 8v8M8 12h8" />
             <circle cx="8" cy="16" r="2.2" />
@@ -833,21 +837,21 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
       );
     case "netgear":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center text-indigo-400">
-          <Network className="h-4.5 w-4.5" />
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center text-indigo-400">
+          <Network className="h-5 w-5" />
         </span>
       );
     case "storage":
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center text-sky-400">
-          <HardDrive className="h-4.5 w-4.5" />
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center text-sky-400">
+          <HardDrive className="h-5 w-5" />
         </span>
       );
     case "icmp":
     default:
       return (
-        <span title={label} className="inline-flex h-5 w-6 items-center justify-center text-slate-400">
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+        <span title={label} className="inline-flex h-7 w-8 items-center justify-center text-slate-400">
+          <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
             <circle cx="12" cy="12" r="2" fill="currentColor" stroke="none" />
             <path d="M8.5 8.5a5 5 0 0 0 0 7" />
             <path d="M15.5 8.5a5 5 0 0 1 0 7" />
@@ -859,10 +863,14 @@ function renderVendorIcon(d: UnifiedDeviceItem): React.ReactNode {
   }
 }
 
-function renderDeviceRoleBadge(d: UnifiedDeviceItem): React.ReactNode {
+function getDeviceRoleKey(d: UnifiedDeviceItem): string {
   const rawRole = (d.device_role || "").trim().toLowerCase();
   const ptype = (d.device_profile_type || "").trim().toLowerCase();
-  const role = rawRole || (ptype === "wireless" ? "ap" : ptype && ptype !== "server" ? ptype : "");
+  return rawRole || (ptype === "wireless" ? "ap" : ptype && ptype !== "server" ? ptype : "");
+}
+
+function renderDeviceRoleBadge(d: UnifiedDeviceItem): React.ReactNode {
+  const role = getDeviceRoleKey(d);
   if (!role) return null;
 
   switch (role) {
@@ -1833,6 +1841,44 @@ function buildMonotoneSpline(
   return { linePath, areaPath, segments };
 }
 
+function buildLinearPath(
+  pts: Array<{ x: number; y: number }>,
+  baselineY: number,
+): { linePath: string; areaPath: string; segments: SplineSegment[] } {
+  const n = pts.length;
+  if (n === 0) return { linePath: "", areaPath: "", segments: [] };
+  if (n === 1) {
+    return {
+      linePath: `M ${pts[0].x.toFixed(2)},${pts[0].y.toFixed(2)}`,
+      areaPath: "",
+      segments: [],
+    };
+  }
+
+  const segments: SplineSegment[] = [];
+  let linePath = `M ${pts[0].x.toFixed(2)},${pts[0].y.toFixed(2)}`;
+  for (let i = 0; i < n - 1; i++) {
+    const p0 = pts[i];
+    const p1 = pts[i + 1];
+    const dx = p1.x - p0.x;
+    const dy = p1.y - p0.y;
+    segments.push({
+      x0: p0.x,
+      y0: p0.y,
+      cp1x: p0.x + dx / 3,
+      cp1y: p0.y + dy / 3,
+      cp2x: p0.x + (2 * dx) / 3,
+      cp2y: p0.y + (2 * dy) / 3,
+      x1: p1.x,
+      y1: p1.y,
+    });
+    linePath += ` L ${p1.x.toFixed(2)},${p1.y.toFixed(2)}`;
+  }
+
+  const areaPath = `${linePath} L ${pts[n - 1].x.toFixed(2)},${baselineY.toFixed(2)} L ${pts[0].x.toFixed(2)},${baselineY.toFixed(2)} Z`;
+  return { linePath, areaPath, segments };
+}
+
 function evalSplineY(
   segments: SplineSegment[],
   pts: Array<{ x: number; y: number }>,
@@ -1912,6 +1958,9 @@ const DualAreaSparkChart: React.FC<{
   formatAxisTick?: (val: number) => string;
   emptyMessage?: string;
   hideSecondary?: boolean;
+  linear?: boolean;
+  dropMarkers?: Array<{ label: string; lossPct?: number }>;
+  dropLabel?: string;
 }> = ({
   points,
   height = 210,
@@ -1931,6 +1980,9 @@ const DualAreaSparkChart: React.FC<{
   formatAxisTick,
   emptyMessage = "Waiting for time-series samples...",
   hideSecondary = false,
+  linear = false,
+  dropMarkers,
+  dropLabel = "Ping Drop",
 }) => {
   const isDefaultBps = !formatValue;
   const formatVal = formatValue ?? formatBps;
@@ -1966,6 +2018,7 @@ const DualAreaSparkChart: React.FC<{
     timeText: string;
     boxX: number;
     boxY: number;
+    dropLossPct?: number;
   } | null>(null);
 
   useEffect(() => {
@@ -2110,7 +2163,7 @@ const DualAreaSparkChart: React.FC<{
   }, [liveMode, windowMs]);
 
   const hasFixedWindow = Boolean(windowMs && windowMs > 0);
-  if (!points.length && !hasFixedWindow) {
+  if (!points.length && !hasFixedWindow && !(dropMarkers && dropMarkers.length)) {
     return (
       <div
         style={{ height }}
@@ -2154,6 +2207,7 @@ const DualAreaSparkChart: React.FC<{
   let fixedWindowStart = 0;
   let fixedWindowSpanMs = 0;
   let hasVisibleSamples = points.length > 0;
+  let dropCoords: Array<{ x: number; ts: number; lossPct: number }> = [];
 
   if (useLiveRender) {
     const latestTs = liveSamples[liveSamples.length - 1].ts;
@@ -2321,8 +2375,31 @@ const DualAreaSparkChart: React.FC<{
     outPts = toPts(points.map((p) => p.outVal));
   }
 
-  const inSpline = buildMonotoneSpline(inPts, topPad, baselineY);
-  const outSpline = buildMonotoneSpline(outPts, topPad, baselineY);
+  if (dropMarkers && dropMarkers.length > 0 && (useLiveRender || useFixedWindow)) {
+    const winStart = useLiveRender ? liveWindowStart : fixedWindowStart;
+    const winSpan = useLiveRender ? liveWindowMs : fixedWindowSpanMs;
+    const winEnd = winStart + winSpan;
+    if (winSpan > 0) {
+      dropCoords = dropMarkers
+        .map((dm) => ({
+          ts: new Date(dm.label).getTime(),
+          lossPct: dm.lossPct ?? 100,
+        }))
+        .filter((dm) => !Number.isNaN(dm.ts) && dm.ts >= winStart && dm.ts <= winEnd)
+        .map((dm) => ({
+          x: ((dm.ts - winStart) / winSpan) * width,
+          ts: dm.ts,
+          lossPct: dm.lossPct,
+        }));
+    }
+  }
+
+  const inSpline = linear
+    ? buildLinearPath(inPts, baselineY)
+    : buildMonotoneSpline(inPts, topPad, baselineY);
+  const outSpline = linear
+    ? buildLinearPath(outPts, baselineY)
+    : buildMonotoneSpline(outPts, topPad, baselineY);
   const minCurveX = inPts.length > 0 ? Math.max(0, inPts[0].x) : 0;
   const maxCurveX = inPts.length > 0 ? Math.min(width, inPts[inPts.length - 1].x) : width;
   const showEndpointMarkers =
@@ -2337,24 +2414,49 @@ const DualAreaSparkChart: React.FC<{
     let inY: number;
     let outY: number;
     let timeText = "—";
+    let matchedDrop: { x: number; ts: number; lossPct: number } | undefined;
 
     if (useLiveRender || useFixedWindow) {
       const winStart = useLiveRender ? liveWindowStart : fixedWindowStart;
       const winSpan = useLiveRender ? liveWindowMs : fixedWindowSpanMs;
       const rawX = ratio * width;
+      let minHoverX = minCurveX;
+      let maxHoverX = maxCurveX;
+      if (dropCoords.length > 0) {
+        const dropXs = dropCoords.map((d) => d.x);
+        const dropMin = Math.max(0, Math.min(...dropXs));
+        const dropMax = Math.min(width, Math.max(...dropXs));
+        if (inPts.length === 0) {
+          minHoverX = dropMin;
+          maxHoverX = dropMax;
+        } else {
+          minHoverX = Math.min(minHoverX, dropMin);
+          maxHoverX = Math.max(maxHoverX, dropMax);
+        }
+      }
       const targetX =
-        maxCurveX >= minCurveX
-          ? Math.min(maxCurveX, Math.max(minCurveX, rawX))
-          : maxCurveX;
+        maxHoverX >= minHoverX
+          ? Math.min(maxHoverX, Math.max(minHoverX, rawX))
+          : maxHoverX;
       ratio = targetX / width;
-      inY = evalSplineAtX(inSpline.segments, inPts, targetX);
-      outY = evalSplineAtX(outSpline.segments, outPts, targetX);
+      inY = inPts.length > 0 ? evalSplineAtX(inSpline.segments, inPts, targetX) : baselineY;
+      outY = outPts.length > 0 ? evalSplineAtX(outSpline.segments, outPts, targetX) : baselineY;
+      if (dropCoords.length > 0) {
+        let bestDist = Infinity;
+        for (const dm of dropCoords) {
+          const dist = Math.abs(dm.x - targetX);
+          if (dist <= 6 && dist < bestDist) {
+            bestDist = dist;
+            matchedDrop = dm;
+          }
+        }
+      }
       const tsMs = winStart + ratio * winSpan;
       timeText = formatChartTooltipTimestamp(tsMs, "", winSpan);
     } else {
       ratio = points.length === 1 ? 0.5 : ratio;
-      inY = evalSplineY(inSpline.segments, inPts, ratio);
-      outY = evalSplineY(outSpline.segments, outPts, ratio);
+      inY = inPts.length > 0 ? evalSplineY(inSpline.segments, inPts, ratio) : baselineY;
+      outY = outPts.length > 0 ? evalSplineY(outSpline.segments, outPts, ratio) : baselineY;
 
       if (points.length === 1) {
         timeText = formatChartTooltipTimestamp(
@@ -2385,8 +2487,10 @@ const DualAreaSparkChart: React.FC<{
       }
     }
 
-    const inVal = Math.max(0, ((baselineY - inY) / plotSpanY) * maxVal);
-    const outVal = Math.max(0, ((baselineY - outY) / plotSpanY) * maxVal);
+    const inVal =
+      inPts.length > 0 ? Math.max(0, ((baselineY - inY) / plotSpanY) * maxVal) : 0;
+    const outVal =
+      outPts.length > 0 ? Math.max(0, ((baselineY - outY) / plotSpanY) * maxVal) : 0;
 
     const tooltipW = 204;
     const tooltipH = 82;
@@ -2407,11 +2511,12 @@ const DualAreaSparkChart: React.FC<{
       timeText,
       boxX,
       boxY,
+      dropLossPct: matchedDrop?.lossPct,
     };
   };
 
   const updateHoverFromEvent = (e: React.PointerEvent<HTMLDivElement>, isEntry: boolean) => {
-    if (inPts.length === 0) return;
+    if (inPts.length === 0 && dropCoords.length === 0) return;
     const rect = plotRef.current?.getBoundingClientRect();
     if (!rect || rect.width <= 0) return;
 
@@ -2439,7 +2544,7 @@ const DualAreaSparkChart: React.FC<{
   };
 
   const displayedHover =
-    inPts.length === 0
+    inPts.length === 0 && dropCoords.length === 0
       ? null
       : useLiveRender && isHovering
         ? buildHoverSnapshot(pointerRatioRef.current)
@@ -2490,6 +2595,12 @@ const DualAreaSparkChart: React.FC<{
                 style={{ backgroundColor: secondaryColor }}
               />
               {secondaryLabel}
+            </span>
+          )}
+          {dropCoords.length > 0 && (
+            <span className="flex items-center gap-1.5 text-rose-400">
+              <span className="h-2.5 w-0.5 bg-red-500" />
+              {dropLabel} ({dropCoords.length})
             </span>
           )}
         </div>
@@ -2579,6 +2690,18 @@ const DualAreaSparkChart: React.FC<{
                 />
               ))}
               <g clipPath={`url(#${clipId})`}>
+                {dropCoords.map((dm, idx) => (
+                  <line
+                    key={`drop-${idx}`}
+                    x1={dm.x}
+                    y1={topPad}
+                    x2={dm.x}
+                    y2={baselineY}
+                    stroke="#EF4444"
+                    strokeWidth="2"
+                    vectorEffect="non-scaling-stroke"
+                  />
+                ))}
                 {inSpline.areaPath && <path d={inSpline.areaPath} fill={`url(#${rxGradId})`} />}
                 {!hideSecondary && outSpline.areaPath && (
                   <path d={outSpline.areaPath} fill={`url(#${txGradId})`} />
@@ -2588,9 +2711,9 @@ const DualAreaSparkChart: React.FC<{
                     d={inSpline.linePath}
                     fill="none"
                     stroke={primaryColor}
-                    strokeWidth="2.2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
+                    strokeWidth={linear ? "1.7" : "2.2"}
+                    strokeLinecap={linear ? "butt" : "round"}
+                    strokeLinejoin={linear ? "miter" : "round"}
                     vectorEffect="non-scaling-stroke"
                   />
                 )}
@@ -2599,9 +2722,9 @@ const DualAreaSparkChart: React.FC<{
                     d={outSpline.linePath}
                     fill="none"
                     stroke={secondaryColor}
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
+                    strokeWidth={linear ? "1.7" : "2"}
+                    strokeLinecap={linear ? "butt" : "round"}
+                    strokeLinejoin={linear ? "miter" : "round"}
                     vectorEffect="non-scaling-stroke"
                   />
                 )}
@@ -2630,13 +2753,13 @@ const DualAreaSparkChart: React.FC<{
               </g>
             </svg>
 
-            {inPts.length === 0 && (
+            {inPts.length === 0 && dropCoords.length === 0 && (
               <div className="pointer-events-none absolute inset-0 flex items-center justify-center pb-4 text-xs text-slate-500">
                 {emptyMessage}
               </div>
             )}
 
-            {displayedHover && inPts.length > 0 && (
+            {displayedHover && (inPts.length > 0 || dropCoords.length > 0) && (
               <>
                 {/* Vertical crosshair line */}
                 <div
@@ -2651,20 +2774,22 @@ const DualAreaSparkChart: React.FC<{
                 />
 
                 {/* Hover-only markers on primary & secondary curves */}
-                <div
-                  className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-[#0B101B] motion-reduce:transition-none"
-                  style={{
-                    backgroundColor: primaryColor,
-                    boxShadow: `0 0 8px ${primaryColor}`,
-                    left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
-                    top: `${(displayedHover.inYFrac * 100).toFixed(3)}%`,
-                    opacity: isHovering ? 1 : 0,
-                    transition: smoothPosTransition
-                      ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
-                      : "opacity 180ms ease-out",
-                  }}
-                />
-                {!hideSecondary && (
+                {inPts.length > 0 && (
+                  <div
+                    className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-[#0B101B] motion-reduce:transition-none"
+                    style={{
+                      backgroundColor: primaryColor,
+                      boxShadow: `0 0 8px ${primaryColor}`,
+                      left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
+                      top: `${(displayedHover.inYFrac * 100).toFixed(3)}%`,
+                      opacity: isHovering ? 1 : 0,
+                      transition: smoothPosTransition
+                        ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
+                        : "opacity 180ms ease-out",
+                    }}
+                  />
+                )}
+                {!hideSecondary && outPts.length > 0 && (
                   <div
                     className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-[#0B101B] motion-reduce:transition-none"
                     style={{
@@ -2713,7 +2838,7 @@ const DualAreaSparkChart: React.FC<{
                           className="font-mono-tabular font-semibold"
                           style={{ color: primaryColor }}
                         >
-                          {formatVal(displayedHover.inVal)}
+                          {inPts.length > 0 ? formatVal(displayedHover.inVal) : "—"}
                         </span>
                       </div>
                       {!hideSecondary && (
@@ -2730,6 +2855,17 @@ const DualAreaSparkChart: React.FC<{
                             style={{ color: secondaryColor }}
                           >
                             {formatVal(displayedHover.outVal)}
+                          </span>
+                        </div>
+                      )}
+                      {displayedHover.dropLossPct != null && (
+                        <div className="flex items-center justify-between gap-2 text-rose-400">
+                          <span className="flex items-center gap-1.5">
+                            <span className="h-2 w-2 rounded-full bg-red-500" />
+                            Packet Loss
+                          </span>
+                          <span className="font-mono-tabular font-semibold">
+                            {displayedHover.dropLossPct.toFixed(0)}%
                           </span>
                         </div>
                       )}
@@ -2919,14 +3055,34 @@ export const App: React.FC = () => {
   const [visibleDeviceColumns, setVisibleDeviceColumns] = useState<DeviceColumnKey[]>(() => {
     try {
       const validKeys = new Set(DEVICE_TABLE_COLUMNS.map((c) => c.key));
-      const rawV2 = localStorage.getItem(DEVICE_COLUMNS_STORAGE_KEY);
+      const rawV3 = localStorage.getItem(DEVICE_COLUMNS_STORAGE_KEY);
+      if (rawV3) {
+        const parsed = JSON.parse(rawV3);
+        if (Array.isArray(parsed)) {
+          const filtered = parsed.filter(
+            (k): k is DeviceColumnKey => typeof k === "string" && validKeys.has(k as DeviceColumnKey),
+          );
+          if (filtered.length > 0) return filtered;
+        }
+      }
+      const rawV2 = localStorage.getItem("netdash_device_table_columns_v2");
       if (rawV2) {
         const parsed = JSON.parse(rawV2);
         if (Array.isArray(parsed)) {
           const filtered = parsed.filter(
             (k): k is DeviceColumnKey => typeof k === "string" && validKeys.has(k as DeviceColumnKey),
           );
-          if (filtered.length > 0) return filtered;
+          if (filtered.length > 0) {
+            if (!filtered.includes("device_type")) {
+              const hIdx = filtered.indexOf("hostname");
+              if (hIdx >= 0) {
+                filtered.splice(hIdx + 1, 0, "device_type");
+              } else {
+                filtered.push("device_type");
+              }
+            }
+            return filtered;
+          }
         }
       }
       const rawV1 = localStorage.getItem("netdash_device_table_columns_v1");
@@ -2938,11 +3094,19 @@ export const App: React.FC = () => {
           );
           if (filtered.length > 0) {
             if (!filtered.includes("vendor_icon")) {
-              const vIdx = filtered.indexOf("vendor");
-              if (vIdx >= 0) {
-                filtered.splice(vIdx, 0, "vendor_icon");
+              const ipIdx = filtered.indexOf("ip_address");
+              if (ipIdx >= 0) {
+                filtered.splice(ipIdx, 0, "vendor_icon");
               } else {
                 filtered.unshift("vendor_icon");
+              }
+            }
+            if (!filtered.includes("device_type")) {
+              const hIdx = filtered.indexOf("hostname");
+              if (hIdx >= 0) {
+                filtered.splice(hIdx + 1, 0, "device_type");
+              } else {
+                filtered.push("device_type");
               }
             }
             return filtered;
@@ -5287,6 +5451,9 @@ export const App: React.FC = () => {
             (b.hostname || b.ip_address || "").trim(),
           );
           break;
+        case "device_type":
+          cmp = compareOptionalText(getDeviceRoleKey(a), getDeviceRoleKey(b));
+          break;
         case "mac_address":
           cmp = compareOptionalText((a.mac_address || "").trim(), (b.mac_address || "").trim());
           break;
@@ -7187,10 +7354,15 @@ export const App: React.FC = () => {
                                       key={col.key}
                                       className="py-3 font-sans font-medium text-white"
                                     >
-                                      <div className="flex items-center gap-1.5">
-                                        <span>{d.hostname || d.ip_address}</span>
-                                        {renderDeviceRoleBadge(d)}
-                                      </div>
+                                      <span>{d.hostname || d.ip_address}</span>
+                                    </td>
+                                  );
+                                case "device_type":
+                                  return (
+                                    <td key={col.key} className="py-3">
+                                      {renderDeviceRoleBadge(d) || (
+                                        <span className="text-slate-600">—</span>
+                                      )}
                                     </td>
                                   );
                                 case "mac_address":
@@ -7827,6 +7999,18 @@ export const App: React.FC = () => {
                     inVal: pt.rtt_ms ?? 0,
                     outVal: 0,
                   }));
+                const icmpDropMarkers = icmpHistory
+                  .filter(
+                    (pt) =>
+                      pt.had_drop ||
+                      pt.is_reachable === false ||
+                      pt.rtt_ms == null ||
+                      (pt.packet_loss_pct ?? 0) > 0,
+                  )
+                  .map((pt) => ({
+                    label: pt.time,
+                    lossPct: pt.packet_loss_pct ?? (pt.rtt_ms == null ? 100 : 0),
+                  }));
                 return (
                   <div className="space-y-6">
                     {deviceDetail?.device_settings?.notes && (
@@ -7965,6 +8149,9 @@ export const App: React.FC = () => {
                           height={180}
                           showYAxis={true}
                           hideSecondary={true}
+                          linear={true}
+                          dropMarkers={icmpDropMarkers}
+                          dropLabel="Ping Drop"
                           windowMs={rangeKeyToWindowMs(icmpHistoryRange)}
                           primaryLabel="Ping Latency (ms)"
                           primaryShortLabel="Latency"
@@ -9815,6 +10002,18 @@ export const App: React.FC = () => {
                       inVal: pt.rtt_ms ?? 0,
                       outVal: 0,
                     }));
+                  const icmpDropMarkers = icmpHistory
+                    .filter(
+                      (pt) =>
+                        pt.had_drop ||
+                        pt.is_reachable === false ||
+                        pt.rtt_ms == null ||
+                        (pt.packet_loss_pct ?? 0) > 0,
+                    )
+                    .map((pt) => ({
+                      label: pt.time,
+                      lossPct: pt.packet_loss_pct ?? (pt.rtt_ms == null ? 100 : 0),
+                    }));
                   return (
                     <div className="rounded-xl border border-cyan-500/30 bg-[#111827] p-5 space-y-4">
                       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -9894,6 +10093,9 @@ export const App: React.FC = () => {
                           height={180}
                           showYAxis={true}
                           hideSecondary={true}
+                          linear={true}
+                          dropMarkers={icmpDropMarkers}
+                          dropLabel="Ping Drop"
                           windowMs={rangeKeyToWindowMs(icmpHistoryRange)}
                           primaryLabel="Ping Latency (ms)"
                           primaryShortLabel="Latency"

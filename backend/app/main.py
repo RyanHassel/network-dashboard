@@ -5454,10 +5454,10 @@ async def get_device_icmp_history(
 
     range_specs = {
         "1h": ("1 hour", None),
-        "6h": ("6 hours", "5 minutes"),
-        "24h": ("24 hours", "15 minutes"),
-        "7d": ("7 days", "1 hour"),
-        "30d": ("30 days", "4 hours"),
+        "6h": ("6 hours", None),
+        "24h": ("24 hours", None),
+        "7d": ("7 days", "5 minutes"),
+        "30d": ("30 days", "30 minutes"),
     }
     sql_interval, bucket_size = range_specs[rk]
 
@@ -5470,7 +5470,12 @@ async def get_device_icmp_history(
                 SELECT time AS bucket,
                        rtt_ms,
                        packet_loss_pct,
-                       CASE WHEN is_reachable THEN 100.0 ELSE 0.0 END AS uptime_pct
+                       CASE WHEN is_reachable THEN 100.0 ELSE 0.0 END AS uptime_pct,
+                       is_reachable,
+                       CASE
+                           WHEN (NOT is_reachable OR COALESCE(packet_loss_pct, 0) > 0) THEN TRUE
+                           ELSE FALSE
+                       END AS had_drop
                 FROM icmp_metrics_raw
                 WHERE device_ip = $1
                   AND time > NOW() - INTERVAL '{sql_interval}'
@@ -5482,9 +5487,11 @@ async def get_device_icmp_history(
             rows = await conn.fetch(
                 f"""
                 SELECT time_bucket('{bucket_size}', time) AS bucket,
-                       AVG(rtt_ms) AS rtt_ms,
-                       AVG(packet_loss_pct) AS packet_loss_pct,
-                       (COUNT(*) FILTER (WHERE is_reachable) * 100.0 / NULLIF(COUNT(*), 0))::double precision AS uptime_pct
+                       AVG(rtt_ms) FILTER (WHERE is_reachable) AS rtt_ms,
+                       MAX(packet_loss_pct) AS packet_loss_pct,
+                       (COUNT(*) FILTER (WHERE is_reachable) * 100.0 / NULLIF(COUNT(*), 0))::double precision AS uptime_pct,
+                       BOOL_AND(is_reachable) AS is_reachable,
+                       BOOL_OR(NOT is_reachable OR COALESCE(packet_loss_pct, 0) > 0) AS had_drop
                 FROM icmp_metrics_raw
                 WHERE device_ip = $1
                   AND time > NOW() - INTERVAL '{sql_interval}'
@@ -5504,6 +5511,8 @@ async def get_device_icmp_history(
             "uptime_pct": round(float(r["uptime_pct"]), 1)
             if r["uptime_pct"] is not None
             else 0.0,
+            "is_reachable": bool(r["is_reachable"]),
+            "had_drop": bool(r["had_drop"]),
         }
         for r in rows
     ]
