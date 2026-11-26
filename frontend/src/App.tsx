@@ -96,8 +96,44 @@ type DeviceSortKey =
   | "vendor"
   | "subnet"
   | "snmp"
-  | "sources";
+  | "sources"
+  | "matched_mibs"
+  | "sys_location"
+  | "cpu_usage_pct"
+  | "uptime_sec"
+  | "log_count_24h"
+  | "last_seen";
+type DeviceColumnKey = DeviceSortKey;
 type SortDirection = "asc" | "desc";
+
+const DEVICE_COLUMNS_STORAGE_KEY = "netdash_device_table_columns_v1";
+
+const DEVICE_TABLE_COLUMNS: Array<{
+  key: DeviceColumnKey;
+  label: string;
+  alignRight: boolean;
+  defaultVisible: boolean;
+}> = [
+  { key: "device_id", label: "ID", alignRight: false, defaultVisible: true },
+  { key: "status", label: "Status", alignRight: false, defaultVisible: true },
+  { key: "ip_address", label: "IPv4 Address", alignRight: false, defaultVisible: true },
+  { key: "hostname", label: "Hostname / sysName", alignRight: false, defaultVisible: true },
+  { key: "mac_address", label: "MAC Address", alignRight: false, defaultVisible: true },
+  { key: "vendor", label: "Vendor / Hardware", alignRight: false, defaultVisible: true },
+  { key: "subnet", label: "Subnet / VLAN", alignRight: false, defaultVisible: true },
+  { key: "snmp", label: "SNMP / Interfaces", alignRight: false, defaultVisible: true },
+  { key: "sources", label: "Telemetry Sources", alignRight: true, defaultVisible: true },
+  { key: "matched_mibs", label: "Matched MIBs", alignRight: false, defaultVisible: false },
+  { key: "sys_location", label: "Location", alignRight: false, defaultVisible: false },
+  { key: "cpu_usage_pct", label: "CPU", alignRight: true, defaultVisible: false },
+  { key: "uptime_sec", label: "Uptime", alignRight: false, defaultVisible: false },
+  { key: "log_count_24h", label: "Logs (24h)", alignRight: true, defaultVisible: false },
+  { key: "last_seen", label: "Last Seen", alignRight: false, defaultVisible: false },
+];
+
+const DEFAULT_DEVICE_COLUMNS: DeviceColumnKey[] = DEVICE_TABLE_COLUMNS.filter(
+  (c) => c.defaultVisible,
+).map((c) => c.key);
 
 interface UpdateProgressComponent {
   id: string;
@@ -335,6 +371,7 @@ interface UnifiedDeviceItem {
   hostname: string;
   mac_address: string | null;
   vendor: string | null;
+  hardware_model?: string | null;
   device_category?: string | null;
   device_profile_type?: string;
   matched_mibs?: string[];
@@ -354,6 +391,15 @@ interface UnifiedDeviceItem {
   sources: string[];
   log_count_24h: number;
   last_seen: string | null;
+}
+
+function formatDeviceVendorHardware(d: UnifiedDeviceItem): string {
+  const vendor = (d.vendor || "").trim();
+  const model = (d.hardware_model || "").trim();
+  if (vendor && model) {
+    return vendor.toLowerCase().includes(model.toLowerCase()) ? vendor : `${vendor} / ${model}`;
+  }
+  return vendor || model || "—";
 }
 
 interface UPSTelemetry {
@@ -2264,6 +2310,66 @@ export const App: React.FC = () => {
   const [deviceFilter, setDeviceFilter] = useState<"all" | "online" | "snmp">("all");
   const [deviceSortKey, setDeviceSortKey] = useState<DeviceSortKey>("ip_address");
   const [deviceSortDir, setDeviceSortDir] = useState<SortDirection>("asc");
+  const [visibleDeviceColumns, setVisibleDeviceColumns] = useState<DeviceColumnKey[]>(() => {
+    try {
+      const raw = localStorage.getItem(DEVICE_COLUMNS_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          const validKeys = new Set(DEVICE_TABLE_COLUMNS.map((c) => c.key));
+          const filtered = parsed.filter(
+            (k): k is DeviceColumnKey => typeof k === "string" && validKeys.has(k as DeviceColumnKey),
+          );
+          if (filtered.length > 0) return filtered;
+        }
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return DEFAULT_DEVICE_COLUMNS;
+  });
+  const [showColumnPicker, setShowColumnPicker] = useState(false);
+  const columnPickerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(DEVICE_COLUMNS_STORAGE_KEY, JSON.stringify(visibleDeviceColumns));
+    } catch {
+      // ignore storage errors
+    }
+  }, [visibleDeviceColumns]);
+
+  useEffect(() => {
+    if (!showColumnPicker) return;
+    const handleOutside = (e: MouseEvent) => {
+      if (columnPickerRef.current && !columnPickerRef.current.contains(e.target as Node)) {
+        setShowColumnPicker(false);
+      }
+    };
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setShowColumnPicker(false);
+    };
+    document.addEventListener("mousedown", handleOutside);
+    document.addEventListener("keydown", handleEsc);
+    return () => {
+      document.removeEventListener("mousedown", handleOutside);
+      document.removeEventListener("keydown", handleEsc);
+    };
+  }, [showColumnPicker]);
+
+  const toggleDeviceColumn = (key: DeviceColumnKey) => {
+    setVisibleDeviceColumns((prev) => {
+      if (prev.includes(key)) {
+        if (prev.length <= 1) return prev;
+        return prev.filter((k) => k !== key);
+      }
+      return [...prev, key];
+    });
+  };
+
+  const resetDeviceColumns = () => {
+    setVisibleDeviceColumns(DEFAULT_DEVICE_COLUMNS);
+  };
   const [selectedDeviceRef, setSelectedDeviceRef] = useState<string | null>(initialRoute.deviceRef);
   const [selectedDeviceDetailIp, setSelectedDeviceDetailIp] = useState<string | null>(
     initialRoute.deviceRef && !/^\d+$/.test(initialRoute.deviceRef) ? initialRoute.deviceRef : null,
@@ -3411,7 +3517,10 @@ export const App: React.FC = () => {
       if (r.ok) {
         const data: OverviewPayload = await r.json();
         setOverview(data);
-        if (overviewGraphMode === "1d" || overviewHistorySeries.length === 0) {
+        if (
+          overviewGraphMode === "1d" ||
+          (overviewGraphMode === "live" && overviewHistorySeries.length === 0)
+        ) {
           setOverviewHistorySeries(data.wan_series || []);
         }
         if (data.live_series && data.live_series.length > 0) {
@@ -4231,9 +4340,22 @@ export const App: React.FC = () => {
       setDeviceSortDir((prev) => (prev === "asc" ? "desc" : "asc"));
     } else {
       setDeviceSortKey(key);
-      setDeviceSortDir(key === "snmp" || key === "sources" ? "desc" : "asc");
+      setDeviceSortDir(
+        key === "snmp" ||
+          key === "sources" ||
+          key === "cpu_usage_pct" ||
+          key === "uptime_sec" ||
+          key === "log_count_24h" ||
+          key === "last_seen"
+          ? "desc"
+          : "asc",
+      );
     }
   };
+
+  const activeDeviceColumns = DEVICE_TABLE_COLUMNS.filter((c) =>
+    visibleDeviceColumns.includes(c.key),
+  );
 
   const filteredDevices = allDevices
     .filter((d) => {
@@ -4249,6 +4371,7 @@ export const App: React.FC = () => {
           (d.hostname || "").toLowerCase().includes(q) ||
           (d.mac_address || "").toLowerCase().includes(q) ||
           (d.vendor || "").toLowerCase().includes(q) ||
+          (d.hardware_model || "").toLowerCase().includes(q) ||
           (d.sys_descr || "").toLowerCase().includes(q)
         );
       }
@@ -4302,12 +4425,12 @@ export const App: React.FC = () => {
         case "mac_address":
           cmp = compareOptionalText((a.mac_address || "").trim(), (b.mac_address || "").trim());
           break;
-        case "vendor":
-          cmp = compareOptionalText(
-            (a.vendor || a.sys_descr || "").trim(),
-            (b.vendor || b.sys_descr || "").trim(),
-          );
+        case "vendor": {
+          const va = formatDeviceVendorHardware(a);
+          const vb = formatDeviceVendorHardware(b);
+          cmp = compareOptionalText(va === "—" ? "" : va, vb === "—" ? "" : vb);
           break;
+        }
         case "subnet": {
           cmp = compareOptionalText((a.subnet_cidr || "").trim(), (b.subnet_cidr || "").trim());
           if (cmp === 0) {
@@ -4333,6 +4456,33 @@ export const App: React.FC = () => {
           if (cmp === 0) {
             cmp = compareOptionalText(a.sources.join(","), b.sources.join(","));
           }
+          break;
+        }
+        case "matched_mibs": {
+          const ma = (a.matched_mibs || []).join(",");
+          const mb = (b.matched_mibs || []).join(",");
+          cmp = compareOptionalText(ma, mb);
+          break;
+        }
+        case "sys_location":
+          cmp = compareOptionalText(
+            (a.sys_location || "").trim(),
+            (b.sys_location || "").trim(),
+          );
+          break;
+        case "cpu_usage_pct":
+          cmp = ((a.cpu_usage_pct ?? -1) - (b.cpu_usage_pct ?? -1)) * dir;
+          break;
+        case "uptime_sec":
+          cmp = ((a.uptime_sec ?? -1) - (b.uptime_sec ?? -1)) * dir;
+          break;
+        case "log_count_24h":
+          cmp = ((a.log_count_24h || 0) - (b.log_count_24h || 0)) * dir;
+          break;
+        case "last_seen": {
+          const ta = a.last_seen ? new Date(a.last_seen).getTime() : 0;
+          const tb = b.last_seen ? new Date(b.last_seen).getTime() : 0;
+          cmp = (ta - tb) * dir;
           break;
         }
       }
@@ -5880,30 +6030,81 @@ export const App: React.FC = () => {
                     telemetry webpage.
                   </p>
                 </div>
-                {deviceFilter === "all" && (
-                  <span className="rounded border border-emerald-500/25 bg-emerald-500/10 px-2 py-0.5 text-[11px] text-emerald-400">
-                    Online devices pinned first
-                  </span>
-                )}
+                <div className="flex flex-wrap items-center gap-2">
+                  {deviceFilter === "all" && (
+                    <span className="rounded border border-emerald-500/25 bg-emerald-500/10 px-2 py-0.5 text-[11px] text-emerald-400">
+                      Online devices pinned first
+                    </span>
+                  )}
+                  <div ref={columnPickerRef} className="relative">
+                    <button
+                      type="button"
+                      onClick={() => setShowColumnPicker((prev) => !prev)}
+                      aria-expanded={showColumnPicker}
+                      aria-haspopup="menu"
+                      className="inline-flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#090D16] px-2.5 py-1 text-xs font-medium text-slate-200 hover:border-slate-600 hover:bg-slate-800"
+                    >
+                      <Settings className="h-3.5 w-3.5 text-slate-400" />
+                      <span>
+                        Columns ({activeDeviceColumns.length}/{DEVICE_TABLE_COLUMNS.length})
+                      </span>
+                      <ChevronDown className="h-3.5 w-3.5 text-slate-400" />
+                    </button>
+                    {showColumnPicker && (
+                      <div className="absolute right-0 z-30 mt-1.5 w-60 rounded-lg border border-slate-700 bg-[#0B111E] p-2 shadow-2xl">
+                        <div className="mb-1.5 flex items-center justify-between border-b border-slate-800 px-1.5 pb-1.5">
+                          <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                            Visible Columns
+                          </span>
+                          <button
+                            type="button"
+                            onClick={resetDeviceColumns}
+                            className="text-[11px] font-medium text-emerald-400 hover:text-emerald-300"
+                          >
+                            Reset defaults
+                          </button>
+                        </div>
+                        <div className="max-h-72 space-y-0.5 overflow-y-auto">
+                          {DEVICE_TABLE_COLUMNS.map((col) => {
+                            const checked = visibleDeviceColumns.includes(col.key);
+                            const isOnlyRemaining = checked && visibleDeviceColumns.length <= 1;
+                            return (
+                              <button
+                                key={col.key}
+                                type="button"
+                                disabled={isOnlyRemaining}
+                                onClick={() => toggleDeviceColumn(col.key)}
+                                className={`flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-xs transition ${
+                                  checked
+                                    ? "bg-emerald-500/10 text-slate-100 hover:bg-emerald-500/15"
+                                    : "text-slate-400 hover:bg-slate-800/70 hover:text-slate-200"
+                                } disabled:cursor-not-allowed disabled:opacity-60`}
+                              >
+                                <span>{col.label}</span>
+                                <span
+                                  className={`flex h-4 w-4 items-center justify-center rounded border ${
+                                    checked
+                                      ? "border-emerald-500/60 bg-emerald-500/20 text-emerald-400"
+                                      : "border-slate-700 bg-[#090D16] text-transparent"
+                                  }`}
+                                >
+                                  <Check className="h-3 w-3" />
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
               </div>
 
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs">
                   <thead>
                     <tr className="border-b border-slate-800 text-slate-400">
-                      {(
-                        [
-                          { key: "device_id", label: "ID", alignRight: false },
-                          { key: "status", label: "Status", alignRight: false },
-                          { key: "ip_address", label: "IPv4 Address", alignRight: false },
-                          { key: "hostname", label: "Hostname / sysName", alignRight: false },
-                          { key: "mac_address", label: "MAC Address", alignRight: false },
-                          { key: "vendor", label: "Vendor / Hardware", alignRight: false },
-                          { key: "subnet", label: "Subnet / VLAN", alignRight: false },
-                          { key: "snmp", label: "SNMP / Interfaces", alignRight: false },
-                          { key: "sources", label: "Telemetry Sources", alignRight: true },
-                        ] as Array<{ key: DeviceSortKey; label: string; alignRight: boolean }>
-                      ).map((col) => {
+                      {activeDeviceColumns.map((col) => {
                         const isActive = deviceSortKey === col.key;
                         return (
                           <th
@@ -5947,7 +6148,10 @@ export const App: React.FC = () => {
                   <tbody className="divide-y divide-slate-800/60 font-mono-tabular">
                     {filteredDevices.length === 0 ? (
                       <tr>
-                        <td colSpan={9} className="py-10 text-center font-sans text-slate-500">
+                        <td
+                          colSpan={activeDeviceColumns.length}
+                          className="py-10 text-center font-sans text-slate-500"
+                        >
                           No devices match your current filter. Add a subnet or SNMP target in{" "}
                           <a
                             href="/targets"
@@ -5964,107 +6168,207 @@ export const App: React.FC = () => {
                         </td>
                       </tr>
                     ) : (
-                      filteredDevices.map((d) => (
-                        <tr
-                          key={d.ip_address}
-                          onClick={() => openDevicePage(d.ip_address, d.device_id)}
-                          className="cursor-pointer transition hover:bg-slate-800/50"
-                        >
-                          <td className="py-3 text-slate-400">
-                            {d.device_id != null ? `#${d.device_id}` : "—"}
-                          </td>
-                          <td className="py-3">
-                            <span
-                              className={`inline-flex items-center gap-1.5 rounded px-2 py-0.5 text-[11px] font-medium ${
-                                d.is_online
-                                  ? "bg-emerald-500/15 text-emerald-400"
-                                  : "bg-slate-800 text-slate-400"
-                              }`}
-                            >
-                              <span
-                                className={`h-1.5 w-1.5 rounded-full ${
-                                  d.is_online ? "bg-emerald-400" : "bg-slate-500"
-                                }`}
-                              />
-                              {d.is_online ? "ONLINE" : "OFFLINE"}
-                            </span>
-                          </td>
-                          <td className="py-3 font-semibold text-emerald-400 underline">
-                            <a
-                              href={getDeviceHref(d.ip_address, d.device_id)}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                if (isModifiedClick(e)) return;
-                                e.preventDefault();
-                                openDevicePage(d.ip_address, d.device_id);
-                              }}
-                              className="hover:text-emerald-300"
-                            >
-                              {d.ip_address}
-                            </a>
-                          </td>
-                          <td className="py-3 font-sans font-medium text-white">
-                            <div className="flex items-center gap-1.5">
-                              <span>{d.hostname || d.ip_address}</span>
-                              {d.device_profile_type === "wireless" && (
-                                <span
-                                  title="Wireless AP / Device (SNMP)"
-                                  className="inline-flex items-center gap-1 rounded border border-teal-500/30 bg-teal-500/15 px-1.5 py-0.5 text-[10px] font-medium text-teal-300"
-                                >
-                                  <Wifi className="h-2.5 w-2.5" /> Wi-Fi
-                                </span>
-                              )}
-                            </div>
-                          </td>
-                          <td className="py-3 text-slate-300">{d.mac_address || "—"}</td>
-                          <td className="max-w-xs py-3 font-sans text-slate-300">
-                            <div className="truncate">{d.vendor || d.sys_descr || "—"}</div>
-                            {d.matched_mibs && d.matched_mibs.length > 0 && (
-                              <div className="mt-1 flex flex-wrap gap-1">
-                                {d.matched_mibs.slice(0, 3).map((mib) => (
-                                  <span
-                                    key={mib}
-                                    className="rounded border border-sky-500/25 bg-sky-500/10 px-1.5 py-0.2 font-mono-tabular text-[10px] text-sky-300"
-                                  >
-                                    {mib}
-                                  </span>
-                                ))}
-                                {d.matched_mibs.length > 3 && (
-                                  <span className="font-mono-tabular text-[10px] text-slate-500">
-                                    +{d.matched_mibs.length - 3}
-                                  </span>
-                                )}
-                              </div>
-                            )}
-                          </td>
-                          <td className="py-3 text-slate-400">
-                            {d.subnet_cidr || "—"}
-                            {d.vlan_id ? ` (VLAN ${d.vlan_id})` : ""}
-                          </td>
-                          <td className="py-3 text-slate-300">
-                            {d.sources.includes("SNMP") ? (
-                              <span>
-                                {d.interface_count} ifs •{" "}
-                                {d.snmp_profile_name || "SNMP"}
-                              </span>
-                            ) : (
-                              <span className="font-sans text-slate-500">Not Polled</span>
-                            )}
-                          </td>
-                          <td className="py-3 text-right">
-                            <div className="flex justify-end gap-1">
-                              {d.sources.map((src) => (
-                                <span
-                                  key={src}
-                                  className="rounded border border-slate-700 bg-slate-800/90 px-1.5 py-0.5 text-[10px] text-slate-300"
-                                >
-                                  {src}
-                                </span>
-                              ))}
-                            </div>
-                          </td>
-                        </tr>
-                      ))
+                      filteredDevices.map((d) => {
+                        const vendorText = formatDeviceVendorHardware(d);
+                        return (
+                          <tr
+                            key={d.ip_address}
+                            onClick={() => openDevicePage(d.ip_address, d.device_id)}
+                            className="cursor-pointer transition hover:bg-slate-800/50"
+                          >
+                            {activeDeviceColumns.map((col) => {
+                              switch (col.key) {
+                                case "device_id":
+                                  return (
+                                    <td key={col.key} className="py-3 text-slate-400">
+                                      {d.device_id != null ? `#${d.device_id}` : "—"}
+                                    </td>
+                                  );
+                                case "status":
+                                  return (
+                                    <td key={col.key} className="py-3">
+                                      <span
+                                        className={`inline-flex items-center gap-1.5 rounded px-2 py-0.5 text-[11px] font-medium ${
+                                          d.is_online
+                                            ? "bg-emerald-500/15 text-emerald-400"
+                                            : "bg-slate-800 text-slate-400"
+                                        }`}
+                                      >
+                                        <span
+                                          className={`h-1.5 w-1.5 rounded-full ${
+                                            d.is_online ? "bg-emerald-400" : "bg-slate-500"
+                                          }`}
+                                        />
+                                        {d.is_online ? "ONLINE" : "OFFLINE"}
+                                      </span>
+                                    </td>
+                                  );
+                                case "ip_address":
+                                  return (
+                                    <td
+                                      key={col.key}
+                                      className="py-3 font-semibold text-emerald-400 underline"
+                                    >
+                                      <a
+                                        href={getDeviceHref(d.ip_address, d.device_id)}
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          if (isModifiedClick(e)) return;
+                                          e.preventDefault();
+                                          openDevicePage(d.ip_address, d.device_id);
+                                        }}
+                                        className="hover:text-emerald-300"
+                                      >
+                                        {d.ip_address}
+                                      </a>
+                                    </td>
+                                  );
+                                case "hostname":
+                                  return (
+                                    <td
+                                      key={col.key}
+                                      className="py-3 font-sans font-medium text-white"
+                                    >
+                                      <div className="flex items-center gap-1.5">
+                                        <span>{d.hostname || d.ip_address}</span>
+                                        {d.device_profile_type === "wireless" && (
+                                          <span
+                                            title="Wireless AP / Device (SNMP)"
+                                            className="inline-flex items-center gap-1 rounded border border-teal-500/30 bg-teal-500/15 px-1.5 py-0.5 text-[10px] font-medium text-teal-300"
+                                          >
+                                            <Wifi className="h-2.5 w-2.5" /> Wi-Fi
+                                          </span>
+                                        )}
+                                      </div>
+                                    </td>
+                                  );
+                                case "mac_address":
+                                  return (
+                                    <td key={col.key} className="py-3 text-slate-300">
+                                      {d.mac_address || "—"}
+                                    </td>
+                                  );
+                                case "vendor":
+                                  return (
+                                    <td
+                                      key={col.key}
+                                      className="max-w-xs py-3 font-sans text-slate-300"
+                                    >
+                                      <div className="truncate" title={vendorText}>
+                                        {vendorText}
+                                      </div>
+                                    </td>
+                                  );
+                                case "subnet":
+                                  return (
+                                    <td key={col.key} className="py-3 text-slate-400">
+                                      {d.subnet_cidr || "—"}
+                                      {d.vlan_id ? ` (VLAN ${d.vlan_id})` : ""}
+                                    </td>
+                                  );
+                                case "snmp":
+                                  return (
+                                    <td key={col.key} className="py-3 text-slate-300">
+                                      {d.sources.includes("SNMP") ? (
+                                        <span>
+                                          {d.interface_count} ifs •{" "}
+                                          {d.snmp_profile_name || "SNMP"}
+                                        </span>
+                                      ) : (
+                                        <span className="font-sans text-slate-500">Not Polled</span>
+                                      )}
+                                    </td>
+                                  );
+                                case "sources":
+                                  return (
+                                    <td key={col.key} className="py-3 text-right">
+                                      <div className="flex justify-end gap-1">
+                                        {d.sources.map((src) => (
+                                          <span
+                                            key={src}
+                                            className="rounded border border-slate-700 bg-slate-800/90 px-1.5 py-0.5 text-[10px] text-slate-300"
+                                          >
+                                            {src}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    </td>
+                                  );
+                                case "matched_mibs":
+                                  return (
+                                    <td key={col.key} className="max-w-xs py-3">
+                                      {d.matched_mibs && d.matched_mibs.length > 0 ? (
+                                        <div className="flex flex-wrap gap-1">
+                                          {d.matched_mibs.slice(0, 3).map((mib) => (
+                                            <span
+                                              key={mib}
+                                              className="rounded border border-sky-500/25 bg-sky-500/10 px-1.5 py-0.2 font-mono-tabular text-[10px] text-sky-300"
+                                            >
+                                              {mib}
+                                            </span>
+                                          ))}
+                                          {d.matched_mibs.length > 3 && (
+                                            <span className="font-mono-tabular text-[10px] text-slate-500">
+                                              +{d.matched_mibs.length - 3}
+                                            </span>
+                                          )}
+                                        </div>
+                                      ) : (
+                                        <span className="font-sans text-slate-500">—</span>
+                                      )}
+                                    </td>
+                                  );
+                                case "sys_location":
+                                  return (
+                                    <td
+                                      key={col.key}
+                                      className="max-w-[180px] py-3 font-sans text-slate-300"
+                                    >
+                                      <div
+                                        className="truncate"
+                                        title={d.sys_location || undefined}
+                                      >
+                                        {d.sys_location || "—"}
+                                      </div>
+                                    </td>
+                                  );
+                                case "cpu_usage_pct":
+                                  return (
+                                    <td key={col.key} className="py-3 text-right text-slate-300">
+                                      {d.cpu_usage_pct != null &&
+                                      (d.sources.includes("SNMP") || d.sources.includes("UniFi"))
+                                        ? `${d.cpu_usage_pct.toFixed(1)}%`
+                                        : "—"}
+                                    </td>
+                                  );
+                                case "uptime_sec":
+                                  return (
+                                    <td key={col.key} className="py-3 text-slate-300">
+                                      {d.uptime_sec != null && d.uptime_sec > 0
+                                        ? formatDurationCompact(d.uptime_sec)
+                                        : "—"}
+                                    </td>
+                                  );
+                                case "log_count_24h":
+                                  return (
+                                    <td key={col.key} className="py-3 text-right text-slate-300">
+                                      {d.log_count_24h > 0 ? d.log_count_24h : "0"}
+                                    </td>
+                                  );
+                                case "last_seen":
+                                  return (
+                                    <td
+                                      key={col.key}
+                                      className="whitespace-nowrap py-3 text-slate-400"
+                                    >
+                                      {d.last_seen ? new Date(d.last_seen).toLocaleString() : "—"}
+                                    </td>
+                                  );
+                              }
+                            })}
+                          </tr>
+                        );
+                      })
                     )}
                   </tbody>
                 </table>

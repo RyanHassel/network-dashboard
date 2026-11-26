@@ -2472,6 +2472,35 @@ def _clean_bps_sql(col: str, coalesce_zero: bool = False) -> str:
     return f"COALESCE({expr}, 0)" if coalesce_zero else expr
 
 
+def _merge_traffic_gap_buckets(
+    primary_rows: List[Dict[str, Any]],
+    fallback_rows: List[Dict[str, Any]],
+    bucket_sec: int,
+) -> List[Dict[str, Any]]:
+    """Preserves primary UniFi gateway buckets and fills missing gap buckets from SNMP WAN."""
+    merged: List[Dict[str, Any]] = []
+    primary_ts: List[float] = []
+    for row in primary_rows:
+        b_dt = row.get("bucket")
+        if b_dt is None:
+            continue
+        merged.append(dict(row))
+        primary_ts.append(b_dt.timestamp())
+
+    min_sep = max(30.0, float(bucket_sec) * 0.5)
+    for row in fallback_rows:
+        b_dt = row.get("bucket")
+        if b_dt is None:
+            continue
+        ts_val = b_dt.timestamp()
+        if any(abs(ts_val - pts) < min_sep for pts in primary_ts):
+            continue
+        merged.append(dict(row))
+
+    merged.sort(key=lambda r: r["bucket"])
+    return merged
+
+
 async def _query_overview_traffic_series(
     conn: asyncpg.Connection,
     range_key: str = "1d",
@@ -2486,13 +2515,13 @@ async def _query_overview_traffic_series(
         rk = "1d"
 
     range_specs = {
-        "1h": ("1 hour", "1 minute"),
-        "12h": ("12 hours", "5 minutes"),
-        "1d": ("24 hours", "10 minutes"),
-        "7d": ("7 days", "1 hour"),
-        "1m": ("30 days", "4 hours"),
+        "1h": ("1 hour", "1 minute", 60),
+        "12h": ("12 hours", "5 minutes", 300),
+        "1d": ("24 hours", "10 minutes", 600),
+        "7d": ("7 days", "1 hour", 3600),
+        "1m": ("30 days", "4 hours", 14400),
     }
-    sql_interval, sql_bucket = range_specs[rk]
+    sql_interval, sql_bucket, bucket_sec = range_specs[rk]
 
     if graph_settings is None:
         graph_settings = await _read_overview_graph_settings(conn)
@@ -2609,6 +2638,113 @@ async def _query_overview_traffic_series(
             ORDER BY bucket ASC
             """
         )
+
+        # Detect trailing or internal gaps in UniFi gateway history and backfill from SNMP WAN
+        if wan_history:
+            now_utc = datetime.now(timezone.utc)
+            last_bucket = wan_history[-1]["bucket"]
+            has_gap = (now_utc - last_bucket).total_seconds() > (bucket_sec * 2)
+            if not has_gap and len(wan_history) >= 2:
+                for idx in range(1, len(wan_history)):
+                    if (
+                        wan_history[idx]["bucket"] - wan_history[idx - 1]["bucket"]
+                    ).total_seconds() > (bucket_sec * 2):
+                        has_gap = True
+                        break
+            if has_gap:
+                gw_ip = await conn.fetchval(
+                    """
+                    SELECT COALESCE(NULLIF(lan_ip, ''), NULLIF(ip_address, ''))
+                    FROM unifi_devices
+                    WHERE device_type IN ('udm', 'ugw', 'uxg')
+                      AND (COALESCE(lan_ip, '') != '' OR COALESCE(ip_address, '') != '')
+                    ORDER BY last_seen DESC NULLS LAST
+                    LIMIT 1
+                    """
+                )
+                if gw_ip:
+                    gw_ip_str = str(gw_ip).strip()
+                    wan_if_index = await conn.fetchval(
+                        f"""
+                        SELECT if_index
+                        FROM snmp_metrics_raw
+                        WHERE device_ip = $1
+                          AND time > NOW() - INTERVAL '{sql_interval}'
+                          AND {_NON_LOOPBACK_SQL}
+                        GROUP BY if_index
+                        ORDER BY
+                            MAX(
+                                CASE
+                                    WHEN COALESCE(if_name, '') ~* '^(eth8|eth9|eth10|ppp|wan)'
+                                      OR COALESCE(if_descr, '') ~* 'wan'
+                                      OR COALESCE(if_alias, '') ~* 'wan'
+                                    THEN 1
+                                    ELSE 0
+                                END
+                            ) DESC,
+                            AVG(COALESCE({clean_raw_in}, 0) + COALESCE({clean_raw_out}, 0)) DESC
+                        LIMIT 1
+                        """,
+                        gw_ip_str,
+                    )
+                    if wan_if_index is not None:
+                        if rk == "7d":
+                            fb_rows = await conn.fetch(
+                                f"""
+                                SELECT bucket,
+                                       AVG({clean_avg_in}) AS rx_bps,
+                                       AVG({clean_avg_out}) AS tx_bps,
+                                       0.0 AS latency_ms
+                                FROM snmp_metrics_hourly
+                                WHERE device_ip = $1
+                                  AND if_index = $2
+                                  AND bucket > NOW() - INTERVAL '7 days'
+                                GROUP BY bucket
+                                ORDER BY bucket ASC
+                                """,
+                                gw_ip_str,
+                                int(wan_if_index),
+                            )
+                        elif rk == "1m":
+                            fb_rows = await conn.fetch(
+                                f"""
+                                SELECT time_bucket('4 hours', bucket) AS bucket,
+                                       AVG({clean_avg_in}) AS rx_bps,
+                                       AVG({clean_avg_out}) AS tx_bps,
+                                       0.0 AS latency_ms
+                                FROM snmp_metrics_hourly
+                                WHERE device_ip = $1
+                                  AND if_index = $2
+                                  AND bucket > NOW() - INTERVAL '30 days'
+                                GROUP BY 1
+                                ORDER BY 1 ASC
+                                """,
+                                gw_ip_str,
+                                int(wan_if_index),
+                            )
+                        else:
+                            fb_rows = await conn.fetch(
+                                f"""
+                                SELECT time_bucket('{sql_bucket}', time) AS bucket,
+                                       AVG({clean_raw_in}) AS rx_bps,
+                                       AVG({clean_raw_out}) AS tx_bps,
+                                       0.0 AS latency_ms
+                                FROM snmp_metrics_raw
+                                WHERE device_ip = $1
+                                  AND if_index = $2
+                                  AND time > NOW() - INTERVAL '{sql_interval}'
+                                GROUP BY bucket
+                                ORDER BY bucket ASC
+                                """,
+                                gw_ip_str,
+                                int(wan_if_index),
+                            )
+                        if fb_rows:
+                            wan_history = _merge_traffic_gap_buckets(
+                                [dict(r) for r in wan_history],
+                                [dict(r) for r in fb_rows],
+                                bucket_sec,
+                            )
 
         # Fallback: aggregate SNMP traffic across all non-loopback interfaces
         if not wan_history:
@@ -3760,6 +3896,7 @@ async def get_all_devices() -> Dict[str, Any]:
                 "hostname": ip_str,
                 "mac_address": None,
                 "vendor": None,
+                "hardware_model": None,
                 "device_category": None,
                 "matched_mibs": [],
                 "subnet_cidr": None,
@@ -3820,12 +3957,10 @@ async def get_all_devices() -> Dict[str, Any]:
         item["snmp_reachable"] = bool(r.get("is_reachable"))
         if r.get("is_reachable"):
             item["is_online"] = True
+        if r.get("hardware_model"):
+            item["hardware_model"] = r.get("hardware_model")
         if r.get("vendor_name") and not item["vendor"]:
-            item["vendor"] = (
-                f"{r['vendor_name']} ({r['hardware_model']})"
-                if r.get("hardware_model")
-                else r["vendor_name"]
-            )
+            item["vendor"] = r["vendor_name"]
         item["device_category"] = r.get("device_category") or item["device_category"]
         if r.get("has_ups_telemetry"):
             item["has_ups_telemetry"] = True
@@ -3861,7 +3996,9 @@ async def get_all_devices() -> Dict[str, Any]:
             if r["name"]:
                 item["hostname"] = r["name"]
             item["mac_address"] = r["mac"] or item["mac_address"]
-            item["vendor"] = item["vendor"] or f"Ubiquiti ({r['model']})"
+            if r["model"]:
+                item["hardware_model"] = item["hardware_model"] or str(r["model"]).strip() or None
+            item["vendor"] = item["vendor"] or "Ubiquiti"
             if r["status"] == "online":
                 item["is_online"] = True
             item["cpu_usage_pct"] = float(r["cpu_usage_pct"] or 0.0)
