@@ -3439,6 +3439,17 @@ export const App: React.FC = () => {
   const [allDevices, setAllDevices] = useState<UnifiedDeviceItem[]>([]);
   const [deviceSearch, setDeviceSearch] = useState("");
   const [deviceFilter, setDeviceFilter] = useState<"all" | "online" | "snmp" | "clients">("all");
+  const [deviceRoleFilter, setDeviceRoleFilter] = useState<string>("all");
+  const [hoveredNavTab, setHoveredNavTab] = useState<Exclude<TabKey, "settings"> | null>(null);
+  const addDeviceDialogRef = useRef<HTMLDialogElement | null>(null);
+  const [addDeviceOpen, setAddDeviceOpen] = useState(false);
+  const [addDeviceMode, setAddDeviceMode] = useState<"snmp" | "icmp">("snmp");
+  const [addDeviceIp, setAddDeviceIp] = useState("");
+  const [addDeviceLabel, setAddDeviceLabel] = useState("");
+  const [addDeviceProfileId, setAddDeviceProfileId] = useState<number | null>(null);
+  const [addDeviceInterval, setAddDeviceInterval] = useState<number>(30);
+  const [addDeviceSubmitting, setAddDeviceSubmitting] = useState(false);
+  const [addDeviceError, setAddDeviceError] = useState<string | null>(null);
   const [confirmRemoveDeviceIp, setConfirmRemoveDeviceIp] = useState<string | null>(null);
   const [removingDeviceIp, setRemovingDeviceIp] = useState<string | null>(null);
   const [deviceSortKey, setDeviceSortKey] = useState<DeviceSortKey>("ip_address");
@@ -3697,6 +3708,97 @@ export const App: React.FC = () => {
   const closeOnboardingModal = () => {
     const dlg = onboardingDialogRef.current;
     if (dlg && dlg.open) dlg.close();
+  };
+
+  useEffect(() => {
+    const dlg = addDeviceDialogRef.current;
+    if (!dlg) return;
+    if (addDeviceOpen && !dlg.open) {
+      dlg.showModal();
+    } else if (!addDeviceOpen && dlg.open) {
+      dlg.close();
+    }
+  }, [addDeviceOpen]);
+
+  useEffect(() => {
+    if (!hoveredNavTab) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setHoveredNavTab(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [hoveredNavTab]);
+
+  const openAddDeviceModal = (defaultMode: "snmp" | "icmp" = "snmp") => {
+    setHoveredNavTab(null);
+    setAddDeviceMode(defaultMode);
+    setAddDeviceIp("");
+    setAddDeviceLabel("");
+    setAddDeviceProfileId(config?.snmp_profiles?.[0]?.id ?? null);
+    setAddDeviceInterval(30);
+    setAddDeviceError(null);
+    setAddDeviceOpen(true);
+  };
+
+  const handleSubmitAddDevice = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanIp = addDeviceIp.trim();
+    if (!cleanIp) {
+      setAddDeviceError("IP address or hostname is required.");
+      return;
+    }
+    setAddDeviceSubmitting(true);
+    setAddDeviceError(null);
+    try {
+      if (addDeviceMode === "snmp") {
+        const r = await fetch("/api/config/snmp-targets", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            device_ip: cleanIp,
+            label: addDeviceLabel.trim(),
+            profile_id: addDeviceProfileId || config?.snmp_profiles?.[0]?.id || null,
+            enabled: true,
+          }),
+        });
+        if (!r.ok) {
+          const errData = await r.json().catch(() => ({}));
+          setAddDeviceError(errData.detail || `Failed to add SNMP device (HTTP ${r.status}).`);
+          return;
+        }
+        syncConfigState(await r.json());
+        flashFeedback("ok", `Added SNMP device ${cleanIp} and triggered initial poll.`);
+      } else {
+        const r = await fetch("/api/config/icmp-targets", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            device_ip: cleanIp,
+            label: addDeviceLabel.trim(),
+            poll_interval: Math.max(10, Number(addDeviceInterval) || 30),
+            enabled: true,
+          }),
+        });
+        if (!r.ok) {
+          const errData = await r.json().catch(() => ({}));
+          setAddDeviceError(errData.detail || `Failed to add ICMP host (HTTP ${r.status}).`);
+          return;
+        }
+        syncConfigState(await r.json());
+        flashFeedback("ok", `Added ICMP-only host ${cleanIp} and queued ping + DNS lookup.`);
+      }
+      setAddDeviceOpen(false);
+      fetchOverview();
+      fetchAllDevices();
+      setTimeout(() => {
+        fetchConfig();
+        fetchAllDevices();
+      }, 2500);
+    } catch (err) {
+      setAddDeviceError(err instanceof Error ? err.message : "Network error while adding device.");
+    } finally {
+      setAddDeviceSubmitting(false);
+    }
   };
 
   const syncConfigState = (data: AllConfigPayload) => {
@@ -5839,6 +5941,11 @@ export const App: React.FC = () => {
       ) {
         return false;
       }
+      if (deviceRoleFilter !== "all") {
+        const rk = getDeviceRoleKey(d);
+        const normRole = rk === "wireless" ? "ap" : rk;
+        if (normRole !== deviceRoleFilter) return false;
+      }
       if (deviceSearch.trim()) {
         const q = deviceSearch.trim().toLowerCase();
         const qNum = q.replace(/^#/, "");
@@ -6070,8 +6177,39 @@ export const App: React.FC = () => {
   ) => {
     if (e && isModifiedClick(e)) return;
     if (e) e.preventDefault();
+    setHoveredNavTab(null);
     navigateToTab(tabId);
   };
+
+  const DEVICE_TYPE_MENU_ITEMS: Array<{
+    key: string;
+    label: string;
+    icon: React.ComponentType<{ className?: string }>;
+    alwaysShow?: boolean;
+  }> = [
+    { key: "router", label: "Routers / Gateways", icon: Router, alwaysShow: true },
+    { key: "switch", label: "Switches", icon: Network, alwaysShow: true },
+    { key: "ap", label: "Wireless APs", icon: Wifi, alwaysShow: true },
+    { key: "firewall", label: "Firewalls", icon: ShieldCheck, alwaysShow: true },
+    { key: "server", label: "Servers", icon: Server, alwaysShow: true },
+    { key: "nas", label: "NAS / Storage", icon: HardDrive, alwaysShow: true },
+    { key: "ups", label: "UPS / Power", icon: Battery, alwaysShow: true },
+    { key: "printer", label: "Printers", icon: Printer, alwaysShow: true },
+    { key: "icmp", label: "ICMP Hosts", icon: Activity, alwaysShow: true },
+    { key: "network", label: "Network Devices", icon: Network },
+    { key: "client", label: "UniFi Clients", icon: Monitor, alwaysShow: true },
+  ];
+
+  const deviceRoleCounts: Record<string, number> = {};
+  for (const d of allDevices) {
+    const rk = getDeviceRoleKey(d);
+    const norm = rk === "wireless" ? "ap" : rk;
+    if (norm) {
+      deviceRoleCounts[norm] = (deviceRoleCounts[norm] || 0) + 1;
+    }
+  }
+  const activeDeviceRoleMeta =
+    DEVICE_TYPE_MENU_ITEMS.find((item) => item.key === deviceRoleFilter) || null;
 
   const detailUps = deviceDetail?.snmp_system?.extended_metrics?.ups_telemetry || null;
   const detailPrinterSupplies =
@@ -6298,28 +6436,484 @@ export const App: React.FC = () => {
           className="border-t border-slate-800/80 bg-[#0B101B]/95"
         >
           <div className="mx-auto max-w-7xl px-4 py-2 sm:px-6">
-            {/* Desktop: Separated non-scrolling button bar */}
+            {/* Desktop: Separated non-scrolling button bar with hover dropdown menus */}
             <div className="hidden lg:flex lg:flex-wrap lg:items-center lg:gap-2">
               {primaryTabs.map((tab) => {
                 const Icon = tab.icon;
                 const active = activeTab === tab.id;
+                const menuOpen = hoveredNavTab === tab.id;
                 return (
-                  <a
+                  <div
                     key={tab.id}
-                    href={TAB_PATHS[tab.id]}
-                    onClick={(e) => handleSelectNavTab(tab.id, e)}
-                    aria-current={active ? "page" : undefined}
-                    className={`group flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-medium transition-all duration-150 ${
-                      active ? tab.activeClass : tab.inactiveClass
-                    }`}
+                    className="relative"
+                    onMouseEnter={() => setHoveredNavTab(tab.id)}
+                    onMouseLeave={() => setHoveredNavTab((cur) => (cur === tab.id ? null : cur))}
+                    onFocus={() => setHoveredNavTab(tab.id)}
+                    onBlur={(e) => {
+                      if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+                        setHoveredNavTab((cur) => (cur === tab.id ? null : cur));
+                      }
+                    }}
                   >
-                    <Icon
-                      className={`h-3.5 w-3.5 shrink-0 transition-colors ${
-                        active ? tab.iconActiveClass : tab.iconInactiveClass
+                    <a
+                      href={TAB_PATHS[tab.id]}
+                      onClick={(e) => handleSelectNavTab(tab.id, e)}
+                      aria-current={active ? "page" : undefined}
+                      aria-haspopup="menu"
+                      aria-expanded={menuOpen}
+                      className={`group flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-medium transition-all duration-150 ${
+                        active ? tab.activeClass : tab.inactiveClass
                       }`}
-                    />
-                    <span>{tab.label}</span>
-                  </a>
+                    >
+                      <Icon
+                        className={`h-3.5 w-3.5 shrink-0 transition-colors ${
+                          active ? tab.iconActiveClass : tab.iconInactiveClass
+                        }`}
+                      />
+                      <span>{tab.label}</span>
+                      <ChevronDown
+                        className={`h-3 w-3 opacity-60 transition-transform duration-150 ${
+                          menuOpen ? "rotate-180 opacity-100" : ""
+                        }`}
+                      />
+                    </a>
+
+                    {menuOpen && (
+                      <div className="absolute left-0 top-full z-50 pt-1.5">
+                        <div
+                          role="menu"
+                          className={`rounded-xl border border-slate-700/90 bg-[#111827] p-2 text-xs text-slate-200 shadow-2xl shadow-black/60 backdrop-blur-md ${
+                            tab.id === "devices" ? "w-72" : "w-56"
+                          }`}
+                        >
+                          {tab.id === "devices" && (
+                            <div className="space-y-2">
+                              <div>
+                                <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                                  Views
+                                </div>
+                                <div className="grid grid-cols-2 gap-1">
+                                  {(
+                                    [
+                                      {
+                                        id: "all",
+                                        label: "All Devices",
+                                        count: allDevices.length,
+                                      },
+                                      {
+                                        id: "online",
+                                        label: "Online Only",
+                                        count: allDevices.filter((d) => d.is_online).length,
+                                      },
+                                      {
+                                        id: "snmp",
+                                        label: "SNMP Polled",
+                                        count: allDevices.filter((d) =>
+                                          d.sources.includes("SNMP"),
+                                        ).length,
+                                      },
+                                      {
+                                        id: "clients",
+                                        label: "UniFi Clients",
+                                        count: allDevices.filter(
+                                          (d) =>
+                                            d.device_role === "client" ||
+                                            d.device_profile_type === "client",
+                                        ).length,
+                                      },
+                                    ] as Array<{
+                                      id: "all" | "online" | "snmp" | "clients";
+                                      label: string;
+                                      count: number;
+                                    }>
+                                  ).map((v) => {
+                                    const selected =
+                                      activeTab === "devices" &&
+                                      !selectedDeviceRef &&
+                                      deviceFilter === v.id &&
+                                      deviceRoleFilter === "all";
+                                    return (
+                                      <button
+                                        key={v.id}
+                                        type="button"
+                                        role="menuitem"
+                                        onClick={() => {
+                                          setDeviceFilter(v.id);
+                                          setDeviceRoleFilter("all");
+                                          setHoveredNavTab(null);
+                                          navigateToTab("devices");
+                                        }}
+                                        className={`flex items-center justify-between rounded-md px-2 py-1.5 text-left text-[11px] transition ${
+                                          selected
+                                            ? "bg-sky-500/20 font-semibold text-sky-200"
+                                            : "text-slate-300 hover:bg-slate-800/90 hover:text-white"
+                                        }`}
+                                      >
+                                        <span className="truncate">{v.label}</span>
+                                        <span className="ml-1 font-mono-tabular text-[10px] text-slate-400">
+                                          {v.count}
+                                        </span>
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+
+                              <div className="border-t border-slate-800/90 pt-1.5">
+                                <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                                  Device Types
+                                </div>
+                                <div className="max-h-60 space-y-0.5 overflow-y-auto">
+                                  {DEVICE_TYPE_MENU_ITEMS.filter(
+                                    (t) => t.alwaysShow || (deviceRoleCounts[t.key] || 0) > 0,
+                                  ).map((t) => {
+                                    const TypeIcon = t.icon;
+                                    const count = deviceRoleCounts[t.key] || 0;
+                                    const isSel =
+                                      activeTab === "devices" &&
+                                      !selectedDeviceRef &&
+                                      deviceRoleFilter === t.key;
+                                    return (
+                                      <button
+                                        key={t.key}
+                                        type="button"
+                                        role="menuitem"
+                                        onClick={() => {
+                                          setDeviceFilter("all");
+                                          setDeviceRoleFilter(t.key);
+                                          setHoveredNavTab(null);
+                                          navigateToTab("devices");
+                                        }}
+                                        className={`flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left transition ${
+                                          isSel
+                                            ? "bg-sky-500/20 font-semibold text-sky-200"
+                                            : "text-slate-300 hover:bg-slate-800/90 hover:text-white"
+                                        }`}
+                                      >
+                                        <span className="flex items-center gap-2">
+                                          <TypeIcon className="h-3.5 w-3.5 text-slate-400" />
+                                          <span>{t.label}</span>
+                                        </span>
+                                        <span className="font-mono-tabular text-[11px] text-slate-400">
+                                          {count}
+                                        </span>
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+
+                              <div className="space-y-1 border-t border-slate-800/90 pt-2">
+                                <button
+                                  type="button"
+                                  role="menuitem"
+                                  onClick={() => {
+                                    setHoveredNavTab(null);
+                                    handleRematchAllMibs();
+                                  }}
+                                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-slate-300 transition hover:bg-slate-800/90 hover:text-white"
+                                >
+                                  <RefreshCw className="h-3.5 w-3.5 text-sky-400" />
+                                  <span>Auto-Match &amp; Poll MIBs</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  role="menuitem"
+                                  onClick={() => {
+                                    setHoveredNavTab(null);
+                                    triggerScanNow();
+                                  }}
+                                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-slate-300 transition hover:bg-slate-800/90 hover:text-white"
+                                >
+                                  <Network className="h-3.5 w-3.5 text-amber-400" />
+                                  <span>Rescan Subnets</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  role="menuitem"
+                                  onClick={() => openAddDeviceModal("snmp")}
+                                  className="mt-1 flex w-full items-center justify-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-emerald-500"
+                                >
+                                  <Plus className="h-3.5 w-3.5" />
+                                  <span>Add Device</span>
+                                </button>
+                              </div>
+                            </div>
+                          )}
+
+                          {tab.id === "pulse" && (
+                            <div className="space-y-0.5">
+                              <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                                Traffic Window
+                              </div>
+                              {(
+                                [
+                                  { id: "live", label: "Live Stream" },
+                                  { id: "1h", label: "Last 1 Hour (1H)" },
+                                  { id: "12h", label: "Last 12 Hours (12H)" },
+                                  { id: "1d", label: "Last 24 Hours (1D)" },
+                                  { id: "7d", label: "Last 7 Days (7D)" },
+                                  { id: "1m", label: "Last 30 Days (1M)" },
+                                ] as Array<{ id: OverviewRangeKey; label: string }>
+                              ).map((opt) => (
+                                <button
+                                  key={opt.id}
+                                  type="button"
+                                  role="menuitem"
+                                  onClick={() => {
+                                    setOverviewGraphMode(opt.id);
+                                    setHoveredNavTab(null);
+                                    navigateToTab("pulse");
+                                  }}
+                                  className={`flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left transition ${
+                                    activeTab === "pulse" && overviewGraphMode === opt.id
+                                      ? "bg-emerald-500/20 font-semibold text-emerald-200"
+                                      : "text-slate-300 hover:bg-slate-800/90 hover:text-white"
+                                  }`}
+                                >
+                                  <span>{opt.label}</span>
+                                  {opt.id === "live" && (
+                                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                                  )}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+
+                          {tab.id === "snmp" && (
+                            <div className="space-y-1">
+                              <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                                SNMP Views &amp; Metrics
+                              </div>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setSnmpPortFilterIp("");
+                                  setHoveredNavTab(null);
+                                  navigateToTab("snmp");
+                                }}
+                                className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-slate-300 transition hover:bg-slate-800/90 hover:text-white"
+                              >
+                                <span>All Interfaces</span>
+                                <span className="font-mono-tabular text-[11px] text-slate-400">
+                                  {interfaces.length}
+                                </span>
+                              </button>
+                              {(
+                                [
+                                  { id: "ingestion", label: "Ingestion Rate" },
+                                  { id: "latency", label: "Poll Latency" },
+                                  { id: "polls", label: "Poll Volume" },
+                                ] as Array<{ id: "ingestion" | "latency" | "polls"; label: string }>
+                              ).map((m) => (
+                                <button
+                                  key={m.id}
+                                  type="button"
+                                  role="menuitem"
+                                  onClick={() => {
+                                    setSnmpChartMode(m.id);
+                                    setHoveredNavTab(null);
+                                    navigateToTab("snmp");
+                                  }}
+                                  className={`flex w-full items-center rounded-md px-2 py-1.5 text-left transition ${
+                                    activeTab === "snmp" && snmpChartMode === m.id
+                                      ? "bg-violet-500/20 font-semibold text-violet-200"
+                                      : "text-slate-300 hover:bg-slate-800/90 hover:text-white"
+                                  }`}
+                                >
+                                  {m.label}
+                                </button>
+                              ))}
+                              <div className="border-t border-slate-800/90 pt-1">
+                                <button
+                                  type="button"
+                                  role="menuitem"
+                                  onClick={() => {
+                                    setHoveredNavTab(null);
+                                    handlePollAllSnmp();
+                                  }}
+                                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-emerald-300 transition hover:bg-slate-800/90"
+                                >
+                                  <RefreshCw className="h-3.5 w-3.5" />
+                                  <span>Poll All SNMP Now</span>
+                                </button>
+                              </div>
+                            </div>
+                          )}
+
+                          {tab.id === "scanner" && (
+                            <div className="space-y-1">
+                              <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                                Subnet Scope
+                              </div>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setSelectedSubnet("");
+                                  setHoveredNavTab(null);
+                                  navigateToTab("scanner");
+                                }}
+                                className={`flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left transition ${
+                                  activeTab === "scanner" && !selectedSubnet
+                                    ? "bg-amber-500/20 font-semibold text-amber-200"
+                                    : "text-slate-300 hover:bg-slate-800/90 hover:text-white"
+                                }`}
+                              >
+                                <span>All Subnets</span>
+                                <span className="font-mono-tabular text-[11px] text-slate-400">
+                                  {subnets.length}
+                                </span>
+                              </button>
+                              {subnets.slice(0, 8).map((cidr) => (
+                                <button
+                                  key={cidr}
+                                  type="button"
+                                  role="menuitem"
+                                  onClick={() => {
+                                    setSelectedSubnet(cidr);
+                                    setHoveredNavTab(null);
+                                    navigateToTab("scanner");
+                                  }}
+                                  className={`flex w-full items-center rounded-md px-2 py-1.5 text-left font-mono-tabular text-[11px] transition ${
+                                    activeTab === "scanner" && selectedSubnet === cidr
+                                      ? "bg-amber-500/20 font-semibold text-amber-200"
+                                      : "text-slate-300 hover:bg-slate-800/90 hover:text-white"
+                                  }`}
+                                >
+                                  {cidr}
+                                </button>
+                              ))}
+                              <div className="border-t border-slate-800/90 pt-1">
+                                <button
+                                  type="button"
+                                  role="menuitem"
+                                  onClick={() => {
+                                    setHoveredNavTab(null);
+                                    triggerScanNow();
+                                  }}
+                                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-amber-300 transition hover:bg-slate-800/90"
+                                >
+                                  <RefreshCw className="h-3.5 w-3.5" />
+                                  <span>Run Subnet Scan Now</span>
+                                </button>
+                              </div>
+                            </div>
+                          )}
+
+                          {tab.id === "syslog" && (
+                            <div className="space-y-0.5">
+                              <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                                Severity Filter
+                              </div>
+                              {[
+                                { id: "all", label: "All Severities" },
+                                { id: "err", label: "Error / Critical" },
+                                { id: "warning", label: "Warning" },
+                                { id: "notice", label: "Notice" },
+                                { id: "info", label: "Info" },
+                                { id: "debug", label: "Debug" },
+                              ].map((sev) => (
+                                <button
+                                  key={sev.id}
+                                  type="button"
+                                  role="menuitem"
+                                  onClick={() => {
+                                    setLogSeverity(sev.id);
+                                    setHoveredNavTab(null);
+                                    navigateToTab("syslog");
+                                  }}
+                                  className={`flex w-full items-center rounded-md px-2 py-1.5 text-left transition ${
+                                    activeTab === "syslog" && logSeverity === sev.id
+                                      ? "bg-rose-500/20 font-semibold text-rose-200"
+                                      : "text-slate-300 hover:bg-slate-800/90 hover:text-white"
+                                  }`}
+                                >
+                                  {sev.label}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+
+                          {tab.id === "targets" && (
+                            <div className="space-y-1.5">
+                              <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                                Monitoring Inventory
+                              </div>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setHoveredNavTab(null);
+                                  navigateToTab("targets");
+                                }}
+                                className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-slate-300 transition hover:bg-slate-800/90 hover:text-white"
+                              >
+                                <span>SNMP Targets</span>
+                                <span className="font-mono-tabular text-[11px] text-slate-400">
+                                  {config?.snmp_targets?.length || 0}
+                                </span>
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setHoveredNavTab(null);
+                                  navigateToTab("targets");
+                                }}
+                                className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-slate-300 transition hover:bg-slate-800/90 hover:text-white"
+                              >
+                                <span>ICMP Hosts</span>
+                                <span className="font-mono-tabular text-[11px] text-slate-400">
+                                  {config?.icmp_targets?.length || 0}
+                                </span>
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setHoveredNavTab(null);
+                                  navigateToTab("targets");
+                                }}
+                                className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-slate-300 transition hover:bg-slate-800/90 hover:text-white"
+                              >
+                                <span>Scan Subnets</span>
+                                <span className="font-mono-tabular text-[11px] text-slate-400">
+                                  {config?.subnets?.length || 0}
+                                </span>
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setHoveredNavTab(null);
+                                  navigateToTab("targets");
+                                }}
+                                className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-slate-300 transition hover:bg-slate-800/90 hover:text-white"
+                              >
+                                <span>SNMP Profiles</span>
+                                <span className="font-mono-tabular text-[11px] text-slate-400">
+                                  {config?.snmp_profiles?.length || 0}
+                                </span>
+                              </button>
+                              <div className="border-t border-slate-800/90 pt-1.5">
+                                <button
+                                  type="button"
+                                  role="menuitem"
+                                  onClick={() => openAddDeviceModal("snmp")}
+                                  className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-emerald-500"
+                                >
+                                  <Plus className="h-3.5 w-3.5" />
+                                  <span>Add Device</span>
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 );
               })}
             </div>
@@ -6561,6 +7155,188 @@ export const App: React.FC = () => {
             {savingOnboarding ? "Saving..." : "Save & Start Discovery"}
           </button>
         </div>
+      </dialog>
+
+      {/* Quick Add Device Modal Dialog (SNMP or ICMP-Only Host) */}
+      <dialog
+        ref={addDeviceDialogRef}
+        onCancel={(e) => {
+          e.preventDefault();
+          if (!addDeviceSubmitting) setAddDeviceOpen(false);
+        }}
+        onClick={(e) => {
+          if (e.target === addDeviceDialogRef.current && !addDeviceSubmitting) {
+            setAddDeviceOpen(false);
+          }
+        }}
+        className="m-auto w-full max-w-lg rounded-xl border border-slate-700 bg-[#111827] p-0 text-slate-100 shadow-2xl"
+      >
+        <div className="flex items-center justify-between border-b border-slate-800 px-5 py-4">
+          <div className="flex items-center gap-2.5">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-emerald-500/40 bg-emerald-500/10 text-emerald-400">
+              <Plus className="h-4 w-4" />
+            </div>
+            <div>
+              <h2 className="text-sm font-semibold text-white">Add Monitored Device</h2>
+              <p className="text-[11px] text-slate-400">
+                Add a host for full SNMP telemetry or lightweight ICMP ping + DNS monitoring.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setAddDeviceOpen(false)}
+            disabled={addDeviceSubmitting}
+            className="rounded-md p-1 text-slate-400 hover:bg-slate-800 hover:text-slate-200 disabled:opacity-50"
+            title="Close"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmitAddDevice} className="space-y-4 p-5 text-xs">
+          <div className="grid grid-cols-2 gap-2 rounded-lg border border-slate-800 bg-[#090D16] p-1">
+            <button
+              type="button"
+              onClick={() => {
+                setAddDeviceMode("snmp");
+                setAddDeviceError(null);
+              }}
+              className={`rounded-md px-3 py-1.5 text-xs font-medium transition ${
+                addDeviceMode === "snmp"
+                  ? "bg-emerald-600 text-white"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              SNMP Device
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setAddDeviceMode("icmp");
+                setAddDeviceError(null);
+              }}
+              className={`rounded-md px-3 py-1.5 text-xs font-medium transition ${
+                addDeviceMode === "icmp"
+                  ? "bg-cyan-600 text-white"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              ICMP-Only Host
+            </button>
+          </div>
+
+          <div className="space-y-3">
+            <div>
+              <label className="mb-1 block text-[11px] font-medium text-slate-300">
+                IP Address or Hostname
+              </label>
+              <input
+                type="text"
+                required
+                placeholder="e.g. 10.1.3.25"
+                value={addDeviceIp}
+                onChange={(e) => setAddDeviceIp(e.target.value)}
+                className="w-full rounded-md border border-slate-700 bg-[#090D16] px-3 py-2 font-mono-tabular text-xs text-white placeholder:text-slate-500 focus:border-emerald-500 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="mb-1 block text-[11px] font-medium text-slate-300">
+                Label / Name Override <span className="text-slate-500">(optional)</span>
+              </label>
+              <input
+                type="text"
+                placeholder="e.g. Core Switch, Cloudflare DNS"
+                value={addDeviceLabel}
+                onChange={(e) => setAddDeviceLabel(e.target.value)}
+                className="w-full rounded-md border border-slate-700 bg-[#090D16] px-3 py-2 text-xs text-white placeholder:text-slate-500 focus:border-emerald-500 focus:outline-none"
+              />
+            </div>
+
+            {addDeviceMode === "snmp" ? (
+              <div>
+                <label className="mb-1 block text-[11px] font-medium text-slate-300">
+                  SNMP Credential Profile
+                </label>
+                <select
+                  value={addDeviceProfileId ?? ""}
+                  onChange={(e) =>
+                    setAddDeviceProfileId(e.target.value ? Number(e.target.value) : null)
+                  }
+                  className="w-full rounded-md border border-slate-700 bg-[#090D16] px-3 py-2 text-xs text-white focus:border-emerald-500 focus:outline-none"
+                >
+                  {(config?.snmp_profiles || []).map((prof) => (
+                    <option key={prof.id} value={prof.id}>
+                      {prof.name} ({prof.version.toUpperCase()} • {prof.poll_interval}s)
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : (
+              <div>
+                <label className="mb-1 block text-[11px] font-medium text-slate-300">
+                  Ping Interval (seconds)
+                </label>
+                <input
+                  type="number"
+                  min={10}
+                  max={3600}
+                  value={addDeviceInterval}
+                  onChange={(e) => setAddDeviceInterval(Number(e.target.value) || 30)}
+                  className="w-full rounded-md border border-slate-700 bg-[#090D16] px-3 py-2 font-mono-tabular text-xs text-white focus:border-cyan-500 focus:outline-none"
+                />
+              </div>
+            )}
+          </div>
+
+          {addDeviceError && (
+            <div className="flex items-center gap-2 rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+              <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+              <span>{addDeviceError}</span>
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-800 pt-3">
+            <a
+              href="/targets"
+              onClick={(e) => {
+                if (isModifiedClick(e)) return;
+                e.preventDefault();
+                setAddDeviceOpen(false);
+                navigateToTab("targets");
+              }}
+              className="text-[11px] font-medium text-sky-400 hover:text-sky-300"
+            >
+              Manage Profiles &amp; Subnets →
+            </a>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setAddDeviceOpen(false)}
+                disabled={addDeviceSubmitting}
+                className="rounded-md border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-slate-800 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={addDeviceSubmitting}
+                className={`rounded-md px-4 py-1.5 text-xs font-semibold text-white disabled:opacity-50 ${
+                  addDeviceMode === "snmp"
+                    ? "bg-emerald-600 hover:bg-emerald-500"
+                    : "bg-cyan-600 hover:bg-cyan-500"
+                }`}
+              >
+                {addDeviceSubmitting
+                  ? "Adding..."
+                  : addDeviceMode === "snmp"
+                    ? "Add SNMP Device"
+                    : "Add ICMP Host"}
+              </button>
+            </div>
+          </div>
+        </form>
       </dialog>
 
       {/* Native <dialog> Modal Prompt for Available GitHub Updates */}
@@ -7501,9 +8277,10 @@ export const App: React.FC = () => {
                   ].map((f) => (
                     <button
                       key={f.id}
-                      onClick={() =>
-                        setDeviceFilter(f.id as "all" | "online" | "snmp" | "clients")
-                      }
+                      onClick={() => {
+                        setDeviceFilter(f.id as "all" | "online" | "snmp" | "clients");
+                        setDeviceRoleFilter("all");
+                      }}
                       className={`rounded px-2.5 py-1 text-xs font-medium transition ${
                         deviceFilter === f.id
                           ? "bg-emerald-600 text-white"
@@ -7514,6 +8291,20 @@ export const App: React.FC = () => {
                     </button>
                   ))}
                 </div>
+
+                {deviceRoleFilter !== "all" && (
+                  <button
+                    type="button"
+                    onClick={() => setDeviceRoleFilter("all")}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-sky-500/40 bg-sky-500/15 px-2.5 py-1 text-xs font-medium text-sky-200 transition hover:bg-sky-500/25"
+                    title="Clear device type filter"
+                  >
+                    <span>
+                      Type: {activeDeviceRoleMeta ? activeDeviceRoleMeta.label : deviceRoleFilter}
+                    </span>
+                    <X className="h-3 w-3 text-sky-300" />
+                  </button>
+                )}
               </div>
 
               <div className="flex flex-wrap items-center gap-2">
