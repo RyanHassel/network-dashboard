@@ -475,6 +475,7 @@ async def ensure_dynamic_config_tables(pool: asyncpg.Pool) -> None:
             )
 
     await repair_implausible_snmp_spikes(pool)
+    await ensure_continuous_aggregates_realtime(pool)
 
 
 async def repair_implausible_snmp_spikes(
@@ -674,3 +675,74 @@ async def repair_implausible_snmp_spikes(
     except Exception as exc:
         logger.warning("SNMP spike cleanup skipped: %s", exc)
     return {"repaired_rows": updated_rows, "repaired_devices": repaired_by_device}
+
+
+async def ensure_continuous_aggregates_realtime(pool: asyncpg.Pool) -> None:
+    """Enables real-time aggregation and valid refresh windows for SNMP continuous aggregates."""
+    lock_id = 8419201
+    try:
+        async with pool.acquire() as conn:
+            acquired = bool(await conn.fetchval("SELECT pg_try_advisory_lock($1)", lock_id))
+            if not acquired:
+                return
+            try:
+                for view_name in ("snmp_metrics_hourly", "snmp_metrics_daily"):
+                    try:
+                        await conn.execute(
+                            f"ALTER MATERIALIZED VIEW {view_name} SET (timescaledb.materialized_only = false)"
+                        )
+                    except Exception as exc:
+                        logger.debug("Skipping materialized_only update for %s: %s", view_name, exc)
+
+                policy_done = bool(
+                    await conn.fetchval("SELECT 1 FROM app_settings WHERE key = 'cagg_policy_v2'")
+                )
+                if policy_done:
+                    return
+
+                view_specs = (
+                    ("snmp_metrics_hourly", "7 days", "1 hour", "15 minutes"),
+                    ("snmp_metrics_daily", "30 days", "1 day", "1 hour"),
+                )
+                for view_name, start_off, end_off, sched in view_specs:
+                    try:
+                        await conn.execute(
+                            f"SELECT remove_continuous_aggregate_policy('{view_name}', if_exists => TRUE)"
+                        )
+                    except Exception as exc:
+                        logger.debug("Skipping remove policy for %s: %s", view_name, exc)
+                    try:
+                        await conn.execute(
+                            f"""
+                            SELECT add_continuous_aggregate_policy(
+                                '{view_name}',
+                                start_offset => INTERVAL '{start_off}',
+                                end_offset   => INTERVAL '{end_off}',
+                                schedule_interval => INTERVAL '{sched}',
+                                if_not_exists => TRUE
+                            )
+                            """
+                        )
+                    except Exception as exc:
+                        logger.warning("Could not update policy for %s: %s", view_name, exc)
+                    try:
+                        await conn.execute(
+                            f"CALL refresh_continuous_aggregate('{view_name}', NOW() - INTERVAL '30 days', NOW() - INTERVAL '{end_off}')"
+                        )
+                    except Exception as exc:
+                        logger.warning("Could not refresh continuous aggregate %s: %s", view_name, exc)
+
+                await conn.execute(
+                    """
+                    INSERT INTO app_settings (key, value)
+                    VALUES ('cagg_policy_v2', '{"realtime": true, "hourly_end_offset": "1 hour", "daily_end_offset": "1 day"}'::jsonb)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                    """
+                )
+            finally:
+                try:
+                    await conn.execute("SELECT pg_advisory_unlock($1)", lock_id)
+                except Exception:
+                    pass
+    except Exception as exc:
+        logger.warning("Continuous aggregate setup skipped: %s", exc)

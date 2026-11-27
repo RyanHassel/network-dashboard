@@ -12,7 +12,7 @@ import socket
 import struct
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -2621,6 +2621,30 @@ def _merge_traffic_gap_buckets(
     return merged
 
 
+def _series_has_gap(
+    rows: List[Any],
+    now_utc: datetime,
+    interval_sec: int,
+    bucket_sec: int,
+    check_leading: bool = False,
+) -> bool:
+    """Returns True when rows are empty or contain leading, internal, or trailing gaps."""
+    if not rows:
+        return True
+    max_gap = max(float(bucket_sec) * 2.0, 3600.0)
+    last_bucket = rows[-1]["bucket"]
+    if (now_utc - last_bucket).total_seconds() > max_gap:
+        return True
+    if check_leading:
+        expected_start = now_utc - timedelta(seconds=interval_sec)
+        if (rows[0]["bucket"] - expected_start).total_seconds() > max_gap:
+            return True
+    for idx in range(1, len(rows)):
+        if (rows[idx]["bucket"] - rows[idx - 1]["bucket"]).total_seconds() > max_gap:
+            return True
+    return False
+
+
 async def _query_overview_traffic_series(
     conn: asyncpg.Connection,
     range_key: str = "1d",
@@ -2635,13 +2659,14 @@ async def _query_overview_traffic_series(
         rk = "1d"
 
     range_specs = {
-        "1h": ("1 hour", "30 seconds", 30),
-        "12h": ("12 hours", "2 minutes", 120),
-        "1d": ("24 hours", "5 minutes", 300),
-        "7d": ("7 days", "30 minutes", 1800),
-        "1m": ("30 days", "2 hours", 7200),
+        "1h": ("1 hour", "30 seconds", 30, 3600),
+        "12h": ("12 hours", "2 minutes", 120, 43200),
+        "1d": ("24 hours", "5 minutes", 300, 86400),
+        "7d": ("7 days", "30 minutes", 1800, 604800),
+        "1m": ("30 days", "2 hours", 7200, 2592000),
     }
-    sql_interval, sql_bucket, bucket_sec = range_specs[rk]
+    sql_interval, sql_bucket, bucket_sec, interval_sec = range_specs[rk]
+    now_utc = datetime.now(timezone.utc)
 
     if graph_settings is None:
         graph_settings = await _read_overview_graph_settings(conn)
@@ -2702,7 +2727,7 @@ async def _query_overview_traffic_series(
                        SUM(if_tx) AS tx_bps,
                        0.0 AS latency_ms
                 FROM (
-                    SELECT time_bucket('4 hours', bucket) AS bucket,
+                    SELECT time_bucket('2 hours', bucket) AS bucket,
                            device_ip,
                            if_index,
                            AVG({clean_avg_in}) AS if_rx,
@@ -2720,15 +2745,20 @@ async def _query_overview_traffic_series(
                 spec_indices,
             )
 
-        if not wan_history:
-            wan_history = await conn.fetch(
+        agg_bucket_sec = 3600 if rk == "7d" else bucket_sec
+        if not wan_history or (
+            rk in ("7d", "1m")
+            and _series_has_gap(wan_history, now_utc, interval_sec, agg_bucket_sec, check_leading=True)
+        ):
+            raw_bucket = "1 hour" if (rk == "7d" and wan_history) else sql_bucket
+            raw_rows = await conn.fetch(
                 f"""
                 SELECT bucket,
                        SUM(if_rx) AS rx_bps,
                        SUM(if_tx) AS tx_bps,
                        0.0 AS latency_ms
                 FROM (
-                    SELECT time_bucket('{sql_bucket}', time) AS bucket,
+                    SELECT time_bucket('{raw_bucket}', time) AS bucket,
                            device_ip,
                            if_index,
                            AVG({clean_raw_in}) AS if_rx,
@@ -2745,6 +2775,15 @@ async def _query_overview_traffic_series(
                 spec_ips,
                 spec_indices,
             )
+            if wan_history:
+                if raw_rows:
+                    wan_history = _merge_traffic_gap_buckets(
+                        [dict(r) for r in wan_history],
+                        [dict(r) for r in raw_rows],
+                        agg_bucket_sec,
+                    )
+            else:
+                wan_history = raw_rows
     else:
         wan_history = await conn.fetch(
             f"""
@@ -2759,57 +2798,67 @@ async def _query_overview_traffic_series(
             """
         )
 
-        # Detect trailing or internal gaps in UniFi gateway history and backfill from SNMP WAN
-        if wan_history:
-            now_utc = datetime.now(timezone.utc)
-            last_bucket = wan_history[-1]["bucket"]
-            has_gap = (now_utc - last_bucket).total_seconds() > (bucket_sec * 2)
-            if not has_gap and len(wan_history) >= 2:
-                for idx in range(1, len(wan_history)):
-                    if (
-                        wan_history[idx]["bucket"] - wan_history[idx - 1]["bucket"]
-                    ).total_seconds() > (bucket_sec * 2):
-                        has_gap = True
-                        break
-            if has_gap:
-                gw_ip = await conn.fetchval(
+        # Detect leading, trailing, or internal gaps in UniFi gateway history and backfill from SNMP WAN
+        if wan_history and _series_has_gap(
+            wan_history, now_utc, interval_sec, bucket_sec, check_leading=True
+        ):
+            gw_ip = await conn.fetchval(
+                """
+                SELECT COALESCE(NULLIF(lan_ip, ''), NULLIF(ip_address, ''))
+                FROM unifi_devices
+                WHERE device_type IN ('udm', 'ugw', 'uxg')
+                  AND (COALESCE(lan_ip, '') != '' OR COALESCE(ip_address, '') != '')
+                ORDER BY last_seen DESC NULLS LAST
+                LIMIT 1
+                """
+            )
+            if not gw_ip:
+                ctrl_host = await conn.fetchval(
                     """
-                    SELECT COALESCE(NULLIF(lan_ip, ''), NULLIF(ip_address, ''))
-                    FROM unifi_devices
-                    WHERE device_type IN ('udm', 'ugw', 'uxg')
-                      AND (COALESCE(lan_ip, '') != '' OR COALESCE(ip_address, '') != '')
-                    ORDER BY last_seen DESC NULLS LAST
+                    SELECT host
+                    FROM unifi_controllers_config
+                    WHERE enabled = TRUE AND COALESCE(host, '') != ''
+                    ORDER BY id ASC
                     LIMIT 1
                     """
                 )
-                if gw_ip:
-                    gw_ip_str = str(gw_ip).strip()
-                    wan_if_index = await conn.fetchval(
-                        f"""
-                        SELECT if_index
-                        FROM snmp_metrics_raw
-                        WHERE device_ip = $1
-                          AND time > NOW() - INTERVAL '{sql_interval}'
-                          AND {_NON_LOOPBACK_SQL}
-                        GROUP BY if_index
-                        ORDER BY
-                            MAX(
-                                CASE
-                                    WHEN COALESCE(if_name, '') ~* '^(eth8|eth9|eth10|ppp|wan)'
-                                      OR COALESCE(if_descr, '') ~* 'wan'
-                                      OR COALESCE(if_alias, '') ~* 'wan'
-                                    THEN 1
-                                    ELSE 0
-                                END
-                            ) DESC,
-                            AVG(COALESCE({clean_raw_in}, 0) + COALESCE({clean_raw_out}, 0)) DESC
-                        LIMIT 1
-                        """,
-                        gw_ip_str,
+                if ctrl_host:
+                    cleaned_host = re.sub(
+                        r"^https?://", "", str(ctrl_host).strip(), flags=re.IGNORECASE
                     )
-                    if wan_if_index is not None:
-                        if rk == "7d":
-                            fb_rows = await conn.fetch(
+                    gw_ip = cleaned_host.split("/", 1)[0].split(":", 1)[0].strip() or None
+
+            if gw_ip:
+                gw_ip_str = str(gw_ip).strip()
+                wan_if_index = await conn.fetchval(
+                    f"""
+                    SELECT if_index
+                    FROM snmp_metrics_raw
+                    WHERE device_ip = $1
+                      AND time > NOW() - INTERVAL '{sql_interval}'
+                      AND {_NON_LOOPBACK_SQL}
+                    GROUP BY if_index
+                    ORDER BY
+                        MAX(
+                            CASE
+                                WHEN COALESCE(if_name, '') ~* '^(eth8|eth9|eth10|ppp|wan)'
+                                  OR COALESCE(if_descr, '') ~* 'wan'
+                                  OR COALESCE(if_alias, '') ~* 'wan'
+                                THEN 1
+                                ELSE 0
+                            END
+                        ) DESC,
+                        AVG(COALESCE({clean_raw_in}, 0) + COALESCE({clean_raw_out}, 0)) DESC
+                    LIMIT 1
+                    """,
+                    gw_ip_str,
+                )
+                if wan_if_index is not None:
+                    wan_if_int = int(wan_if_index)
+                    fb_rows: List[Any] = []
+                    if rk == "7d":
+                        fb_rows = list(
+                            await conn.fetch(
                                 f"""
                                 SELECT bucket,
                                        AVG({clean_avg_in}) AS rx_bps,
@@ -2823,12 +2872,14 @@ async def _query_overview_traffic_series(
                                 ORDER BY bucket ASC
                                 """,
                                 gw_ip_str,
-                                int(wan_if_index),
+                                wan_if_int,
                             )
-                        elif rk == "1m":
-                            fb_rows = await conn.fetch(
+                        )
+                    elif rk == "1m":
+                        fb_rows = list(
+                            await conn.fetch(
                                 f"""
-                                SELECT time_bucket('4 hours', bucket) AS bucket,
+                                SELECT time_bucket('2 hours', bucket) AS bucket,
                                        AVG({clean_avg_in}) AS rx_bps,
                                        AVG({clean_avg_out}) AS tx_bps,
                                        0.0 AS latency_ms
@@ -2840,12 +2891,20 @@ async def _query_overview_traffic_series(
                                 ORDER BY 1 ASC
                                 """,
                                 gw_ip_str,
-                                int(wan_if_index),
+                                wan_if_int,
                             )
-                        else:
-                            fb_rows = await conn.fetch(
+                        )
+
+                    fb_bucket = "1 hour" if rk == "7d" else sql_bucket
+                    fb_bucket_sec = 3600 if rk == "7d" else bucket_sec
+                    if rk not in ("7d", "1m") or _series_has_gap(
+                        fb_rows, now_utc, interval_sec, fb_bucket_sec, check_leading=True
+                    ):
+                        raw_fb_bucket = fb_bucket if rk in ("7d", "1m") else sql_bucket
+                        fb_raw_rows = list(
+                            await conn.fetch(
                                 f"""
-                                SELECT time_bucket('{sql_bucket}', time) AS bucket,
+                                SELECT time_bucket('{raw_fb_bucket}', time) AS bucket,
                                        AVG({clean_raw_in}) AS rx_bps,
                                        AVG({clean_raw_out}) AS tx_bps,
                                        0.0 AS latency_ms
@@ -2857,14 +2916,25 @@ async def _query_overview_traffic_series(
                                 ORDER BY bucket ASC
                                 """,
                                 gw_ip_str,
-                                int(wan_if_index),
+                                wan_if_int,
                             )
+                        )
                         if fb_rows:
-                            wan_history = _merge_traffic_gap_buckets(
-                                [dict(r) for r in wan_history],
-                                [dict(r) for r in fb_rows],
-                                bucket_sec,
-                            )
+                            if fb_raw_rows:
+                                fb_rows = _merge_traffic_gap_buckets(
+                                    [dict(r) for r in fb_rows],
+                                    [dict(r) for r in fb_raw_rows],
+                                    fb_bucket_sec,
+                                )
+                        else:
+                            fb_rows = fb_raw_rows
+
+                    if fb_rows:
+                        wan_history = _merge_traffic_gap_buckets(
+                            [dict(r) for r in wan_history],
+                            [dict(r) for r in fb_rows],
+                            bucket_sec,
+                        )
 
         # Fallback: aggregate SNMP traffic across all non-loopback interfaces
         if not wan_history:
@@ -2891,7 +2961,7 @@ async def _query_overview_traffic_series(
                                SUM(if_tx) AS tx_bps,
                                0.0 AS latency_ms
                         FROM (
-                            SELECT time_bucket('4 hours', bucket) AS bucket,
+                            SELECT time_bucket('2 hours', bucket) AS bucket,
                                    device_ip,
                                    if_index,
                                    AVG({clean_avg_in}) AS if_rx,
@@ -2906,15 +2976,20 @@ async def _query_overview_traffic_series(
                         """
                     )
 
-            if not wan_history:
-                wan_history = await conn.fetch(
+            agg_bucket_sec = 3600 if rk == "7d" else bucket_sec
+            if not wan_history or (
+                rk in ("7d", "1m")
+                and _series_has_gap(wan_history, now_utc, interval_sec, agg_bucket_sec, check_leading=True)
+            ):
+                raw_bucket = "1 hour" if (rk == "7d" and wan_history) else sql_bucket
+                raw_rows = await conn.fetch(
                     f"""
                     SELECT bucket,
                            SUM(if_rx) AS rx_bps,
                            SUM(if_tx) AS tx_bps,
                            0.0 AS latency_ms
                     FROM (
-                        SELECT time_bucket('{sql_bucket}', time) AS bucket,
+                        SELECT time_bucket('{raw_bucket}', time) AS bucket,
                                device_ip,
                                if_index,
                                AVG({clean_raw_in}) AS if_rx,
@@ -2928,6 +3003,15 @@ async def _query_overview_traffic_series(
                     ORDER BY bucket ASC
                     """
                 )
+                if wan_history:
+                    if raw_rows:
+                        wan_history = _merge_traffic_gap_buckets(
+                            [dict(r) for r in wan_history],
+                            [dict(r) for r in raw_rows],
+                            agg_bucket_sec,
+                        )
+                else:
+                    wan_history = raw_rows
 
     series = [
         {

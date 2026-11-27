@@ -3619,6 +3619,7 @@ export const App: React.FC = () => {
     Array<{ time: string; rx_bps: number; tx_bps: number; latency_ms: number }>
   >([]);
   const [loadingOverviewRange, setLoadingOverviewRange] = useState(false);
+  const overviewTrafficReqIdRef = useRef<number>(0);
   const [interfaces, setInterfaces] = useState<SNMPInterface[]>([]);
   const [snmpTelemetry, setSnmpTelemetry] = useState<SNMPTelemetryPayload | null>(null);
   const [snmpTelemetryRange, setSnmpTelemetryRange] = useState<"1h" | "6h" | "24h" | "7d" | "30d">(
@@ -5071,17 +5072,20 @@ export const App: React.FC = () => {
     rk: Exclude<OverviewRangeKey, "live">,
     showLoading = false,
   ) => {
+    const reqId = ++overviewTrafficReqIdRef.current;
     if (showLoading) setLoadingOverviewRange(true);
     try {
       const r = await fetch(`/api/overview/traffic?range=${encodeURIComponent(rk)}`);
-      if (r.ok) {
+      if (r.ok && reqId === overviewTrafficReqIdRef.current) {
         const data = await r.json();
         setOverviewHistorySeries(data.series || []);
       }
     } catch {
       // ignore
     } finally {
-      if (showLoading) setLoadingOverviewRange(false);
+      if (showLoading && reqId === overviewTrafficReqIdRef.current) {
+        setLoadingOverviewRange(false);
+      }
     }
   };
 
