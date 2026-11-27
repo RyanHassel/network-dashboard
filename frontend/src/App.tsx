@@ -46,13 +46,12 @@ import {
   Zap,
 } from "lucide-react";
 
-type TabKey = "pulse" | "devices" | "snmp" | "scanner" | "syslog" | "targets" | "settings";
+type TabKey = "pulse" | "devices" | "snmp" | "syslog" | "targets" | "settings";
 
 const TAB_PATHS: Record<TabKey, string> = {
   pulse: "/",
   devices: "/devices",
   snmp: "/snmp",
-  scanner: "/scanner",
   syslog: "/syslog",
   targets: "/targets",
   settings: "/settings",
@@ -86,7 +85,9 @@ function parseAppRoute(pathname: string): {
     }
   }
   if (clean === "/snmp") return { tab: "snmp", deviceRef: null, deviceSettings: false };
-  if (clean === "/scanner") return { tab: "scanner", deviceRef: null, deviceSettings: false };
+  if (clean === "/scanner" || clean === "/settings/scanner") {
+    return { tab: "settings", deviceRef: null, deviceSettings: false };
+  }
   if (clean === "/syslog") return { tab: "syslog", deviceRef: null, deviceSettings: false };
   if (clean === "/targets") return { tab: "targets", deviceRef: null, deviceSettings: false };
   if (clean === "/settings") return { tab: "settings", deviceRef: null, deviceSettings: false };
@@ -3440,7 +3441,7 @@ export const App: React.FC = () => {
   const [deviceSearch, setDeviceSearch] = useState("");
   const [deviceFilter, setDeviceFilter] = useState<"all" | "online" | "snmp" | "clients">("all");
   const [deviceRoleFilter, setDeviceRoleFilter] = useState<string>("all");
-  const [hoveredNavTab, setHoveredNavTab] = useState<Exclude<TabKey, "settings"> | null>(null);
+  const [hoveredNavTab, setHoveredNavTab] = useState<TabKey | null>(null);
   const addDeviceDialogRef = useRef<HTMLDialogElement | null>(null);
   const [addDeviceOpen, setAddDeviceOpen] = useState(false);
   const [addDeviceMode, setAddDeviceMode] = useState<"snmp" | "icmp">("snmp");
@@ -4183,6 +4184,19 @@ export const App: React.FC = () => {
 
   const navigateToTab = (tab: TabKey) => {
     navigateToPath(TAB_PATHS[tab]);
+  };
+
+  const openSettingsSection = (sectionId?: string) => {
+    setHoveredNavTab(null);
+    navigateToTab("settings");
+    if (sectionId) {
+      window.setTimeout(() => {
+        document.getElementById(sectionId)?.scrollIntoView({
+          behavior: "smooth",
+          block: "start",
+        });
+      }, 60);
+    }
   };
 
   const toggleOverviewScaleMode = () => {
@@ -5250,9 +5264,11 @@ export const App: React.FC = () => {
         fetchInterfaces();
         fetchSnmpTelemetry(snmpTelemetryRange);
       }
-      if (activeTab === "scanner") fetchScanner();
       if (activeTab === "syslog") fetchLogs();
-      if (activeTab === "settings") fetchServerInfo(false);
+      if (activeTab === "settings") {
+        fetchServerInfo(false);
+        fetchScanner();
+      }
     }, 10000);
 
     const updateTimer = setInterval(() => {
@@ -5355,6 +5371,17 @@ export const App: React.FC = () => {
     if (activeTab === "settings") {
       fetchOverviewGraphOptions();
       fetchServerInfo(false);
+      fetchScanner();
+      const cleanPath =
+        (typeof window !== "undefined" ? window.location.pathname : "").replace(/\/+$/, "") || "/";
+      if (cleanPath === "/scanner" || cleanPath === "/settings/scanner") {
+        window.setTimeout(() => {
+          document.getElementById("settings-subnet-scanner")?.scrollIntoView({
+            behavior: "smooth",
+            block: "start",
+          });
+        }, 80);
+      }
     }
   }, [activeTab]);
 
@@ -5440,7 +5467,6 @@ export const App: React.FC = () => {
       pulse: "NetDash — Overview",
       devices: "NetDash — Devices",
       snmp: "NetDash — SNMP Trends & Ports",
-      scanner: "NetDash — Subnet Scanner Matrix",
       syslog: "NetDash — Live Syslog Stream",
       targets: "NetDash — Targets & SNMP",
       settings: "NetDash — Settings",
@@ -6127,16 +6153,6 @@ export const App: React.FC = () => {
       iconInactiveClass: "text-slate-500 group-hover:text-violet-400",
     },
     {
-      id: "scanner",
-      label: "Subnet Scanner Matrix",
-      icon: Network,
-      activeClass: "border-amber-500/60 bg-amber-500/15 text-amber-100 shadow-xs",
-      inactiveClass:
-        "border-slate-800 bg-[#111827] text-slate-400 hover:border-amber-500/50 hover:bg-amber-500/10 hover:text-amber-200",
-      iconActiveClass: "text-amber-400",
-      iconInactiveClass: "text-slate-500 group-hover:text-amber-400",
-    },
-    {
       id: "syslog",
       label: "Live Syslog Stream",
       icon: Terminal,
@@ -6377,45 +6393,193 @@ export const App: React.FC = () => {
 
           {/* Right Status & Settings Controls (always locked to top-right corner) */}
           <div className="flex shrink-0 items-center gap-2">
-            <a
-              href="/settings"
-              onClick={(e) => {
-                if (isModifiedClick(e)) return;
-                e.preventDefault();
-                navigateToTab("settings");
+            <div
+              className="relative"
+              onMouseEnter={() => setHoveredNavTab("settings")}
+              onMouseLeave={() => setHoveredNavTab((cur) => (cur === "settings" ? null : cur))}
+              onFocus={() => setHoveredNavTab("settings")}
+              onBlur={(e) => {
+                if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+                  setHoveredNavTab((cur) => (cur === "settings" ? null : cur));
+                }
               }}
-              aria-current={activeTab === "settings" ? "page" : undefined}
-              className={`group relative flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition ${
-                updateInfo?.update_available && !installingUpdate
-                  ? activeTab === "settings"
-                    ? "border-amber-400/70 bg-amber-500/25 text-amber-200"
-                    : "border-amber-500/50 bg-amber-500/15 text-amber-300 hover:border-amber-400/70 hover:bg-amber-500/25 hover:text-amber-200"
-                  : activeTab === "settings"
-                    ? "border-indigo-500/60 bg-indigo-500/15 text-indigo-100"
-                    : "border-slate-800 bg-[#111827] text-slate-300 hover:border-indigo-500/50 hover:bg-indigo-500/10 hover:text-indigo-200"
-              }`}
-              title={
-                updateInfo?.update_available && !installingUpdate
-                  ? `Update available (${updateInfo.commits_behind} commit${
-                      updateInfo.commits_behind === 1 ? "" : "s"
-                    }) — Open Settings`
-                  : "Server Information, Updates & Background Services"
-              }
             >
-              <Settings
-                className={`h-3.5 w-3.5 transition-colors ${
+              <a
+                href="/settings"
+                onClick={(e) => {
+                  if (isModifiedClick(e)) return;
+                  e.preventDefault();
+                  openSettingsSection();
+                }}
+                aria-current={activeTab === "settings" ? "page" : undefined}
+                aria-haspopup="menu"
+                aria-expanded={hoveredNavTab === "settings"}
+                className={`group relative flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition ${
                   updateInfo?.update_available && !installingUpdate
-                    ? "text-amber-300"
+                    ? activeTab === "settings"
+                      ? "border-amber-400/70 bg-amber-500/25 text-amber-200"
+                      : "border-amber-500/50 bg-amber-500/15 text-amber-300 hover:border-amber-400/70 hover:bg-amber-500/25 hover:text-amber-200"
                     : activeTab === "settings"
-                      ? "text-indigo-400"
-                      : "text-slate-400 group-hover:text-indigo-400"
+                      ? "border-indigo-500/60 bg-indigo-500/15 text-indigo-100"
+                      : "border-slate-800 bg-[#111827] text-slate-300 hover:border-indigo-500/50 hover:bg-indigo-500/10 hover:text-indigo-200"
                 }`}
-              />
-              <span>Settings</span>
-              {updateInfo?.update_available && !installingUpdate && (
-                <DownloadCloud className="h-3.5 w-3.5 shrink-0 text-amber-300" />
+                title={
+                  updateInfo?.update_available && !installingUpdate
+                    ? `Update available (${updateInfo.commits_behind} commit${
+                        updateInfo.commits_behind === 1 ? "" : "s"
+                      }) — Open Settings`
+                    : "Server Information, Updates, Subnet Scanner & Background Services"
+                }
+              >
+                <Settings
+                  className={`h-3.5 w-3.5 transition-colors ${
+                    updateInfo?.update_available && !installingUpdate
+                      ? "text-amber-300"
+                      : activeTab === "settings"
+                        ? "text-indigo-400"
+                        : "text-slate-400 group-hover:text-indigo-400"
+                  }`}
+                />
+                <span>Settings</span>
+                {updateInfo?.update_available && !installingUpdate && (
+                  <DownloadCloud className="h-3.5 w-3.5 shrink-0 text-amber-300" />
+                )}
+                <ChevronDown
+                  className={`h-3 w-3 opacity-60 transition-transform duration-150 ${
+                    hoveredNavTab === "settings" ? "rotate-180 opacity-100" : ""
+                  }`}
+                />
+              </a>
+
+              {hoveredNavTab === "settings" && (
+                <div className="absolute right-0 top-full z-50 pt-1.5">
+                  <div
+                    role="menu"
+                    className="w-64 rounded-xl border border-slate-700/90 bg-[#111827] p-2 text-xs text-slate-200 shadow-2xl shadow-black/60 backdrop-blur-md"
+                  >
+                    <div className="space-y-0.5">
+                      <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                        Settings Sections
+                      </div>
+                      {[
+                        {
+                          id: "settings-updates",
+                          label: "Server Software Updates",
+                          icon: DownloadCloud,
+                          accent: "text-emerald-400",
+                        },
+                        {
+                          id: "settings-isp",
+                          label: "ISP Speed",
+                          icon: Activity,
+                          accent: "text-emerald-400",
+                        },
+                        {
+                          id: "settings-overview-graph",
+                          label: "Overview Graph Source",
+                          icon: Network,
+                          accent: "text-sky-400",
+                        },
+                        {
+                          id: "settings-subnet-scanner",
+                          label: "Subnet Scanner Matrix",
+                          icon: Network,
+                          accent: "text-amber-400",
+                          badge: String(subnets.length),
+                        },
+                        {
+                          id: "settings-services",
+                          label: "Background Services",
+                          icon: Server,
+                          accent: "text-sky-400",
+                        },
+                        {
+                          id: "settings-server-info",
+                          label: "Server Information",
+                          icon: Cpu,
+                          accent: "text-emerald-400",
+                        },
+                      ].map((sec) => {
+                        const SecIcon = sec.icon;
+                        return (
+                          <button
+                            key={sec.id}
+                            type="button"
+                            role="menuitem"
+                            onClick={() => openSettingsSection(sec.id)}
+                            className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-slate-300 transition hover:bg-slate-800/90 hover:text-white"
+                          >
+                            <span className="flex items-center gap-2">
+                              <SecIcon className={`h-3.5 w-3.5 ${sec.accent}`} />
+                              <span>{sec.label}</span>
+                            </span>
+                            {sec.badge !== undefined && (
+                              <span className="font-mono-tabular text-[11px] text-slate-400">
+                                {sec.badge}
+                              </span>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="mt-1.5 space-y-0.5 border-t border-slate-800/90 pt-1.5">
+                      <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                        Subnet Scanner Quick Scope
+                      </div>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setSelectedSubnet("");
+                          openSettingsSection("settings-subnet-scanner");
+                        }}
+                        className={`flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left transition ${
+                          activeTab === "settings" && !selectedSubnet
+                            ? "bg-amber-500/20 font-semibold text-amber-200"
+                            : "text-slate-300 hover:bg-slate-800/90 hover:text-white"
+                        }`}
+                      >
+                        <span>All Subnets</span>
+                        <span className="font-mono-tabular text-[11px] text-slate-400">
+                          {subnets.length}
+                        </span>
+                      </button>
+                      {subnets.slice(0, 6).map((cidr) => (
+                        <button
+                          key={cidr}
+                          type="button"
+                          role="menuitem"
+                          onClick={() => {
+                            setSelectedSubnet(cidr);
+                            openSettingsSection("settings-subnet-scanner");
+                          }}
+                          className={`flex w-full items-center rounded-md px-2 py-1.5 text-left font-mono-tabular text-[11px] transition ${
+                            activeTab === "settings" && selectedSubnet === cidr
+                              ? "bg-amber-500/20 font-semibold text-amber-200"
+                              : "text-slate-300 hover:bg-slate-800/90 hover:text-white"
+                          }`}
+                        >
+                          {cidr}
+                        </button>
+                      ))}
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          triggerScanNow();
+                          openSettingsSection("settings-subnet-scanner");
+                        }}
+                        className="mt-1 flex w-full items-center gap-2 rounded-md border-t border-slate-800/80 px-2 pt-2 pb-1 text-left text-amber-300 transition hover:bg-slate-800/90"
+                      >
+                        <RefreshCw className="h-3.5 w-3.5" />
+                        <span>Run Subnet Scan Now</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
               )}
-            </a>
+            </div>
 
             <div className="flex items-center gap-1.5 rounded-md border border-slate-800 bg-[#111827] px-2.5 py-1.5 text-xs">
               <span
@@ -6737,66 +6901,6 @@ export const App: React.FC = () => {
                                 >
                                   <RefreshCw className="h-3.5 w-3.5" />
                                   <span>Poll All SNMP Now</span>
-                                </button>
-                              </div>
-                            </div>
-                          )}
-
-                          {tab.id === "scanner" && (
-                            <div className="space-y-1">
-                              <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                                Subnet Scope
-                              </div>
-                              <button
-                                type="button"
-                                role="menuitem"
-                                onClick={() => {
-                                  setSelectedSubnet("");
-                                  setHoveredNavTab(null);
-                                  navigateToTab("scanner");
-                                }}
-                                className={`flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left transition ${
-                                  activeTab === "scanner" && !selectedSubnet
-                                    ? "bg-amber-500/20 font-semibold text-amber-200"
-                                    : "text-slate-300 hover:bg-slate-800/90 hover:text-white"
-                                }`}
-                              >
-                                <span>All Subnets</span>
-                                <span className="font-mono-tabular text-[11px] text-slate-400">
-                                  {subnets.length}
-                                </span>
-                              </button>
-                              {subnets.slice(0, 8).map((cidr) => (
-                                <button
-                                  key={cidr}
-                                  type="button"
-                                  role="menuitem"
-                                  onClick={() => {
-                                    setSelectedSubnet(cidr);
-                                    setHoveredNavTab(null);
-                                    navigateToTab("scanner");
-                                  }}
-                                  className={`flex w-full items-center rounded-md px-2 py-1.5 text-left font-mono-tabular text-[11px] transition ${
-                                    activeTab === "scanner" && selectedSubnet === cidr
-                                      ? "bg-amber-500/20 font-semibold text-amber-200"
-                                      : "text-slate-300 hover:bg-slate-800/90 hover:text-white"
-                                  }`}
-                                >
-                                  {cidr}
-                                </button>
-                              ))}
-                              <div className="border-t border-slate-800/90 pt-1">
-                                <button
-                                  type="button"
-                                  role="menuitem"
-                                  onClick={() => {
-                                    setHoveredNavTab(null);
-                                    triggerScanNow();
-                                  }}
-                                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-amber-300 transition hover:bg-slate-800/90"
-                                >
-                                  <RefreshCw className="h-3.5 w-3.5" />
-                                  <span>Run Subnet Scan Now</span>
                                 </button>
                               </div>
                             </div>
@@ -12695,175 +12799,6 @@ export const App: React.FC = () => {
           </div>
         )}
 
-        {/* ==================== VIEW 4: SUBNET SCANNER MATRIX ==================== */}
-        {activeTab === "scanner" && (
-          <div className="space-y-6">
-            <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-800 bg-[#111827] p-4">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-xs text-slate-400">Subnets:</span>
-                {subnets.map((cidr) => (
-                  <button
-                    key={cidr}
-                    onClick={() => setSelectedSubnet(cidr)}
-                    className={`rounded-md px-3 py-1.5 font-mono-tabular text-xs font-medium transition ${
-                      selectedSubnet === cidr
-                        ? "bg-emerald-600 text-white"
-                        : "border border-slate-800 bg-[#090D16] text-slate-300 hover:text-white"
-                    }`}
-                  >
-                    {cidr}
-                  </button>
-                ))}
-                <a
-                  href="/targets"
-                  onClick={(e) => {
-                    if (isModifiedClick(e)) return;
-                    e.preventDefault();
-                    navigateToTab("targets");
-                  }}
-                  className="flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-2.5 py-1.5 text-xs font-medium text-emerald-400 hover:bg-slate-700"
-                >
-                  <Plus className="h-3.5 w-3.5" /> Add / Manage Subnets
-                </a>
-              </div>
-
-              <button
-                onClick={triggerScanNow}
-                disabled={scanningNow || subnets.length === 0}
-                className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
-              >
-                <Play className="h-3.5 w-3.5" />
-                <span>{scanningNow ? "Scanning Subnets..." : "Trigger Nmap Sweep Now"}</span>
-              </button>
-            </div>
-
-            {selectedSubnet && selectedSubnet.endsWith("/24") && (
-              <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
-                <div className="mb-3 flex items-center justify-between">
-                  <h3 className="text-sm font-semibold text-white">
-                    /24 IP Occupancy Grid ({selectedSubnet}) — Click Any Active IP for Details
-                  </h3>
-                  <div className="flex items-center gap-4 text-xs text-slate-400">
-                    <span className="flex items-center gap-1.5">
-                      <span className="h-2.5 w-2.5 rounded-xs bg-emerald-500" /> Online
-                    </span>
-                    <span className="flex items-center gap-1.5">
-                      <span className="h-2.5 w-2.5 rounded-xs bg-amber-500/60" /> Historical /
-                      Offline
-                    </span>
-                    <span className="flex items-center gap-1.5">
-                      <span className="h-2.5 w-2.5 rounded-xs bg-slate-800" /> Unused
-                    </span>
-                  </div>
-                </div>
-                <div className="grid grid-cols-16 gap-1 sm:grid-cols-32">
-                  {Array.from({ length: 254 }, (_, i) => i + 1).map((octet) => {
-                    const prefix = selectedSubnet
-                      .split("/")[0]
-                      .split(".")
-                      .slice(0, 3)
-                      .join(".");
-                    const fullIp = `${prefix}.${octet}`;
-                    const match = filteredHosts.find((h) => h.ip_address === fullIp);
-                    const bgClass = match
-                      ? match.is_online
-                        ? "bg-emerald-500 text-slate-950 font-semibold cursor-pointer hover:ring-2 hover:ring-white"
-                        : "bg-amber-500/40 text-amber-200 cursor-pointer"
-                      : "bg-[#090D16] text-slate-600 border border-slate-800/70";
-                    return match ? (
-                      <a
-                        key={octet}
-                        href={getDeviceHref(fullIp, match.device_id)}
-                        onClick={(e) => {
-                          if (isModifiedClick(e)) return;
-                          e.preventDefault();
-                          openDevicePage(fullIp, match.device_id);
-                        }}
-                        title={`${fullIp} • ${match.hostname || "host"} (${match.mac_address || "no MAC"})`}
-                        className={`flex h-6 items-center justify-center rounded-xs font-mono-tabular text-[10px] ${bgClass}`}
-                      >
-                        .{octet}
-                      </a>
-                    ) : (
-                      <div
-                        key={octet}
-                        title={`${fullIp} (Unused)`}
-                        className={`flex h-6 items-center justify-center rounded-xs font-mono-tabular text-[10px] ${bgClass}`}
-                      >
-                        .{octet}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-
-            <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
-              <h3 className="mb-3 text-sm font-semibold text-white">
-                Discovered Hosts ({filteredHosts.length}) — Click Any Host to Open Device Page
-              </h3>
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-xs">
-                  <thead>
-                    <tr className="border-b border-slate-800 text-slate-400">
-                      <th className="pb-2 font-medium">IPv4 Address</th>
-                      <th className="pb-2 font-medium">Hostname</th>
-                      <th className="pb-2 font-medium">MAC Address</th>
-                      <th className="pb-2 font-medium">OUI Vendor</th>
-                      <th className="pb-2 font-medium">VLAN / Port</th>
-                      <th className="pb-2 font-medium">Source</th>
-                      <th className="pb-2 text-right font-medium">Status</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-800/60 font-mono-tabular">
-                    {filteredHosts.map((h) => (
-                      <tr
-                        key={h.ip_address}
-                        onClick={() => openDevicePage(h.ip_address, h.device_id)}
-                        className="cursor-pointer hover:bg-slate-800/40"
-                      >
-                        <td className="py-2.5 font-semibold text-emerald-400 underline">
-                          <a
-                            href={getDeviceHref(h.ip_address, h.device_id)}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              if (isModifiedClick(e)) return;
-                              e.preventDefault();
-                              openDevicePage(h.ip_address, h.device_id);
-                            }}
-                            className="hover:text-emerald-300"
-                          >
-                            {h.ip_address}
-                          </a>
-                        </td>
-                        <td className="py-2.5 font-sans text-slate-200">{h.hostname || "—"}</td>
-                        <td className="py-2.5 text-slate-300">{h.mac_address || "—"}</td>
-                        <td className="py-2.5 font-sans text-slate-400">{h.vendor || "—"}</td>
-                        <td className="py-2.5 text-slate-400">
-                          {h.vlan_id ? `VLAN ${h.vlan_id}` : "—"}
-                          {h.switch_port ? ` (Port #${h.switch_port})` : ""}
-                        </td>
-                        <td className="py-2.5 text-slate-400">{h.discovery_source}</td>
-                        <td className="py-2.5 text-right">
-                          <span
-                            className={`inline-block rounded px-1.5 py-0.5 text-[11px] ${
-                              h.is_online
-                                ? "bg-emerald-500/15 text-emerald-400"
-                                : "bg-slate-800 text-slate-400"
-                            }`}
-                          >
-                            {h.is_online ? "ONLINE" : "OFFLINE"}
-                          </span>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        )}
-
         {/* ==================== VIEW 5: LIVE SYSLOG STREAM ==================== */}
         {activeTab === "syslog" && (
           <div className="space-y-4">
@@ -13852,19 +13787,51 @@ export const App: React.FC = () => {
                     Server Settings & System Status
                   </h2>
                   <p className="text-xs text-slate-400">
-                    Server hardware & runtime information, software updates, and background service
-                    health & versions.
+                    Server hardware & runtime information, software updates, subnet scanner
+                    matrix, and background service health & versions.
                   </p>
                 </div>
               </div>
               <button
-                onClick={() => fetchServerInfo(true)}
+                onClick={() => {
+                  fetchServerInfo(true);
+                  fetchScanner();
+                }}
                 disabled={loadingServerInfo}
                 className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-[#090D16] px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800 disabled:opacity-50"
               >
                 <RefreshCw className={`h-3.5 w-3.5 ${loadingServerInfo ? "animate-spin" : ""}`} />
                 <span>{loadingServerInfo ? "Refreshing..." : "Refresh Status"}</span>
               </button>
+            </div>
+
+            {/* Settings Section Jump Bar */}
+            <div className="flex flex-wrap items-center gap-2 rounded-xl border border-slate-800 bg-[#111827]/80 px-4 py-2.5 text-xs">
+              <span className="mr-1 text-[11px] font-medium uppercase tracking-wider text-slate-500">
+                Sections:
+              </span>
+              {[
+                { id: "settings-updates", label: "Software Updates" },
+                { id: "settings-isp", label: "ISP Speed" },
+                { id: "settings-overview-graph", label: "Overview Graph" },
+                { id: "settings-subnet-scanner", label: "Subnet Scanner Matrix" },
+                { id: "settings-services", label: "Background Services" },
+                { id: "settings-server-info", label: "Server Info" },
+              ].map((sec) => (
+                <button
+                  key={sec.id}
+                  type="button"
+                  onClick={() =>
+                    document.getElementById(sec.id)?.scrollIntoView({
+                      behavior: "smooth",
+                      block: "start",
+                    })
+                  }
+                  className="rounded-md border border-slate-700/80 bg-[#090D16] px-2.5 py-1 font-medium text-slate-300 transition hover:border-slate-600 hover:bg-slate-800 hover:text-white"
+                >
+                  {sec.label}
+                </button>
+              ))}
             </div>
 
             {settingsFeedback && (
@@ -13883,7 +13850,10 @@ export const App: React.FC = () => {
             )}
 
             {/* 1. Software Updates Panel */}
-            <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+            <div
+              id="settings-updates"
+              className="scroll-mt-24 rounded-xl border border-slate-800 bg-[#111827] p-5"
+            >
               <div className="flex flex-wrap items-start justify-between gap-4">
                 <div>
                   <div className="flex flex-wrap items-center gap-2.5">
@@ -14003,7 +13973,10 @@ export const App: React.FC = () => {
             </div>
 
             {/* 2. Internet Service Provider (ISP) Speed */}
-            <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+            <div
+              id="settings-isp"
+              className="scroll-mt-24 rounded-xl border border-slate-800 bg-[#111827] p-5"
+            >
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
                   <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
@@ -14102,7 +14075,10 @@ export const App: React.FC = () => {
             </div>
 
             {/* 2b. Overview Dashboard Graph Source Selector */}
-            <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+            <div
+              id="settings-overview-graph"
+              className="scroll-mt-24 rounded-xl border border-slate-800 bg-[#111827] p-5"
+            >
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
                   <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
@@ -14548,8 +14524,217 @@ export const App: React.FC = () => {
               </div>
             </div>
 
+            {/* 2c. Subnet Scanner Matrix */}
+            <div
+              id="settings-subnet-scanner"
+              className="scroll-mt-24 space-y-5 rounded-xl border border-slate-800 bg-[#111827] p-5"
+            >
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div>
+                  <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
+                    <Network className="h-4 w-4 text-amber-400" />
+                    Subnet Scanner Matrix
+                  </h3>
+                  <p className="mt-0.5 text-xs text-slate-400">
+                    View allowed-CIDR IP occupancy matrices, MAC/OUI vendor correlations, and
+                    trigger immediate Nmap subnet sweeps.
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="rounded border border-slate-700 bg-[#090D16] px-2.5 py-1 font-mono-tabular text-xs text-amber-300">
+                    {filteredHosts.filter((h) => h.is_online).length} online / {filteredHosts.length}{" "}
+                    total
+                  </span>
+                  <button
+                    onClick={triggerScanNow}
+                    disabled={scanningNow || subnets.length === 0}
+                    className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
+                  >
+                    <Play className="h-3.5 w-3.5" />
+                    <span>{scanningNow ? "Scanning Subnets..." : "Trigger Nmap Sweep Now"}</span>
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-800 bg-[#090D16] p-3">
+                <span className="text-xs text-slate-400">Subnets:</span>
+                <button
+                  type="button"
+                  onClick={() => setSelectedSubnet("")}
+                  className={`rounded-md px-3 py-1.5 font-mono-tabular text-xs font-medium transition ${
+                    !selectedSubnet
+                      ? "bg-emerald-600 text-white"
+                      : "border border-slate-800 bg-[#111827] text-slate-300 hover:text-white"
+                  }`}
+                >
+                  All Subnets ({subnets.length})
+                </button>
+                {subnets.map((cidr) => (
+                  <button
+                    key={cidr}
+                    type="button"
+                    onClick={() => setSelectedSubnet(cidr)}
+                    className={`rounded-md px-3 py-1.5 font-mono-tabular text-xs font-medium transition ${
+                      selectedSubnet === cidr
+                        ? "bg-emerald-600 text-white"
+                        : "border border-slate-800 bg-[#111827] text-slate-300 hover:text-white"
+                    }`}
+                  >
+                    {cidr}
+                  </button>
+                ))}
+                <a
+                  href="/targets"
+                  onClick={(e) => {
+                    if (isModifiedClick(e)) return;
+                    e.preventDefault();
+                    navigateToTab("targets");
+                  }}
+                  className="flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800 px-2.5 py-1.5 text-xs font-medium text-emerald-400 hover:bg-slate-700"
+                >
+                  <Plus className="h-3.5 w-3.5" /> Add / Manage Subnets
+                </a>
+              </div>
+
+              {selectedSubnet && selectedSubnet.endsWith("/24") && (
+                <div className="rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                    <h4 className="text-xs font-semibold text-white">
+                      /24 IP Occupancy Grid ({selectedSubnet}) — Click Any Active IP for Details
+                    </h4>
+                    <div className="flex items-center gap-4 text-xs text-slate-400">
+                      <span className="flex items-center gap-1.5">
+                        <span className="h-2.5 w-2.5 rounded-xs bg-emerald-500" /> Online
+                      </span>
+                      <span className="flex items-center gap-1.5">
+                        <span className="h-2.5 w-2.5 rounded-xs bg-amber-500/60" /> Historical /
+                        Offline
+                      </span>
+                      <span className="flex items-center gap-1.5">
+                        <span className="h-2.5 w-2.5 rounded-xs bg-slate-800" /> Unused
+                      </span>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-16 gap-1 sm:grid-cols-32">
+                    {Array.from({ length: 254 }, (_, i) => i + 1).map((octet) => {
+                      const prefix = selectedSubnet
+                        .split("/")[0]
+                        .split(".")
+                        .slice(0, 3)
+                        .join(".");
+                      const fullIp = `${prefix}.${octet}`;
+                      const match = filteredHosts.find((h) => h.ip_address === fullIp);
+                      const bgClass = match
+                        ? match.is_online
+                          ? "bg-emerald-500 text-slate-950 font-semibold cursor-pointer hover:ring-2 hover:ring-white"
+                          : "bg-amber-500/40 text-amber-200 cursor-pointer"
+                        : "bg-[#111827] text-slate-600 border border-slate-800/70";
+                      return match ? (
+                        <a
+                          key={octet}
+                          href={getDeviceHref(fullIp, match.device_id)}
+                          onClick={(e) => {
+                            if (isModifiedClick(e)) return;
+                            e.preventDefault();
+                            openDevicePage(fullIp, match.device_id);
+                          }}
+                          title={`${fullIp} • ${match.hostname || "host"} (${match.mac_address || "no MAC"})`}
+                          className={`flex h-6 items-center justify-center rounded-xs font-mono-tabular text-[10px] ${bgClass}`}
+                        >
+                          .{octet}
+                        </a>
+                      ) : (
+                        <div
+                          key={octet}
+                          title={`${fullIp} (Unused)`}
+                          className={`flex h-6 items-center justify-center rounded-xs font-mono-tabular text-[10px] ${bgClass}`}
+                        >
+                          .{octet}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              <div className="rounded-lg border border-slate-800 bg-[#090D16] p-4">
+                <h4 className="mb-3 text-xs font-semibold text-white">
+                  Discovered Hosts ({filteredHosts.length}) — Click Any Host to Open Device Page
+                </h4>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="border-b border-slate-800 text-slate-400">
+                        <th className="pb-2 font-medium">IPv4 Address</th>
+                        <th className="pb-2 font-medium">Hostname</th>
+                        <th className="pb-2 font-medium">MAC Address</th>
+                        <th className="pb-2 font-medium">OUI Vendor</th>
+                        <th className="pb-2 font-medium">VLAN / Port</th>
+                        <th className="pb-2 font-medium">Source</th>
+                        <th className="pb-2 text-right font-medium">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/60 font-mono-tabular">
+                      {filteredHosts.length === 0 ? (
+                        <tr>
+                          <td colSpan={7} className="py-6 text-center font-sans text-slate-500">
+                            No hosts recorded for the selected subnet filter yet.
+                          </td>
+                        </tr>
+                      ) : (
+                        filteredHosts.map((h) => (
+                          <tr
+                            key={h.ip_address}
+                            onClick={() => openDevicePage(h.ip_address, h.device_id)}
+                            className="cursor-pointer hover:bg-slate-800/40"
+                          >
+                            <td className="py-2.5 font-semibold text-emerald-400 underline">
+                              <a
+                                href={getDeviceHref(h.ip_address, h.device_id)}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (isModifiedClick(e)) return;
+                                  e.preventDefault();
+                                  openDevicePage(h.ip_address, h.device_id);
+                                }}
+                                className="hover:text-emerald-300"
+                              >
+                                {h.ip_address}
+                              </a>
+                            </td>
+                            <td className="py-2.5 font-sans text-slate-200">{h.hostname || "—"}</td>
+                            <td className="py-2.5 text-slate-300">{h.mac_address || "—"}</td>
+                            <td className="py-2.5 font-sans text-slate-400">{h.vendor || "—"}</td>
+                            <td className="py-2.5 text-slate-400">
+                              {h.vlan_id ? `VLAN ${h.vlan_id}` : "—"}
+                              {h.switch_port ? ` (Port #${h.switch_port})` : ""}
+                            </td>
+                            <td className="py-2.5 text-slate-400">{h.discovery_source}</td>
+                            <td className="py-2.5 text-right">
+                              <span
+                                className={`inline-block rounded px-1.5 py-0.5 text-[11px] ${
+                                  h.is_online
+                                    ? "bg-emerald-500/15 text-emerald-400"
+                                    : "bg-slate-800 text-slate-400"
+                                }`}
+                              >
+                                {h.is_online ? "ONLINE" : "OFFLINE"}
+                              </span>
+                            </td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
             {/* 3. Background Services & Versions */}
-            <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+            <div
+              id="settings-services"
+              className="scroll-mt-24 rounded-xl border border-slate-800 bg-[#111827] p-5"
+            >
               <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
@@ -14845,7 +15030,10 @@ export const App: React.FC = () => {
             </div>
 
             {/* 3. Server Information & Host Footprint */}
-            <div className="rounded-xl border border-slate-800 bg-[#111827] p-5">
+            <div
+              id="settings-server-info"
+              className="scroll-mt-24 rounded-xl border border-slate-800 bg-[#111827] p-5"
+            >
               <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-white">
                 <Cpu className="h-4 w-4 text-emerald-400" />
                 Server Information & Runtime Environment
