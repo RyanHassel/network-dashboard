@@ -3441,7 +3441,7 @@ export const App: React.FC = () => {
   const [deviceSearch, setDeviceSearch] = useState("");
   const [deviceFilter, setDeviceFilter] = useState<"all" | "online" | "snmp" | "clients">("all");
   const [deviceRoleFilter, setDeviceRoleFilter] = useState<string>("all");
-  const [hoveredNavTab, setHoveredNavTab] = useState<TabKey | null>(null);
+  const [hoveredNavTab, setHoveredNavTab] = useState<Exclude<TabKey, "settings"> | null>(null);
   const addDeviceDialogRef = useRef<HTMLDialogElement | null>(null);
   const [addDeviceOpen, setAddDeviceOpen] = useState(false);
   const [addDeviceMode, setAddDeviceMode] = useState<"snmp" | "icmp">("snmp");
@@ -4185,19 +4185,6 @@ export const App: React.FC = () => {
 
   const navigateToTab = (tab: TabKey) => {
     navigateToPath(TAB_PATHS[tab]);
-  };
-
-  const openSettingsSection = (sectionId?: string) => {
-    setHoveredNavTab(null);
-    navigateToTab("settings");
-    if (sectionId) {
-      window.setTimeout(() => {
-        document.getElementById(sectionId)?.scrollIntoView({
-          behavior: "smooth",
-          block: "start",
-        });
-      }, 60);
-    }
   };
 
   const toggleOverviewScaleMode = () => {
@@ -6397,193 +6384,45 @@ export const App: React.FC = () => {
 
           {/* Right Status & Settings Controls (always locked to top-right corner) */}
           <div className="flex shrink-0 items-center gap-2">
-            <div
-              className="relative"
-              onMouseEnter={() => setHoveredNavTab("settings")}
-              onMouseLeave={() => setHoveredNavTab((cur) => (cur === "settings" ? null : cur))}
-              onFocus={() => setHoveredNavTab("settings")}
-              onBlur={(e) => {
-                if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
-                  setHoveredNavTab((cur) => (cur === "settings" ? null : cur));
-                }
+            <a
+              href="/settings"
+              onClick={(e) => {
+                if (isModifiedClick(e)) return;
+                e.preventDefault();
+                navigateToTab("settings");
               }}
+              aria-current={activeTab === "settings" ? "page" : undefined}
+              className={`group relative flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition ${
+                updateInfo?.update_available && !installingUpdate
+                  ? activeTab === "settings"
+                    ? "border-amber-400/70 bg-amber-500/25 text-amber-200"
+                    : "border-amber-500/50 bg-amber-500/15 text-amber-300 hover:border-amber-400/70 hover:bg-amber-500/25 hover:text-amber-200"
+                  : activeTab === "settings"
+                    ? "border-indigo-500/60 bg-indigo-500/15 text-indigo-100"
+                    : "border-slate-800 bg-[#111827] text-slate-300 hover:border-indigo-500/50 hover:bg-indigo-500/10 hover:text-indigo-200"
+              }`}
+              title={
+                updateInfo?.update_available && !installingUpdate
+                  ? `Update available (${updateInfo.commits_behind} commit${
+                      updateInfo.commits_behind === 1 ? "" : "s"
+                    }) — Open Settings`
+                  : "Server Information, Updates, Subnet Scanner & Background Services"
+              }
             >
-              <a
-                href="/settings"
-                onClick={(e) => {
-                  if (isModifiedClick(e)) return;
-                  e.preventDefault();
-                  openSettingsSection();
-                }}
-                aria-current={activeTab === "settings" ? "page" : undefined}
-                aria-haspopup="menu"
-                aria-expanded={hoveredNavTab === "settings"}
-                className={`group relative flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition ${
+              <Settings
+                className={`h-3.5 w-3.5 transition-colors ${
                   updateInfo?.update_available && !installingUpdate
-                    ? activeTab === "settings"
-                      ? "border-amber-400/70 bg-amber-500/25 text-amber-200"
-                      : "border-amber-500/50 bg-amber-500/15 text-amber-300 hover:border-amber-400/70 hover:bg-amber-500/25 hover:text-amber-200"
+                    ? "text-amber-300"
                     : activeTab === "settings"
-                      ? "border-indigo-500/60 bg-indigo-500/15 text-indigo-100"
-                      : "border-slate-800 bg-[#111827] text-slate-300 hover:border-indigo-500/50 hover:bg-indigo-500/10 hover:text-indigo-200"
+                      ? "text-indigo-400"
+                      : "text-slate-400 group-hover:text-indigo-400"
                 }`}
-                title={
-                  updateInfo?.update_available && !installingUpdate
-                    ? `Update available (${updateInfo.commits_behind} commit${
-                        updateInfo.commits_behind === 1 ? "" : "s"
-                      }) — Open Settings`
-                    : "Server Information, Updates, Subnet Scanner & Background Services"
-                }
-              >
-                <Settings
-                  className={`h-3.5 w-3.5 transition-colors ${
-                    updateInfo?.update_available && !installingUpdate
-                      ? "text-amber-300"
-                      : activeTab === "settings"
-                        ? "text-indigo-400"
-                        : "text-slate-400 group-hover:text-indigo-400"
-                  }`}
-                />
-                <span>Settings</span>
-                {updateInfo?.update_available && !installingUpdate && (
-                  <DownloadCloud className="h-3.5 w-3.5 shrink-0 text-amber-300" />
-                )}
-                <ChevronDown
-                  className={`h-3 w-3 opacity-60 transition-transform duration-150 ${
-                    hoveredNavTab === "settings" ? "rotate-180 opacity-100" : ""
-                  }`}
-                />
-              </a>
-
-              {hoveredNavTab === "settings" && (
-                <div className="absolute right-0 top-full z-50 pt-1.5">
-                  <div
-                    role="menu"
-                    className="w-64 rounded-xl border border-slate-700/90 bg-[#111827] p-2 text-xs text-slate-200 shadow-2xl shadow-black/60 backdrop-blur-md"
-                  >
-                    <div className="space-y-0.5">
-                      <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                        Settings Sections
-                      </div>
-                      {[
-                        {
-                          id: "settings-updates",
-                          label: "Server Software Updates",
-                          icon: DownloadCloud,
-                          accent: "text-emerald-400",
-                        },
-                        {
-                          id: "settings-isp",
-                          label: "ISP Speed",
-                          icon: Activity,
-                          accent: "text-emerald-400",
-                        },
-                        {
-                          id: "settings-overview-graph",
-                          label: "Overview Graph Source",
-                          icon: Network,
-                          accent: "text-sky-400",
-                        },
-                        {
-                          id: "settings-subnet-scanner",
-                          label: "Subnet Scanner Matrix",
-                          icon: Network,
-                          accent: "text-amber-400",
-                          badge: String(subnets.length),
-                        },
-                        {
-                          id: "settings-services",
-                          label: "Background Services",
-                          icon: Server,
-                          accent: "text-sky-400",
-                        },
-                        {
-                          id: "settings-server-info",
-                          label: "Server Information",
-                          icon: Cpu,
-                          accent: "text-emerald-400",
-                        },
-                      ].map((sec) => {
-                        const SecIcon = sec.icon;
-                        return (
-                          <button
-                            key={sec.id}
-                            type="button"
-                            role="menuitem"
-                            onClick={() => openSettingsSection(sec.id)}
-                            className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-slate-300 transition hover:bg-slate-800/90 hover:text-white"
-                          >
-                            <span className="flex items-center gap-2">
-                              <SecIcon className={`h-3.5 w-3.5 ${sec.accent}`} />
-                              <span>{sec.label}</span>
-                            </span>
-                            {sec.badge !== undefined && (
-                              <span className="font-mono-tabular text-[11px] text-slate-400">
-                                {sec.badge}
-                              </span>
-                            )}
-                          </button>
-                        );
-                      })}
-                    </div>
-
-                    <div className="mt-1.5 space-y-0.5 border-t border-slate-800/90 pt-1.5">
-                      <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                        Subnet Scanner Quick Scope
-                      </div>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          setSelectedSubnet("");
-                          openSettingsSection("settings-subnet-scanner");
-                        }}
-                        className={`flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left transition ${
-                          activeTab === "settings" && !selectedSubnet
-                            ? "bg-amber-500/20 font-semibold text-amber-200"
-                            : "text-slate-300 hover:bg-slate-800/90 hover:text-white"
-                        }`}
-                      >
-                        <span>All Subnets</span>
-                        <span className="font-mono-tabular text-[11px] text-slate-400">
-                          {subnets.length}
-                        </span>
-                      </button>
-                      {subnets.slice(0, 6).map((cidr) => (
-                        <button
-                          key={cidr}
-                          type="button"
-                          role="menuitem"
-                          onClick={() => {
-                            setSelectedSubnet(cidr);
-                            openSettingsSection("settings-subnet-scanner");
-                          }}
-                          className={`flex w-full items-center rounded-md px-2 py-1.5 text-left font-mono-tabular text-[11px] transition ${
-                            activeTab === "settings" && selectedSubnet === cidr
-                              ? "bg-amber-500/20 font-semibold text-amber-200"
-                              : "text-slate-300 hover:bg-slate-800/90 hover:text-white"
-                          }`}
-                        >
-                          {cidr}
-                        </button>
-                      ))}
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          triggerScanNow();
-                          openSettingsSection("settings-subnet-scanner");
-                        }}
-                        className="mt-1 flex w-full items-center gap-2 rounded-md border-t border-slate-800/80 px-2 pt-2 pb-1 text-left text-amber-300 transition hover:bg-slate-800/90"
-                      >
-                        <RefreshCw className="h-3.5 w-3.5" />
-                        <span>Run Subnet Scan Now</span>
-                      </button>
-                    </div>
-                  </div>
-                </div>
+              />
+              <span>Settings</span>
+              {updateInfo?.update_available && !installingUpdate && (
+                <DownloadCloud className="h-3.5 w-3.5 shrink-0 text-amber-300" />
               )}
-            </div>
+            </a>
 
             <div className="flex items-center gap-1.5 rounded-md border border-slate-800 bg-[#111827] px-2.5 py-1.5 text-xs">
               <span
