@@ -5269,11 +5269,11 @@ async def get_device_system_history(
                              AND jsonb_typeof(volume_metrics) = 'array'
                              AND jsonb_array_length(volume_metrics) > 0
                        ))[1] AS volume_metrics,
-                       (ARRAY_AGG(cpu_core_metrics ORDER BY time DESC) FILTER (
+                       ARRAY_AGG(cpu_core_metrics ORDER BY time ASC) FILTER (
                            WHERE cpu_core_metrics IS NOT NULL
                              AND jsonb_typeof(cpu_core_metrics) = 'array'
                              AND jsonb_array_length(cpu_core_metrics) > 0
-                       ))[1] AS cpu_core_metrics
+                       ) AS cpu_core_metrics
                 FROM device_system_metrics_raw
                 WHERE device_ip = $1
                   {where_clause}
@@ -5444,21 +5444,42 @@ async def get_device_system_history(
             except Exception:
                 raw_cores = []
         cores_map: Dict[str, float] = {}
-        if isinstance(raw_cores, list):
-            for c in raw_cores:
-                if not isinstance(c, dict):
-                    continue
-                core_lbl = str(c.get("label") or "").strip()
-                if not core_lbl:
-                    core_num = c.get("core")
-                    if core_num is not None:
-                        core_lbl = f"CPU {core_num}"
-                if not core_lbl:
-                    continue
-                if core_lbl not in seen_cores:
-                    seen_cores.add(core_lbl)
-                    available_cores.append(core_lbl)
-                cores_map[core_lbl] = round(float(c.get("usage_pct") or 0.0), 1)
+        if isinstance(raw_cores, list) and raw_cores:
+            # Raw query yields List[dict]; bucketed ARRAY_AGG yields List[List[dict] | str]
+            core_samples: List[List[Dict[str, Any]]] = []
+            if isinstance(raw_cores[0], dict):
+                core_samples = [raw_cores]
+            else:
+                for item in raw_cores:
+                    parsed_item = item
+                    if isinstance(parsed_item, str):
+                        try:
+                            parsed_item = json.loads(parsed_item)
+                        except Exception:
+                            parsed_item = []
+                    if isinstance(parsed_item, list):
+                        core_samples.append(parsed_item)
+            core_acc: Dict[str, List[float]] = {}
+            for sample_list in core_samples:
+                for c in sample_list:
+                    if not isinstance(c, dict):
+                        continue
+                    core_lbl = str(c.get("label") or "").strip()
+                    if not core_lbl:
+                        core_num = c.get("core")
+                        if core_num is not None:
+                            core_lbl = f"CPU {core_num}"
+                    if not core_lbl:
+                        continue
+                    if core_lbl not in seen_cores:
+                        seen_cores.add(core_lbl)
+                        available_cores.append(core_lbl)
+                    acc = core_acc.setdefault(core_lbl, [0.0, 0.0])
+                    acc[0] += float(c.get("usage_pct") or 0.0)
+                    acc[1] += 1.0
+            for core_lbl, (tot_u, cnt_u) in core_acc.items():
+                if cnt_u > 0:
+                    cores_map[core_lbl] = round(tot_u / cnt_u, 1)
 
         series.append(
             {

@@ -2657,9 +2657,11 @@ const DualAreaSparkChart: React.FC<{
     const outVal =
       outPts.length > 0 ? Math.max(0, ((baselineY - outY) / plotSpanY) * maxVal) : 0;
 
-    const tooltipW = extraCurves.length >= 3 ? 244 : 204;
-    const tooltipH =
-      extraCurves.length >= 3
+    const highDensity = extraCurves.length >= 8;
+    const tooltipW = highDensity ? 256 : extraCurves.length >= 3 ? 244 : 204;
+    const tooltipH = highDensity
+      ? 148
+      : extraCurves.length >= 3
         ? Math.min(180, 56 + Math.ceil((1 + extraCurves.length) / 2) * 20)
         : 82 + extraCurves.length * 18;
     const cursorX = ratio * rectW;
@@ -2667,7 +2669,12 @@ const DualAreaSparkChart: React.FC<{
     const leftX = cursorX - tooltipW - 14;
     const rawBoxX = rightX + tooltipW <= rectW - 4 ? rightX : leftX;
     const boxX = Math.min(Math.max(4, rawBoxX), Math.max(4, rectW - tooltipW - 4));
-    const topDotY = ((hideSecondary ? inY : Math.min(inY, outY)) / height) * rectH;
+    const minExtraY =
+      extraVals.length > 0
+        ? Math.min(...extraVals.map((ev) => ev.yFrac * height))
+        : baselineY;
+    const baseTopY = hideSecondary ? inY : Math.min(inY, outY);
+    const topDotY = (Math.min(baseTopY, minExtraY) / height) * rectH;
     const boxY = Math.min(Math.max(4, topDotY - 20), Math.max(4, rectH - tooltipH - 4));
 
     return {
@@ -2741,6 +2748,8 @@ const DualAreaSparkChart: React.FC<{
     return parseFloat(scaled.toFixed(2)).toString();
   };
 
+  const isHighDensityMulti = extraCurves.length > 7;
+
   return (
     <div className="relative w-full overflow-visible rounded-lg border border-slate-800/80 bg-[#0B101B] p-3">
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
@@ -2750,31 +2759,50 @@ const DualAreaSparkChart: React.FC<{
               {effectiveYAxisLabel}
             </span>
           )}
-          <span className="flex items-center gap-1.5">
-            <span
-              className="h-2 w-2 rounded-full"
-              style={{ backgroundColor: primaryColor }}
-            />
-            {primaryLabel}
-          </span>
-          {!hideSecondary && (
-            <span className="flex items-center gap-1.5">
-              <span
-                className="h-2 w-2 rounded-full"
-                style={{ backgroundColor: secondaryColor }}
-              />
-              {secondaryLabel}
+          {isHighDensityMulti ? (
+            <span className="flex items-center gap-2 text-slate-300">
+              <span className="flex items-center gap-0.5">
+                {[primaryColor, ...extraCurves.slice(0, 5).map((e) => e.color)].map((clr, i) => (
+                  <span
+                    key={i}
+                    className="h-2 w-2 rounded-full"
+                    style={{ backgroundColor: clr }}
+                  />
+                ))}
+              </span>
+              <span>
+                CPU 0–{extraCurves.length} ({extraCurves.length + 1} cores)
+              </span>
             </span>
+          ) : (
+            <>
+              <span className="flex items-center gap-1.5">
+                <span
+                  className="h-2 w-2 rounded-full"
+                  style={{ backgroundColor: primaryColor }}
+                />
+                {primaryLabel}
+              </span>
+              {!hideSecondary && (
+                <span className="flex items-center gap-1.5">
+                  <span
+                    className="h-2 w-2 rounded-full"
+                    style={{ backgroundColor: secondaryColor }}
+                  />
+                  {secondaryLabel}
+                </span>
+              )}
+              {extraCurves.map((ec) => (
+                <span key={ec.key} className="flex items-center gap-1.5">
+                  <span
+                    className="h-2 w-2 rounded-full"
+                    style={{ backgroundColor: ec.color }}
+                  />
+                  {ec.label}
+                </span>
+              ))}
+            </>
           )}
-          {extraCurves.map((ec) => (
-            <span key={ec.key} className="flex items-center gap-1.5">
-              <span
-                className="h-2 w-2 rounded-full"
-                style={{ backgroundColor: ec.color }}
-              />
-              {ec.label}
-            </span>
-          ))}
           {dropCoords.length > 0 && (
             <span className="flex items-center gap-1.5 text-rose-400">
               <span className="h-2.5 w-0.5 bg-red-500" />
@@ -2891,7 +2919,14 @@ const DualAreaSparkChart: React.FC<{
                     d={inSpline.linePath}
                     fill="none"
                     stroke={primaryColor}
-                    strokeWidth={linear || extraCurves.length > 0 ? "1.8" : "2.2"}
+                    strokeWidth={
+                      isHighDensityMulti
+                        ? "1.35"
+                        : linear || extraCurves.length > 0
+                          ? "1.8"
+                          : "2.2"
+                    }
+                    strokeOpacity={isHighDensityMulti ? 0.82 : 1}
                     strokeLinecap={linear ? "butt" : "round"}
                     strokeLinejoin={linear ? "miter" : "round"}
                     vectorEffect="non-scaling-stroke"
@@ -2916,7 +2951,8 @@ const DualAreaSparkChart: React.FC<{
                         d={ec.spline.linePath}
                         fill="none"
                         stroke={ec.color}
-                        strokeWidth="1.8"
+                        strokeWidth={isHighDensityMulti ? "1.35" : "1.8"}
+                        strokeOpacity={isHighDensityMulti ? 0.82 : 1}
                         strokeLinecap={linear ? "butt" : "round"}
                         strokeLinejoin={linear ? "miter" : "round"}
                         vectorEffect="non-scaling-stroke"
@@ -2925,14 +2961,16 @@ const DualAreaSparkChart: React.FC<{
                 )}
                 {showEndpointMarkers && (
                   <>
-                    <circle
-                      cx={Math.min(width - 4, Math.max(4, inPts[inPts.length - 1].x))}
-                      cy={inPts[inPts.length - 1].y}
-                      r="3.5"
-                      fill={primaryColor}
-                      stroke="#0B101B"
-                      strokeWidth="1.5"
-                    />
+                    {inPts.length > 0 && (
+                      <circle
+                        cx={Math.min(width - 4, Math.max(4, inPts[inPts.length - 1].x))}
+                        cy={inPts[inPts.length - 1].y}
+                        r={isHighDensityMulti ? "2.4" : "3.5"}
+                        fill={primaryColor}
+                        stroke="#0B101B"
+                        strokeWidth="1.2"
+                      />
+                    )}
                     {!hideSecondary && outPts.length > 0 && (
                       <circle
                         cx={Math.min(width - 4, Math.max(4, outPts[outPts.length - 1].x))}
@@ -2942,6 +2980,20 @@ const DualAreaSparkChart: React.FC<{
                         stroke="#0B101B"
                         strokeWidth="1.5"
                       />
+                    )}
+                    {extraCurves.map(
+                      (ec) =>
+                        ec.pts.length > 0 && (
+                          <circle
+                            key={`ep-${ec.key}`}
+                            cx={Math.min(width - 4, Math.max(4, ec.pts[ec.pts.length - 1].x))}
+                            cy={ec.pts[ec.pts.length - 1].y}
+                            r={isHighDensityMulti ? "2.4" : "3"}
+                            fill={ec.color}
+                            stroke="#0B101B"
+                            strokeWidth="1.2"
+                          />
+                        ),
                     )}
                   </>
                 )}
@@ -2954,166 +3006,265 @@ const DualAreaSparkChart: React.FC<{
               </div>
             )}
 
-            {displayedHover && (inPts.length > 0 || dropCoords.length > 0) && (
-              <>
-                {/* Vertical crosshair line */}
-                <div
-                  className="pointer-events-none absolute top-0 bottom-4 w-px bg-slate-400/55 motion-reduce:transition-none"
-                  style={{
-                    left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
-                    opacity: isHovering ? 1 : 0,
-                    transition: smoothPosTransition
-                      ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
-                      : "opacity 180ms ease-out",
-                  }}
-                />
+            {displayedHover &&
+              (inPts.length > 0 || dropCoords.length > 0) &&
+              (() => {
+                const extraList = displayedHover.extraVals || [];
+                const isHighDensityHover = extraList.length >= 8;
+                const allCores =
+                  inPts.length > 0
+                    ? [
+                        {
+                          key: "__primary",
+                          label: primaryShortLabel,
+                          color: primaryColor,
+                          val: displayedHover.inVal,
+                          yFrac: displayedHover.inYFrac,
+                        },
+                        ...extraList,
+                      ]
+                    : extraList;
+                const avgCoreVal =
+                  allCores.length > 0
+                    ? allCores.reduce((acc, c) => acc + c.val, 0) / allCores.length
+                    : 0;
+                const topCores = isHighDensityHover
+                  ? [...allCores].sort((a, b) => b.val - a.val).slice(0, 6)
+                  : [];
 
-                {/* Hover-only markers on primary & secondary curves */}
-                {inPts.length > 0 && (
-                  <div
-                    className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-[#0B101B] motion-reduce:transition-none"
-                    style={{
-                      backgroundColor: primaryColor,
-                      boxShadow: `0 0 8px ${primaryColor}`,
-                      left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
-                      top: `${(displayedHover.inYFrac * 100).toFixed(3)}%`,
-                      opacity: isHovering ? 1 : 0,
-                      transition: smoothPosTransition
-                        ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
-                        : "opacity 180ms ease-out",
-                    }}
-                  />
-                )}
-                {!hideSecondary && outPts.length > 0 && (
-                  <div
-                    className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-[#0B101B] motion-reduce:transition-none"
-                    style={{
-                      backgroundColor: secondaryColor,
-                      boxShadow: `0 0 8px ${secondaryColor}`,
-                      left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
-                      top: `${(displayedHover.outYFrac * 100).toFixed(3)}%`,
-                      opacity: isHovering ? 1 : 0,
-                      transition: smoothPosTransition
-                        ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
-                        : "opacity 180ms ease-out",
-                    }}
-                  />
-                )}
-                {displayedHover.extraVals &&
-                  displayedHover.extraVals.map((ev) => (
+                return (
+                  <>
+                    {/* Vertical crosshair line */}
                     <div
-                      key={ev.key}
-                      className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-[#0B101B] motion-reduce:transition-none"
+                      className="pointer-events-none absolute top-0 bottom-4 w-px bg-slate-400/55 motion-reduce:transition-none"
                       style={{
-                        backgroundColor: ev.color,
-                        boxShadow: `0 0 8px ${ev.color}`,
                         left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
-                        top: `${(ev.yFrac * 100).toFixed(3)}%`,
                         opacity: isHovering ? 1 : 0,
                         transition: smoothPosTransition
-                          ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
+                          ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
                           : "opacity 180ms ease-out",
                       }}
                     />
-                  ))}
 
-                {/* Smooth floating tooltip box */}
-                <div
-                  className={`pointer-events-none absolute top-0 left-0 z-20 will-change-transform motion-reduce:transition-none ${
-                    displayedHover.extraVals && displayedHover.extraVals.length >= 3
-                      ? "w-[244px]"
-                      : "w-[212px]"
-                  }`}
-                  style={{
-                    transform: `translate3d(${displayedHover.boxX.toFixed(1)}px, ${displayedHover.boxY.toFixed(1)}px, 0)`,
-                    transition: smoothPosTransition
-                      ? "transform 95ms cubic-bezier(0.22, 1, 0.36, 1)"
-                      : "none",
-                  }}
-                >
-                  <div
-                    className={`rounded-lg border border-slate-700/90 bg-[#090D16]/95 px-3 py-2 text-xs shadow-xl shadow-black/50 backdrop-blur-md transition-[opacity,transform] duration-200 ease-out motion-reduce:transition-none ${
-                      isHovering
-                        ? "translate-y-0 scale-100 opacity-100"
-                        : "translate-y-1 scale-95 opacity-0"
-                    }`}
-                  >
-                    <div className="mb-1.5 border-b border-slate-800/80 pb-1 font-mono-tabular text-[11px] text-slate-400">
-                      {displayedHover.timeText}
-                    </div>
-                    <div
-                      className={
-                        displayedHover.extraVals && displayedHover.extraVals.length >= 3
-                          ? "grid grid-cols-2 gap-x-3 gap-y-1"
-                          : "space-y-1"
-                      }
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="flex items-center gap-1.5 text-slate-300">
-                          <span
-                            className="h-2 w-2 rounded-full"
-                            style={{ backgroundColor: primaryColor }}
+                    {/* Hover-only markers on curves */}
+                    {isHighDensityHover ? (
+                      topCores.map((tc) => (
+                        <div
+                          key={tc.key}
+                          className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-[#0B101B] motion-reduce:transition-none"
+                          style={{
+                            backgroundColor: tc.color,
+                            boxShadow: `0 0 8px ${tc.color}`,
+                            left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
+                            top: `${(tc.yFrac * 100).toFixed(3)}%`,
+                            opacity: isHovering ? 1 : 0,
+                            transition: smoothPosTransition
+                              ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
+                              : "opacity 180ms ease-out",
+                          }}
+                        />
+                      ))
+                    ) : (
+                      <>
+                        {inPts.length > 0 && (
+                          <div
+                            className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-[#0B101B] motion-reduce:transition-none"
+                            style={{
+                              backgroundColor: primaryColor,
+                              boxShadow: `0 0 8px ${primaryColor}`,
+                              left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
+                              top: `${(displayedHover.inYFrac * 100).toFixed(3)}%`,
+                              opacity: isHovering ? 1 : 0,
+                              transition: smoothPosTransition
+                                ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
+                                : "opacity 180ms ease-out",
+                            }}
                           />
-                          {primaryShortLabel}
-                        </span>
-                        <span
-                          className="font-mono-tabular font-semibold"
-                          style={{ color: primaryColor }}
-                        >
-                          {inPts.length > 0 ? formatVal(displayedHover.inVal) : "—"}
-                        </span>
-                      </div>
-                      {!hideSecondary && (
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="flex items-center gap-1.5 text-slate-300">
-                            <span
-                              className="h-2 w-2 rounded-full"
-                              style={{ backgroundColor: secondaryColor }}
-                            />
-                            {secondaryShortLabel}
-                          </span>
-                          <span
-                            className="font-mono-tabular font-semibold"
-                            style={{ color: secondaryColor }}
-                          >
-                            {formatVal(displayedHover.outVal)}
-                          </span>
-                        </div>
-                      )}
-                      {displayedHover.extraVals &&
-                        displayedHover.extraVals.map((ev) => (
-                          <div key={ev.key} className="flex items-center justify-between gap-2">
-                            <span className="flex items-center gap-1.5 text-slate-300">
-                              <span
-                                className="h-2 w-2 rounded-full"
-                                style={{ backgroundColor: ev.color }}
-                              />
-                              {ev.label}
-                            </span>
-                            <span
-                              className="font-mono-tabular font-semibold"
-                              style={{ color: ev.color }}
-                            >
-                              {formatVal(ev.val)}
-                            </span>
-                          </div>
+                        )}
+                        {!hideSecondary && outPts.length > 0 && (
+                          <div
+                            className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-[#0B101B] motion-reduce:transition-none"
+                            style={{
+                              backgroundColor: secondaryColor,
+                              boxShadow: `0 0 8px ${secondaryColor}`,
+                              left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
+                              top: `${(displayedHover.outYFrac * 100).toFixed(3)}%`,
+                              opacity: isHovering ? 1 : 0,
+                              transition: smoothPosTransition
+                                ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
+                                : "opacity 180ms ease-out",
+                            }}
+                          />
+                        )}
+                        {extraList.map((ev) => (
+                          <div
+                            key={ev.key}
+                            className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-[#0B101B] motion-reduce:transition-none"
+                            style={{
+                              backgroundColor: ev.color,
+                              boxShadow: `0 0 8px ${ev.color}`,
+                              left: `${(displayedHover.ratio * 100).toFixed(3)}%`,
+                              top: `${(ev.yFrac * 100).toFixed(3)}%`,
+                              opacity: isHovering ? 1 : 0,
+                              transition: smoothPosTransition
+                                ? "left 85ms cubic-bezier(0.22, 1, 0.36, 1), top 85ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease-out"
+                                : "opacity 180ms ease-out",
+                            }}
+                          />
                         ))}
-                      {displayedHover.dropLossPct != null && (
-                        <div className="flex items-center justify-between gap-2 text-rose-400">
-                          <span className="flex items-center gap-1.5">
-                            <span className="h-2 w-2 rounded-full bg-red-500" />
-                            Packet Loss
-                          </span>
-                          <span className="font-mono-tabular font-semibold">
-                            {displayedHover.dropLossPct.toFixed(0)}%
-                          </span>
+                      </>
+                    )}
+
+                    {/* Smooth floating tooltip box */}
+                    <div
+                      className={`pointer-events-none absolute top-0 left-0 z-20 will-change-transform motion-reduce:transition-none ${
+                        isHighDensityHover
+                          ? "w-[256px]"
+                          : extraList.length >= 3
+                            ? "w-[244px]"
+                            : "w-[212px]"
+                      }`}
+                      style={{
+                        transform: `translate3d(${displayedHover.boxX.toFixed(1)}px, ${displayedHover.boxY.toFixed(1)}px, 0)`,
+                        transition: smoothPosTransition
+                          ? "transform 95ms cubic-bezier(0.22, 1, 0.36, 1)"
+                          : "none",
+                      }}
+                    >
+                      <div
+                        className={`rounded-lg border border-slate-700/90 bg-[#090D16]/95 px-3 py-2 text-xs shadow-xl shadow-black/50 backdrop-blur-md transition-[opacity,transform] duration-200 ease-out motion-reduce:transition-none ${
+                          isHovering
+                            ? "translate-y-0 scale-100 opacity-100"
+                            : "translate-y-1 scale-95 opacity-0"
+                        }`}
+                      >
+                        <div className="mb-1.5 border-b border-slate-800/80 pb-1 font-mono-tabular text-[11px] text-slate-400">
+                          {displayedHover.timeText}
                         </div>
-                      )}
+                        {isHighDensityHover ? (
+                          <div className="space-y-1.5">
+                            <div className="flex items-center justify-between gap-2 text-[11px]">
+                              <span className="text-slate-300">
+                                Avg ({allCores.length} cores)
+                              </span>
+                              <span className="font-mono-tabular font-semibold text-emerald-400">
+                                {formatVal(avgCoreVal)}
+                              </span>
+                            </div>
+                            <div className="grid grid-cols-2 gap-x-3 gap-y-1">
+                              {topCores.map((tc) => (
+                                <div
+                                  key={tc.key}
+                                  className="flex items-center justify-between gap-1.5"
+                                >
+                                  <span className="flex items-center gap-1.5 text-slate-300">
+                                    <span
+                                      className="h-2 w-2 rounded-full"
+                                      style={{ backgroundColor: tc.color }}
+                                    />
+                                    {tc.label}
+                                  </span>
+                                  <span
+                                    className="font-mono-tabular font-semibold"
+                                    style={{ color: tc.color }}
+                                  >
+                                    {formatVal(tc.val)}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                            {allCores.length > topCores.length && (
+                              <div className="text-[10px] text-slate-500">
+                                +{allCores.length - topCores.length} more cores
+                              </div>
+                            )}
+                            {displayedHover.dropLossPct != null && (
+                              <div className="flex items-center justify-between gap-2 text-rose-400">
+                                <span className="flex items-center gap-1.5">
+                                  <span className="h-2 w-2 rounded-full bg-red-500" />
+                                  Packet Loss
+                                </span>
+                                <span className="font-mono-tabular font-semibold">
+                                  {displayedHover.dropLossPct.toFixed(0)}%
+                                </span>
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <div
+                            className={
+                              extraList.length >= 3
+                                ? "grid grid-cols-2 gap-x-3 gap-y-1"
+                                : "space-y-1"
+                            }
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="flex items-center gap-1.5 text-slate-300">
+                                <span
+                                  className="h-2 w-2 rounded-full"
+                                  style={{ backgroundColor: primaryColor }}
+                                />
+                                {primaryShortLabel}
+                              </span>
+                              <span
+                                className="font-mono-tabular font-semibold"
+                                style={{ color: primaryColor }}
+                              >
+                                {inPts.length > 0 ? formatVal(displayedHover.inVal) : "—"}
+                              </span>
+                            </div>
+                            {!hideSecondary && (
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="flex items-center gap-1.5 text-slate-300">
+                                  <span
+                                    className="h-2 w-2 rounded-full"
+                                    style={{ backgroundColor: secondaryColor }}
+                                  />
+                                  {secondaryShortLabel}
+                                </span>
+                                <span
+                                  className="font-mono-tabular font-semibold"
+                                  style={{ color: secondaryColor }}
+                                >
+                                  {formatVal(displayedHover.outVal)}
+                                </span>
+                              </div>
+                            )}
+                            {extraList.map((ev) => (
+                              <div key={ev.key} className="flex items-center justify-between gap-2">
+                                <span className="flex items-center gap-1.5 text-slate-300">
+                                  <span
+                                    className="h-2 w-2 rounded-full"
+                                    style={{ backgroundColor: ev.color }}
+                                  />
+                                  {ev.label}
+                                </span>
+                                <span
+                                  className="font-mono-tabular font-semibold"
+                                  style={{ color: ev.color }}
+                                >
+                                  {formatVal(ev.val)}
+                                </span>
+                              </div>
+                            ))}
+                            {displayedHover.dropLossPct != null && (
+                              <div className="flex items-center justify-between gap-2 text-rose-400">
+                                <span className="flex items-center gap-1.5">
+                                  <span className="h-2 w-2 rounded-full bg-red-500" />
+                                  Packet Loss
+                                </span>
+                                <span className="font-mono-tabular font-semibold">
+                                  {displayedHover.dropLossPct.toFixed(0)}%
+                                </span>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                </div>
-              </>
-            )}
+                  </>
+                );
+              })()}
           </div>
 
           <div className="mt-1 flex items-center justify-between border-t border-slate-800/70 pt-1.5 font-mono-tabular text-[11px] text-slate-400">
@@ -3489,6 +3640,7 @@ export const App: React.FC = () => {
     "1h" | "6h" | "24h" | "7d" | "30d" | "1y" | "all"
   >("24h");
   const [systemScaleMode, setSystemScaleMode] = useState<"auto" | "full">("auto");
+  const [cpuGraphMode, setCpuGraphMode] = useState<"cores" | "avg">("cores");
   const [selectedStorageMount, setSelectedStorageMount] = useState<string>("__all__");
   const [icmpHistory, setIcmpHistory] = useState<ICMPHistoryPoint[]>([]);
   const [icmpHistoryRange, setIcmpHistoryRange] = useState<
@@ -10439,7 +10591,8 @@ export const App: React.FC = () => {
                   const multiCoreCpuNames = systemHistoryCores.filter((coreName) =>
                     systemHistory.some((pt) => pt.cores?.[coreName] != null),
                   );
-                  const useMultiCoreCpu = multiCoreCpuNames.length > 1;
+                  const useMultiCoreCpu =
+                    cpuGraphMode === "cores" && multiCoreCpuNames.length > 1;
                   const cpuPrimaryCoreName = useMultiCoreCpu ? multiCoreCpuNames[0] : "CPU Usage (%)";
                   const cpuPrimaryShortName = useMultiCoreCpu ? multiCoreCpuNames[0] : "CPU";
                   const cpuPrimaryChartPts = useMultiCoreCpu
@@ -10612,8 +10765,36 @@ export const App: React.FC = () => {
                                 {liveTempC != null ? ` • ${liveTempC.toFixed(1)}°C` : ""}
                               </div>
                             </div>
-                            <div className="font-mono-tabular text-lg font-bold text-emerald-400">
-                              {liveCpuPct != null ? `${liveCpuPct.toFixed(1)}%` : "—"}
+                            <div className="flex items-center gap-2.5">
+                              {multiCoreCpuNames.length > 1 && (
+                                <div className="inline-flex items-center rounded-md border border-slate-800 bg-[#111827] p-0.5 text-[11px] font-medium">
+                                  <button
+                                    type="button"
+                                    onClick={() => setCpuGraphMode("cores")}
+                                    className={`rounded px-2 py-0.5 transition ${
+                                      cpuGraphMode === "cores"
+                                        ? "bg-emerald-500/20 text-emerald-300"
+                                        : "text-slate-400 hover:text-slate-200"
+                                    }`}
+                                  >
+                                    Cores ({multiCoreCpuNames.length})
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setCpuGraphMode("avg")}
+                                    className={`rounded px-2 py-0.5 transition ${
+                                      cpuGraphMode === "avg"
+                                        ? "bg-slate-800 text-white"
+                                        : "text-slate-400 hover:text-slate-200"
+                                    }`}
+                                  >
+                                    Average
+                                  </button>
+                                </div>
+                              )}
+                              <div className="font-mono-tabular text-lg font-bold text-emerald-400">
+                                {liveCpuPct != null ? `${liveCpuPct.toFixed(1)}%` : "—"}
+                              </div>
                             </div>
                           </div>
 
